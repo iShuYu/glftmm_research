@@ -1,0 +1,135 @@
+{
+  "symbols": [
+    "BTCUSDT"
+  ],
+  "date_start": "2025-01-02",
+  "date_end": "2026-06-01",
+  "input_path": "/data/users/data-helper/PROCESSED/RHDT/BINANCE/UFUTURES",
+  "input_backup_path": "/home/kang/data_helper/PROCESSED/DATA_RECORDER/BINANCE/UFUTURES",
+  "output_path": "/data/users/kang/backtest/glftmm_var/cached",
+  "ticker_category": "BOOKTICKER",
+  "trade_category": "TRADE",
+  "paths": {
+    "output_dir": "/data/users/kang/backtest/glftmm_var/result"
+  },
+  "simulation": {
+    "mode": [
+      1,
+      0
+    ],
+    "latency": [
+      2
+    ],
+    "price_precision": [
+      1
+    ],
+    "qty_precision": [
+      3
+    ],
+    "taker_fee": [
+      0.00025
+    ],
+    "maker_fee": [
+      -3e-05
+    ],
+    "min_order_notional": [
+      100.0
+    ],
+    "freq": [
+      1000
+    ],
+    "name_intensity": [
+      "k"
+    ],
+    "name_volatility": [
+      "sigma"
+    ],
+    "lookback_volatility": [
+      300
+    ],
+    "lookback_intensity": [
+      300
+    ],
+    "max_position_usdt": [
+      500000
+    ],
+    "phase_change_position": [
+      200000,
+      300000
+    ],
+    "phase_mode": [
+      "market",
+      "trade"
+    ],
+    "max_holding_time": [
+      -1
+    ],
+    "stoploss": [
+      0.1
+    ],
+    "order_amt": [
+      1000,
+      2000
+    ],
+    "min_order_qty": [
+      0.0
+    ],
+    "adj_spread_intensity": [
+      1.0,
+      1.5
+    ],
+    "adj_spread_volatility": [
+      0.0
+    ],
+    "inventory_skew": [
+      [
+        0,
+        1
+      ],
+      [
+        40,
+        1
+      ]
+    ],
+    "profit_grid": [
+      [
+        5,
+        105,
+        10,
+        "exponential",
+        0.1
+      ],
+      [
+        5,
+        105,
+        10,
+        "exponential",
+        0.2
+      ],
+      [
+        5,
+        105,
+        10,
+        "exponential",
+        0.3
+      ]
+    ],
+    "open_curve_underwater": [
+      [
+        0.0,
+        1.0,
+        0
+      ]
+    ]
+  },
+  "output": {
+    "split_daily": true,
+    "overwrite": false
+  },
+  "strategy_test": {
+    "summary_csv": "strategy_summary.csv"
+  },
+  "parallel": {
+    "num_workers": 24
+  }
+}
