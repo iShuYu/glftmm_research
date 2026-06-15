@@ -29,6 +29,9 @@ _FULL_REPORT_COLUMNS = (
     "price",
     "best_bid_price",
     "best_ask_price",
+    "mark_notional_usdt",
+    "cost_notional_usdt",
+    "gross_cost_notional_usdt",
     "inventory",
     "position",
 )
@@ -122,8 +125,6 @@ def _normalize_report_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
     renames: dict[str, str] = {}
-    if "inventory" not in out.columns and "position" in out.columns:
-        renames["position"] = "inventory"
     if "real_pnl" not in out.columns and "realized_pnl" in out.columns:
         renames["realized_pnl"] = "real_pnl"
     if "unreal_pnl" not in out.columns and "unrealized_pnl" in out.columns:
@@ -138,15 +139,40 @@ def _normalize_report_columns(df: pd.DataFrame) -> pd.DataFrame:
         elif "real_pnl" in out.columns:
             out["total_pnl"] = out["real_pnl"]
 
+    if "position" not in out.columns and "inventory" in out.columns:
+        out["position"] = out["inventory"]
+
     if "price" not in out.columns and {"best_bid_price", "best_ask_price"}.issubset(out.columns):
         out["price"] = 0.5 * (out["best_bid_price"] + out["best_ask_price"])
-    elif "price" not in out.columns and {"inventory", "unreal_pnl"}.issubset(out.columns):
-        inv = out["inventory"].astype("float64")
+    elif "price" not in out.columns and {"position", "unreal_pnl"}.issubset(out.columns):
+        inv = out["position"].astype("float64")
         unreal = out["unreal_pnl"].astype("float64")
         valid = inv.abs() > 0.0
         approx = pd.Series(np.nan, index=out.index, dtype="float64")
         approx.loc[valid] = (unreal.loc[valid].diff() / inv.loc[valid]).fillna(0.0)
         out["price"] = approx.ffill().bfill()
+
+    if "mark_notional_usdt" not in out.columns and {"position", "price"}.issubset(out.columns):
+        out["mark_notional_usdt"] = (
+            out["position"].astype("float64") * out["price"].astype("float64")
+        )
+
+    if (
+        "cost_notional_usdt" not in out.columns
+        and {"mark_notional_usdt", "unreal_pnl"}.issubset(out.columns)
+    ):
+        out["cost_notional_usdt"] = (
+            out["mark_notional_usdt"].astype("float64")
+            - out["unreal_pnl"].astype("float64")
+        )
+
+    if "gross_cost_notional_usdt" not in out.columns and "cost_notional_usdt" in out.columns:
+        out["gross_cost_notional_usdt"] = out["cost_notional_usdt"].abs()
+
+    if "cost_notional_usdt" in out.columns:
+        out["inventory"] = out["cost_notional_usdt"]
+    elif "inventory" not in out.columns and "position" in out.columns:
+        out["inventory"] = out["position"]
 
     if "datetime" not in out.columns and "timestamp" in out.columns:
         out["datetime"] = pd.to_datetime(out["timestamp"], unit="ms")
@@ -663,8 +689,8 @@ def report(
             if "price" in df.columns:
                 axes[0].plot(x, df["price"])
 
-            if {"inventory", "price"}.issubset(df.columns):
-                axes[1].plot(x, df["inventory"] * df["price"])
+            if "cost_notional_usdt" in df.columns:
+                axes[1].plot(x, df["cost_notional_usdt"])
             elif "inventory" in df.columns:
                 axes[1].plot(x, df["inventory"])
 
@@ -691,7 +717,7 @@ def report(
                 axes[0].legend(title="run_id")
         else:
             axes[0].set_title("Price")
-            axes[1].set_title("Inventory")
+            axes[1].set_title("Inventory Cost Notional")
             if normalize:
                 axes[2].set_title("Realized PnL / Max Position")
                 axes[3].set_title("Unrealized PnL / Max Position")

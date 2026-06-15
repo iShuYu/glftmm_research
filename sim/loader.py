@@ -8,6 +8,7 @@ from typing import Any, Iterable, Iterator, Literal, TypeAlias
 
 import pandas as pd
 
+from sampler.instructor import instructor_output_path
 from sampler.intensity import intensity_output_path
 from sampler.resample import output_path as sampled_ticker_path
 from sampler.resample import resolve_existing_input_path
@@ -16,7 +17,15 @@ from sampler.volatility import volatility_output_path
 
 DateLike: TypeAlias = str | dt.date | dt.datetime | pd.Timestamp
 TradeTuple: TypeAlias = tuple[Literal["trade"], int, bool, float, float]
-AlphaTuple: TypeAlias = tuple[Literal["ticker"], int, float, float, float | None, float]
+AlphaTuple: TypeAlias = tuple[
+    Literal["ticker"],
+    int,
+    float,
+    float,
+    float | None,
+    float | None,
+    float,
+]
 MergedEventTuple: TypeAlias = TradeTuple | AlphaTuple
 
 RAW_TRADE_TIME_COLUMN = "exchange_timestamp"
@@ -123,6 +132,7 @@ class BinanceEventLoader:
         trades_root: str | Path | None = None,
         bookticker_root: str | Path | None = None,
         ticker_cache_root: str | Path | None = None,
+        instructor_cache_root: str | Path | None = None,
         trade_intensity_cache_root: str | Path | None = None,
         intensity_cache_root: str | Path | None = None,
         volatility_cache_root: str | Path | None = None,
@@ -156,6 +166,11 @@ class BinanceEventLoader:
             self.bookticker_root = None
         self.ticker_cache_root = (
             Path(ticker_cache_root) if ticker_cache_root is not None else default_cache_root
+        )
+        self.instructor_cache_root = (
+            Path(instructor_cache_root)
+            if instructor_cache_root is not None
+            else default_cache_root
         )
         resolved_intensity_root = (
             trade_intensity_cache_root
@@ -193,6 +208,7 @@ class BinanceEventLoader:
         freq: int,
         trade_intensity_spec: dict[str, int | str] | None = None,
         volatility_specs: Iterable[dict[str, int | str]] | None = None,
+        instructor_spec: dict[str, int | str] | None = None,
     ) -> Iterator[MergedEventTuple]:
         symbol = str(symbol).upper()
         date_str = normalize_date(date)
@@ -206,6 +222,7 @@ class BinanceEventLoader:
             freq_ms=freq_ms,
             trade_intensity_spec=trade_intensity_spec,
             volatility_specs=volatility_specs,
+            instructor_spec=instructor_spec,
         )
         trades = self._read_trade_frame(symbol=symbol, date=date_str)
         yield from self._merge_sorted(alpha=alpha, trades=trades)
@@ -217,11 +234,24 @@ class BinanceEventLoader:
         freq_ms: int,
         trade_intensity_spec: dict[str, int | str] | None,
         volatility_specs: Iterable[dict[str, int | str]] | None,
+        instructor_spec: dict[str, int | str] | None,
     ) -> pd.DataFrame:
         ticker = self._read_sampled_ticker(symbol=symbol, date=date, freq_ms=freq_ms)
         alpha = ticker.loc[:, TICKER_COLUMNS].copy()
+        alpha["instructor"] = 0.0
         alpha["intensity"] = 0.0
         alpha["volatility_scalar"] = 0.0
+
+        if instructor_spec is not None:
+            instructor = self._read_instructor_frame(
+                symbol=symbol,
+                date=date,
+                freq_ms=freq_ms,
+                spec=instructor_spec,
+            )
+            alpha = alpha.merge(instructor, on="timestamp", how="left", suffixes=("", "_new"))
+            alpha["instructor"] = alpha["instructor_new"].fillna(alpha["instructor"])
+            alpha = alpha.drop(columns=["instructor_new"])
 
         if trade_intensity_spec is not None:
             intensity = self._read_intensity_frame(
@@ -250,7 +280,13 @@ class BinanceEventLoader:
             alpha = alpha.drop(columns=[column])
 
         alpha["timestamp"] = alpha["timestamp"].astype("int64")
-        for column in ("best_bid_price", "best_ask_price", "intensity", "volatility_scalar"):
+        for column in (
+            "best_bid_price",
+            "best_ask_price",
+            "instructor",
+            "intensity",
+            "volatility_scalar",
+        ):
             alpha[column] = alpha[column].astype("float64")
         return alpha.sort_values("timestamp", kind="mergesort", ignore_index=True)
 
@@ -269,6 +305,30 @@ class BinanceEventLoader:
         if missing:
             raise ValueError(f"sampled ticker missing columns: {sorted(missing)}")
         return frame
+
+    def _read_instructor_frame(
+        self,
+        symbol: str,
+        date: str,
+        freq_ms: int,
+        spec: dict[str, int | str],
+    ) -> pd.DataFrame:
+        name, lookback = self._parse_spec(spec=spec, default_name="trade_imbalance")
+        path = instructor_output_path(
+            root=self.instructor_cache_root,
+            symbol=symbol,
+            indicator=name,
+            freq_ms=freq_ms,
+            lookback=lookback,
+            date_str=date,
+        )
+        if not path.exists():
+            raise FileNotFoundError(f"missing instructor: {path}")
+
+        frame = pd.read_parquet(path, columns=["timestamp", "instructor"])
+        frame["timestamp"] = frame["timestamp"].astype("int64")
+        frame["instructor"] = frame["instructor"].astype("float64")
+        return frame.loc[:, ["timestamp", "instructor"]]
 
     def _read_intensity_frame(
         self,
@@ -372,6 +432,7 @@ class BinanceEventLoader:
                     "timestamp",
                     "best_bid_price",
                     "best_ask_price",
+                    "instructor",
                     "intensity",
                     "volatility_scalar",
                 ],
@@ -404,13 +465,15 @@ class BinanceEventLoader:
             assert alpha_row is not None
             bid = float(alpha_row[1])
             ask = float(alpha_row[2])
-            intensity = float(alpha_row[3]) if math.isfinite(float(alpha_row[3])) else 0.0
-            volatility = float(alpha_row[4]) if math.isfinite(float(alpha_row[4])) else 0.0
+            instructor = float(alpha_row[3]) if math.isfinite(float(alpha_row[3])) else 0.0
+            intensity = float(alpha_row[4]) if math.isfinite(float(alpha_row[4])) else 0.0
+            volatility = float(alpha_row[5]) if math.isfinite(float(alpha_row[5])) else 0.0
             yield (
                 "ticker",
                 int(alpha_row[0]),
                 bid,
                 ask,
+                instructor,
                 intensity,
                 volatility,
             )

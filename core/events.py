@@ -40,6 +40,11 @@ class IntensityEvent(BaseEvent):
 
 
 @dataclass(frozen=True, slots=True)
+class InstructorEvent(BaseEvent):
+    instructor: float
+
+
+@dataclass(frozen=True, slots=True)
 class VolatilityEvent(BaseEvent):
     volatility: float
 
@@ -47,5 +52,6 @@ class VolatilityEvent(BaseEvent):
 @dataclass(frozen=True, slots=True)
 class AlphaEvent(BaseEvent):
     ticker_event: TickerEvent
+    instructor_event: InstructorEvent
     intensity_event: IntensityEvent
     volatility_event: VolatilityEvent

@@ -66,8 +66,10 @@ PARAM_KEY_ALIAS = {
     "taker_fee": "tf",
     "maker_fee": "mf",
     "name_volatility": "vn",
+    "name_instructor": "ir",
     "name_intensity": "in",
     "lookback_volatility": "vlb",
+    "lookback_instructor": "ilb",
     "lookback_intensity": "lbi",
     "order_amt": "oa",
     "max_position_usdt": "mp",
@@ -88,7 +90,9 @@ PARAM_KEY_ALIAS = {
 
 SIM_OPTIONAL_KEYS = (
     "name_intensity",
+    "name_instructor",
     "name_volatility",
+    "lookback_instructor",
     "lookback_volatility",
     "phase_change_position",
     "phase_mode",
@@ -300,6 +304,15 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
 
 
 def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
+    name_instructor = raw.get("name_instructor")
+    if name_instructor is not None:
+        name_instructor = str(name_instructor).strip() or None
+    lookback_instructor = raw.get("lookback_instructor")
+    if lookback_instructor is not None:
+        lookback_instructor = int(lookback_instructor)
+    if name_instructor is not None and lookback_instructor is None:
+        raise ValueError("simulation.lookback_instructor is required when name_instructor is set")
+
     name_volatility = raw.get("name_volatility")
     if name_volatility is not None:
         name_volatility = str(name_volatility).strip() or None
@@ -341,6 +354,10 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
         mode=int(raw["mode"]),
         taker_fee=float(raw["taker_fee"]),
         maker_fee=float(raw["maker_fee"]),
+        name_instructor=(
+            None if name_instructor is None else str(name_instructor).strip().lower()
+        ),
+        lookback_instructor=lookback_instructor,
         name_intensity=str(raw.get("name_intensity", "k")).strip().lower(),
         lookback_intensity=int(raw["lookback_intensity"]),
         name_volatility=(
@@ -386,6 +403,7 @@ def _config_paths(cfg: dict[str, Any]) -> dict[str, Any]:
         "ticker_category",
         "trade_category",
         "ticker_cache_root",
+        "instructor_cache_root",
         "intensity_cache_root",
         "trade_intensity_cache_root",
         "volatility_cache_root",
@@ -476,6 +494,7 @@ def _build_loader(cfg: dict[str, Any], require_volatility_cache: bool = False) -
         raise ValueError(
             "config requires output_path or paths.volatility_cache_root when simulation.name_volatility is set"
         )
+    instructor_cache_root = _path_value(paths, "instructor_cache_root") or sampler_output_root
     trade_category = _normalize_category(paths.get("trade_category"), "TRADE")
     ticker_category = _normalize_category(paths.get("ticker_category"), "BOOKTICKER")
     trade_roots = _resolve_category_roots(
@@ -495,6 +514,7 @@ def _build_loader(cfg: dict[str, Any], require_volatility_cache: bool = False) -
         trade_roots=trade_roots,
         bookticker_root=bookticker_roots[0] if bookticker_roots else None,
         ticker_cache_root=ticker_cache_root,
+        instructor_cache_root=instructor_cache_root,
         trade_intensity_cache_root=intensity_cache_root,
         volatility_cache_root=volatility_cache_root,
         trade_category=trade_category,
@@ -608,43 +628,39 @@ def _state_max_position_usdt(state: dict[str, Any]) -> float | None:
     return max_pos if math.isfinite(max_pos) and max_pos > 0.0 else None
 
 
-def _state_position_usdt(state: dict[str, Any]) -> float | None:
+def _state_cost_notional_usdt(state: dict[str, Any]) -> float | None:
     pos = state.get("position")
     if not isinstance(pos, dict):
         return None
+    cost_notional_raw = pos.get("cost_notional_usdt")
+    if cost_notional_raw is not None:
+        try:
+            cost_notional = float(cost_notional_raw)
+            if math.isfinite(cost_notional):
+                return cost_notional
+        except (TypeError, ValueError):
+            pass
+
     try:
         qty = float(pos.get("qty", 0.0))
+        cost_raw = pos.get("cost")
+        cost = float(cost_raw) if cost_raw is not None else math.nan
     except (TypeError, ValueError):
         return None
     if not math.isfinite(qty):
         return None
+    if abs(qty) <= 0.0:
+        return 0.0
+    if math.isfinite(cost):
+        return qty * cost
 
-    bid_raw = state.get("latest_best_bid")
-    ask_raw = state.get("latest_best_ask")
     try:
-        bid = float(bid_raw) if bid_raw is not None else None
+        mark_notional = float(pos.get("mark_notional_usdt"))
+        unrealized = float(pos.get("unrealized_pnl", 0.0))
     except (TypeError, ValueError):
-        bid = None
-    try:
-        ask = float(ask_raw) if ask_raw is not None else None
-    except (TypeError, ValueError):
-        ask = None
-
-    if bid is not None and not math.isfinite(bid):
-        bid = None
-    if ask is not None and not math.isfinite(ask):
-        ask = None
-
-    if bid is not None and ask is not None:
-        mark = (bid + ask) / 2.0
-    elif bid is not None:
-        mark = bid
-    elif ask is not None:
-        mark = ask
-    else:
         return None
-
-    return qty * mark
+    cost_notional = mark_notional - unrealized
+    return cost_notional if math.isfinite(cost_notional) else None
 
 
 def _state_drawdown_ratio(state: dict[str, Any]) -> float | None:
@@ -970,7 +986,7 @@ def _run_daily_incremental(
         day_total_pnl = _state_total_pnl(day_state)
         day_annualized_return_ratio = _state_annualized_return_ratio(day_state)
         day_drawdown_ratio = _state_drawdown_ratio(day_state)
-        day_position_usdt = _state_position_usdt(day_state)
+        day_cost_notional_usdt = _state_cost_notional_usdt(day_state)
         _save_state(day_state, out_dir=out_dir, day=day)
         prev_max_pnl_ever = _state_max_pnl_ever(day_state)
         print(
@@ -978,7 +994,7 @@ def _run_daily_incremental(
             f"total_pnl={_fmt_pnl(day_total_pnl)} "
             f"annualized_return_ratio={_fmt_pnl(day_annualized_return_ratio)} "
             f"drawdown_ratio={_fmt_pnl(day_drawdown_ratio)} "
-            f"position_usdt={_fmt_pnl(day_position_usdt)} "
+            f"cost_notional_usdt={_fmt_pnl(day_cost_notional_usdt)} "
             f"sec={perf_counter() - day_t0:.1f}",
             flush=True,
         )

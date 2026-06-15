@@ -1,6 +1,7 @@
 from .events import (
     AlphaEvent,
     BaseEvent,
+    InstructorEvent,
     IntensityEvent,
     TickerEvent,
     TradeEvent,
@@ -14,6 +15,7 @@ __all__ = [
     "AlphaEvent",
     "BaseEvent",
     "EPS",
+    "InstructorEvent",
     "IntensityEvent",
     "Manager",
     "NAN",

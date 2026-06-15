@@ -279,6 +279,8 @@ class SimulationConfig:
     mode: int
     taker_fee: float
     maker_fee: float
+    name_instructor: Optional[str] = None
+    lookback_instructor: Optional[int] = None
     name_intensity: str = "k"
     lookback_intensity: int = 100
     name_volatility: Optional[str] = None
@@ -320,6 +322,9 @@ class SimulationConfig:
             raise ValueError("qty_precision must be >= 0")
         if self.mode not in (0, 1):
             raise ValueError("mode must be 0 or 1")
+        if self.name_instructor is not None:
+            if self.lookback_instructor is None or int(self.lookback_instructor) <= 0:
+                raise ValueError("lookback_instructor must be > 0 when name_instructor is provided")
         if self.lookback_intensity <= 0:
             raise ValueError("lookback_intensity must be > 0")
         if self.name_volatility is not None:
@@ -412,7 +417,7 @@ class SimpleMakerStrategy:
         self._latest_best_ask: Optional[float] = None
         self._latest_best_bid: Optional[float] = None
         self._traded_volume: float = 0.0
-        self._records: list[tuple[int, float, float, float, float, float]] = []
+        self._records: list[tuple[int, float, float, float, float, float, float, float, float]] = []
         self._reach_and_release_active: bool = False
         self._max_holding_start_ts: Optional[int] = None
         self._max_holding_was_at_limit: bool = False
@@ -427,6 +432,9 @@ class SimpleMakerStrategy:
             "position": {
                 "qty": float(pos.qty),
                 "cost": None if math.isnan(float(pos.cost)) else float(pos.cost),
+                "mark_notional_usdt": float(pos.mark_notional_usdt),
+                "cost_notional_usdt": float(pos.cost_notional_usdt),
+                "gross_cost_notional_usdt": float(pos.gross_cost_notional_usdt),
                 "realized_pnl": float(pos.realized_pnl),
                 "unrealized_pnl": float(pos.unrealized_pnl),
                 "mid": float(pos.mid),
@@ -560,6 +568,7 @@ class SimpleMakerStrategy:
         self._records = []
         vol_specs = self._selected_volatility_specs()
         ti_spec = self._selected_intensity_spec()
+        instructor_spec = self._selected_instructor_spec()
 
         for event in self.loader.iter_merged_alpha_trade_tuples(
             symbol=symbol,
@@ -567,6 +576,7 @@ class SimpleMakerStrategy:
             freq=self.sim.freq,
             trade_intensity_spec=ti_spec,
             volatility_specs=vol_specs,
+            instructor_spec=instructor_spec,
         ):
             kind = event[0]
             ts = int(event[1])
@@ -583,8 +593,9 @@ class SimpleMakerStrategy:
                     timestamp=ts,
                     best_bid=float(event[2]),
                     best_ask=float(event[3]),
-                    intensity_value=event[4],
-                    volatility_scalar=float(event[5]),
+                    instructor_value=event[4],
+                    intensity_value=event[5],
+                    volatility_scalar=float(event[6]),
                 )
         return pd.DataFrame(
             self._records,
@@ -592,6 +603,9 @@ class SimpleMakerStrategy:
                 "timestamp",
                 "price",
                 "position",
+                "mark_notional_usdt",
+                "cost_notional_usdt",
+                "gross_cost_notional_usdt",
                 "realized_pnl",
                 "unrealized_pnl",
                 "traded_volume",
@@ -606,6 +620,9 @@ class SimpleMakerStrategy:
                     "timestamp",
                     "price",
                     "position",
+                    "mark_notional_usdt",
+                    "cost_notional_usdt",
+                    "gross_cost_notional_usdt",
                     "realized_pnl",
                     "unrealized_pnl",
                     "traded_volume",
@@ -654,7 +671,6 @@ class SimpleMakerStrategy:
         position_reduced = new_abs_pos_qty + self.EPS < prev_abs_pos_qty
         self._update_max_holding_tracking(
             timestamp=int(trade_time),
-            reference_price=float(trade_price),
             position_reduced=position_reduced,
         )
         if self.cfg.phase_mode == "trade":
@@ -677,7 +693,9 @@ class SimpleMakerStrategy:
         best_ask: float,
         intensity_value: Optional[float],
         volatility_scalar: float,
+        instructor_value: Optional[float] = None,
     ) -> None:
+        _ = instructor_value
         rounded_best_bid = self._round_to_precision(float(best_bid), self.sim.price_precision)
         rounded_best_ask = self._round_to_precision(float(best_ask), self.sim.price_precision)
         if (
@@ -731,7 +749,7 @@ class SimpleMakerStrategy:
         )
         if self.cfg.phase_mode == "market" or abs(float(self.manager.position.qty)) <= self.EPS:
             self._update_phase_change_tracking(reference_mid=mid)
-        self._update_max_holding_tracking(timestamp=timestamp, reference_price=mid)
+        self._update_max_holding_tracking(timestamp=timestamp)
 
         if self._should_activate_stoploss(mid=mid):
             self._reach_and_release_active = True
@@ -775,6 +793,9 @@ class SimpleMakerStrategy:
                 int(timestamp),
                 float(mid),
                 float(self.manager.position.qty),
+                float(self.manager.position.mark_notional_usdt),
+                float(self.manager.position.cost_notional_usdt),
+                float(self.manager.position.gross_cost_notional_usdt),
                 float(self.manager.position.realized_pnl),
                 float(self.manager.position.unrealized_pnl),
                 float(self._traded_volume),
@@ -814,10 +835,9 @@ class SimpleMakerStrategy:
     def _update_max_holding_tracking(
         self,
         timestamp: int,
-        reference_price: float,
         position_reduced: bool = False,
     ) -> None:
-        at_limit = self._is_at_max_position(reference_price=reference_price)
+        at_limit = self._is_at_max_position()
         if position_reduced:
             self._max_holding_start_ts = None
             self._max_holding_was_at_limit = at_limit
@@ -828,14 +848,14 @@ class SimpleMakerStrategy:
             self._max_holding_start_ts = None
         self._max_holding_was_at_limit = at_limit
 
-    def _is_at_max_position(self, reference_price: float) -> bool:
+    def _is_at_max_position(self) -> bool:
         max_pos_usdt = float(self.cfg.max_position_usdt)
         if max_pos_usdt <= self.EPS:
             return False
-        pos_qty = abs(float(self.manager.position.qty))
-        if pos_qty <= self.EPS:
-            return False
-        return pos_qty * float(reference_price) + self.EPS >= max_pos_usdt
+        return (
+            float(self.manager.position.gross_cost_notional_usdt) + self.EPS
+            >= max_pos_usdt
+        )
 
     def _phase_change_active(self) -> bool:
         threshold = float(self.cfg.phase_change_position)
@@ -846,7 +866,7 @@ class SimpleMakerStrategy:
         cost = float(pos.cost)
         if abs(pos_qty) <= self.EPS or not math.isfinite(cost) or cost <= 0.0:
             return False
-        return abs(pos_qty) * cost > threshold + self.EPS
+        return float(pos.gross_cost_notional_usdt) > threshold + self.EPS
 
     def _phase_open_allowed(self, mid: float, side: int) -> bool:
         if not self._phase_change_active():
@@ -1172,10 +1192,10 @@ class SimpleMakerStrategy:
         if max_position_usdt <= self.EPS:
             return 0.0, 0.0
 
-        position_usdt = float(self.manager.position.qty) * float(mid)
-        if position_usdt + self.EPS >= max_position_usdt:
+        cost_notional_usdt = float(self.manager.position.cost_notional_usdt)
+        if cost_notional_usdt + self.EPS >= max_position_usdt:
             bid_qty = 0.0
-        if position_usdt - self.EPS <= -max_position_usdt:
+        if cost_notional_usdt - self.EPS <= -max_position_usdt:
             ask_qty = 0.0
         return ask_qty, bid_qty
 
@@ -1193,8 +1213,8 @@ class SimpleMakerStrategy:
         if max_position_usdt <= self.EPS:
             return 0.0
 
-        position_usdt = float(self.manager.position.qty) * float(mid)
-        inventory_util = max(-1.0, min(1.0, position_usdt / max_position_usdt))
+        cost_notional_usdt = float(self.manager.position.cost_notional_usdt)
+        inventory_util = max(-1.0, min(1.0, cost_notional_usdt / max_position_usdt))
         if abs(inventory_util) <= self.EPS:
             return 0.0
 
@@ -1226,8 +1246,8 @@ class SimpleMakerStrategy:
         if max_position_usdt <= self.EPS:
             return 1.0
 
-        position_usdt = abs(float(self.manager.position.qty) * float(mid))
-        util = min(1.0, max(0.0, position_usdt / max_position_usdt))
+        gross_cost_notional_usdt = float(self.manager.position.gross_cost_notional_usdt)
+        util = min(1.0, max(0.0, gross_cost_notional_usdt / max_position_usdt))
         decay = (1.0 - util) ** order
         return min_scale + (max_scale - min_scale) * decay
 
@@ -1302,6 +1322,16 @@ class SimpleMakerStrategy:
         return {
             "name": str(self.sim.name_intensity).strip().lower(),
             "lookback": int(self.sim.lookback_intensity),
+        }
+
+    def _selected_instructor_spec(self) -> dict[str, int | str] | None:
+        if self.sim.name_instructor is None:
+            return None
+        if self.sim.lookback_instructor is None:
+            raise ValueError("lookback_instructor must be provided when name_instructor is set")
+        return {
+            "name": str(self.sim.name_instructor).strip().lower(),
+            "lookback": int(self.sim.lookback_instructor),
         }
 
     def _selected_volatility_specs(self) -> list[dict[str, int | str]]:

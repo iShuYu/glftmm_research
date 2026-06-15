@@ -10,7 +10,7 @@ from typing import Any
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from sampler import intensity, resample, volatility  # noqa: E402
+from sampler import instructor, intensity, resample, volatility  # noqa: E402
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -130,15 +130,33 @@ def parallel_config(cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def positive_int_list(cfg: dict[str, Any], key: str, required: bool) -> list[int]:
+    value = cfg.get(key)
+    if value in (None, "", []):
+        if required:
+            raise ValueError(f"config requires {key}")
+        return []
+    values = [int(item) for item in ensure_list(value)]
+    values = [item for item in values if item > 0]
+    if required and not values:
+        raise ValueError(f"config requires positive {key}")
+    return values
+
+
 def common_dates_and_symbols(cfg: dict[str, Any]) -> dict[str, Any]:
     return {
-        "symbols": [str(symbol).upper() for symbol in ensure_list(require_non_empty(cfg, "symbols"))],
+        "symbols": [
+            str(symbol).upper()
+            for symbol in ensure_list(require_non_empty(cfg, "symbols"))
+        ],
         "date_start": require_non_empty(cfg, "date_start"),
         "date_end": cfg.get("date_end", cfg["date_start"]),
     }
 
 
-def build_stage_configs(cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+def build_stage_configs(
+    cfg: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     common = common_dates_and_symbols(cfg)
     input_paths = resolve_input_paths(cfg)
 
@@ -147,10 +165,12 @@ def build_stage_configs(cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, 
     freqs = [int(freq) for freq in ensure_list(require_non_empty(cfg, "freq_ms"))]
     if not freqs:
         raise ValueError("config requires freq_ms")
-    lookbacks = [int(lookback) for lookback in ensure_list(require_non_empty(cfg, "lookback"))]
-    if not lookbacks:
-        raise ValueError("config requires lookback")
 
+    name_instructor = [
+        str(name).strip().lower()
+        for name in ensure_list(cfg.get("name_instructor", []))
+        if str(name).strip()
+    ]
     name_intensity = [
         str(name).strip().lower()
         for name in ensure_list(cfg.get("name_intensity", []))
@@ -161,6 +181,22 @@ def build_stage_configs(cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, 
         for name in ensure_list(cfg.get("name_volatility", []))
         if str(name).strip()
     ]
+
+    lookback_instructor = positive_int_list(
+        cfg,
+        "lookback_instructor",
+        required=bool(name_instructor),
+    )
+    lookback_intensity = positive_int_list(
+        cfg,
+        "lookback_intensity",
+        required=bool(name_intensity),
+    )
+    lookback_volatility = positive_int_list(
+        cfg,
+        "lookback_volatility",
+        required=bool(name_volatility),
+    )
 
     overwrite = bool(cfg.get("overwrite", False))
     strict_validate = bool(cfg.get("strict_validate", True))
@@ -183,6 +219,24 @@ def build_stage_configs(cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, 
         "parallel": parallel,
     }
 
+    instructor_cfg = {
+        **common,
+        "paths": {
+            "trade_roots": [str(path) for path in input_paths.trade_roots],
+            "output_root": str(output_root),
+        },
+        "instructor": {
+            "freq": freqs,
+            "indicator": name_instructor,
+            "lookback": lookback_instructor,
+            "trade_category": input_paths.trade_category,
+            "overwrite": overwrite,
+            "strict_validate": strict_validate,
+            "compression": compression,
+        },
+        "parallel": parallel,
+    }
+
     intensity_cfg = {
         **common,
         "paths": {
@@ -194,7 +248,7 @@ def build_stage_configs(cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, 
         "intensity": {
             "freq": freqs,
             "indicator": name_intensity,
-            "lookback": lookbacks,
+            "lookback": lookback_intensity,
             "ticker_category": input_paths.ticker_category,
             "trade_category": input_paths.trade_category,
             "auto_resample": False,
@@ -216,7 +270,7 @@ def build_stage_configs(cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, 
         "volatility": {
             "freq": freqs,
             "indicator": name_volatility,
-            "lookback": lookbacks,
+            "lookback": lookback_volatility,
             "ticker_category": input_paths.ticker_category,
             "trade_category": input_paths.trade_category,
             "auto_resample": False,
@@ -232,31 +286,37 @@ def build_stage_configs(cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, 
         "parallel": parallel,
     }
 
-    return resample_cfg, intensity_cfg, volatility_cfg
+    return resample_cfg, instructor_cfg, intensity_cfg, volatility_cfg
 
 
 def run_pipeline(cfg: dict[str, Any]) -> None:
-    resample_cfg, intensity_cfg, volatility_cfg = build_stage_configs(cfg)
+    resample_cfg, instructor_cfg, intensity_cfg, volatility_cfg = build_stage_configs(cfg)
 
-    print("=== stage 1/3: resample ===", flush=True)
+    print("=== stage 1/4: resample ===", flush=True)
     resample.run_all(resample_cfg)
 
+    if instructor_cfg["instructor"]["indicator"]:
+        print("=== stage 2/4: instructor ===", flush=True)
+        instructor.run_all(instructor_cfg)
+    else:
+        print("=== stage 2/4: instructor skipped ===", flush=True)
+
     if intensity_cfg["intensity"]["indicator"]:
-        print("=== stage 2/3: intensity ===", flush=True)
+        print("=== stage 3/4: intensity ===", flush=True)
         intensity.run_all(intensity_cfg)
     else:
-        print("=== stage 2/3: intensity skipped ===", flush=True)
+        print("=== stage 3/4: intensity skipped ===", flush=True)
 
     if volatility_cfg["volatility"]["indicator"]:
-        print("=== stage 3/3: volatility ===", flush=True)
+        print("=== stage 4/4: volatility ===", flush=True)
         volatility.run_all(volatility_cfg)
     else:
-        print("=== stage 3/3: volatility skipped ===", flush=True)
+        print("=== stage 4/4: volatility skipped ===", flush=True)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run resample, intensity, and volatility stages in order."
+        description="Run resample, instructor, intensity, and volatility stages in order."
     )
     parser.add_argument("--config", default="config.json")
     args = parser.parse_args()

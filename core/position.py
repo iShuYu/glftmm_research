@@ -29,7 +29,21 @@ class Position:
 
     @property
     def unrealized_pnl(self) -> float:
-        return 0.0 if self.qty == 0.0 else self.qty * (self.mid - self.cost)
+        return self.mark_notional_usdt - self.cost_notional_usdt
+
+    @property
+    def mark_notional_usdt(self) -> float:
+        return 0.0 if self.qty == 0.0 else self.qty * self.mid
+
+    @property
+    def cost_notional_usdt(self) -> float:
+        if self.qty == 0.0 or not math.isfinite(self.cost):
+            return 0.0
+        return self.qty * self.cost
+
+    @property
+    def gross_cost_notional_usdt(self) -> float:
+        return abs(self.cost_notional_usdt)
 
     def mark(self, mid_price: float) -> None:
         self.mid = mid_price
@@ -76,4 +90,3 @@ class Position:
             self.cost = price
 
         return realized
-

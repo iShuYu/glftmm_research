@@ -1,12 +1,18 @@
 import math
 import unittest
 
+from core.position import Position
+from sim.report import _normalize_report_columns
 from sim.strategy import (
     SimpleMakerStrategy,
     SimulationConfig,
     build_profit_grid_levels,
 )
-from run_strategy import _build_simulation_config, _normalize_sim_param_map
+from run_strategy import (
+    _build_simulation_config,
+    _normalize_sim_param_map,
+    _state_cost_notional_usdt,
+)
 
 
 def make_config(**overrides):
@@ -83,6 +89,33 @@ def price_levels(engine, book):
         )
         for price, qty in book.snapshot()
     ]
+
+
+class PositionNotionalTest(unittest.TestCase):
+    def test_position_tracks_mark_and_cost_notional_separately(self):
+        pos = Position()
+        pos.execute(qty=2.0, price=100.0)
+        pos.mark(110.0)
+
+        self.assertEqual(pos.mark_notional_usdt, 220.0)
+        self.assertEqual(pos.cost_notional_usdt, 200.0)
+        self.assertEqual(pos.gross_cost_notional_usdt, 200.0)
+        self.assertEqual(pos.unrealized_pnl, 20.0)
+
+        pos.mark(80.0)
+        self.assertEqual(pos.mark_notional_usdt, 160.0)
+        self.assertEqual(pos.cost_notional_usdt, 200.0)
+        self.assertEqual(pos.unrealized_pnl, -40.0)
+
+    def test_short_notional_preserves_sign(self):
+        pos = Position()
+        pos.execute(qty=-2.0, price=100.0)
+        pos.mark(90.0)
+
+        self.assertEqual(pos.mark_notional_usdt, -180.0)
+        self.assertEqual(pos.cost_notional_usdt, -200.0)
+        self.assertEqual(pos.gross_cost_notional_usdt, 200.0)
+        self.assertEqual(pos.unrealized_pnl, 20.0)
 
 
 class ProfitGridAllocationTest(unittest.TestCase):
@@ -270,6 +303,45 @@ class ProfitGridConfigTest(unittest.TestCase):
 
 
 class ProfitGridStrategyTest(unittest.TestCase):
+    def test_inventory_limit_uses_cost_notional_not_mark_notional(self):
+        engine = SimpleMakerStrategy(make_config(max_position_usdt=150.0))
+        set_position(engine, qty=1.0, cost=100.0)
+
+        ask_qty, bid_qty = engine._apply_inventory_limit(mid=200.0, ask_qty=1.0, bid_qty=1.0)
+        self.assertEqual((ask_qty, bid_qty), (1.0, 1.0))
+
+        engine = SimpleMakerStrategy(make_config(max_position_usdt=150.0))
+        set_position(engine, qty=1.0, cost=200.0)
+
+        ask_qty, bid_qty = engine._apply_inventory_limit(mid=100.0, ask_qty=1.0, bid_qty=1.0)
+        self.assertEqual((ask_qty, bid_qty), (1.0, 0.0))
+
+    def test_short_inventory_limit_uses_signed_cost_notional(self):
+        engine = SimpleMakerStrategy(make_config(max_position_usdt=150.0))
+        set_position(engine, qty=-1.0, cost=200.0)
+
+        ask_qty, bid_qty = engine._apply_inventory_limit(mid=100.0, ask_qty=1.0, bid_qty=1.0)
+        self.assertEqual((ask_qty, bid_qty), (0.0, 1.0))
+
+    def test_inventory_skew_uses_cost_notional_not_mark_notional(self):
+        engine = SimpleMakerStrategy(
+            make_config(max_position_usdt=100.0, inventory_skew=(10.0, 1.0))
+        )
+        set_position(engine, qty=1.0, cost=50.0)
+
+        self.assertEqual(engine._inventory_skew_price_shift(mid=100.0), -0.5)
+
+    def test_open_curve_uses_gross_cost_notional(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                max_position_usdt=100.0,
+                open_curve_underwater=(0.0, 2.0, 1.0),
+            )
+        )
+        set_position(engine, qty=1.0, cost=25.0)
+
+        self.assertEqual(engine._inventory_open_curve_underwater_multiplier(mid=100.0), 1.5)
+
     def test_long_under_cost_only_places_open_bid(self):
         engine = SimpleMakerStrategy(make_config())
         set_position(engine, qty=1.0, cost=100.0)
@@ -619,6 +691,40 @@ class ProfitGridStrategyTest(unittest.TestCase):
         self.assertEqual(
             price_levels(engine, engine.manager.books.bid_maker),
             [(99.0, 0.334), (98.0, 0.333), (97.0, 0.333)],
+        )
+
+
+class ReportNotionalTest(unittest.TestCase):
+    def test_report_inventory_is_cost_notional_for_legacy_columns(self):
+        import pandas as pd
+
+        df = pd.DataFrame(
+            {
+                "timestamp": [1, 2],
+                "price": [110.0, 90.0],
+                "position": [2.0, -2.0],
+                "realized_pnl": [0.0, 0.0],
+                "unrealized_pnl": [20.0, 20.0],
+            }
+        )
+
+        out = _normalize_report_columns(df)
+
+        self.assertEqual(list(out["mark_notional_usdt"]), [220.0, -180.0])
+        self.assertEqual(list(out["cost_notional_usdt"]), [200.0, -200.0])
+        self.assertEqual(list(out["gross_cost_notional_usdt"]), [200.0, 200.0])
+        self.assertEqual(list(out["inventory"]), [200.0, -200.0])
+
+    def test_state_cost_notional_prefers_state_field_and_falls_back_to_cost(self):
+        self.assertEqual(
+            _state_cost_notional_usdt(
+                {"position": {"qty": 2.0, "cost": 100.0, "cost_notional_usdt": 201.0}}
+            ),
+            201.0,
+        )
+        self.assertEqual(
+            _state_cost_notional_usdt({"position": {"qty": -2.0, "cost": 100.0}}),
+            -200.0,
         )
 
 
