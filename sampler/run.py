@@ -130,16 +130,25 @@ def parallel_config(cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def positive_int_list(cfg: dict[str, Any], key: str, required: bool) -> list[int]:
+def positive_int_list(
+    cfg: dict[str, Any],
+    key: str,
+    required: bool,
+    allow_zero: bool = False,
+) -> list[int]:
     value = cfg.get(key)
     if value in (None, "", []):
         if required:
             raise ValueError(f"config requires {key}")
         return []
     values = [int(item) for item in ensure_list(value)]
-    values = [item for item in values if item > 0]
+    if allow_zero:
+        values = [item for item in values if item >= 0]
+    else:
+        values = [item for item in values if item > 0]
     if required and not values:
-        raise ValueError(f"config requires positive {key}")
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"config requires {qualifier} {key}")
     return values
 
 
@@ -186,6 +195,7 @@ def build_stage_configs(
         cfg,
         "lookback_instructor",
         required=bool(name_instructor),
+        allow_zero=True,
     )
     lookback_intensity = positive_int_list(
         cfg,
@@ -223,6 +233,7 @@ def build_stage_configs(
         **common,
         "paths": {
             "trade_roots": [str(path) for path in input_paths.trade_roots],
+            "ticker_cache_root": str(output_root),
             "output_root": str(output_root),
         },
         "instructor": {

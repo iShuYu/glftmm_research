@@ -4,7 +4,7 @@
   ],
   "date_start": "2025-01-02",
   "date_end": "2026-06-01",
-  "input_path": "/data/users/data-helper/PROCESSED/RHDT/BINANCE/UFUTURES",
+  "input_path": "/data/users/data-helper/PROCESSED/TARDIS/BINANCE/UFUTURES",
   "input_backup_path": "/home/kang/data_helper/PROCESSED/DATA_RECORDER/BINANCE/UFUTURES",
   "output_path": "/data/users/kang/backtest/glftmm_var/cached",
   "ticker_category": "BOOKTICKER",
@@ -44,8 +44,14 @@
     "name_volatility": [
       "sigma"
     ],
+    "name_instructor": [
+      "bbo_imbalance"
+    ],
     "lookback_volatility": [
       300
+    ],
+    "lookback_instructor": [
+      0
     ],
     "lookback_intensity": [
       300
@@ -57,8 +63,7 @@
       300000
     ],
     "phase_mode": [
-      "market",
-      "trade"
+      "market"
     ],
     "max_holding_time": [
       -1
@@ -67,15 +72,22 @@
       0.1
     ],
     "order_amt": [
-      1000,
-      500
+      1000
     ],
     "min_order_qty": [
       0.0
     ],
     "adj_spread_intensity": [
-      1.0,
-      1.5
+      1.0
+    ],
+    "adj_spread_instructor": [
+      0,
+      1e-5,
+      5e-5
+    ],
+    "open_passive_only": [
+      false,
+      true
     ],
     "adj_spread_volatility": [
       0.0
@@ -84,21 +96,10 @@
       [
         0,
         1
-      ],
-      [
-        40,
-        1
       ]
     ],
     "profit_grid": [
       [
-        10,
-        110,
-        10,
-        "exponential",
-        0.2
-      ],
-      [
         5,
         105,
         10,
@@ -110,14 +111,21 @@
         105,
         10,
         "exponential",
-        0.3
+        0.5
       ],
       [
-        5,
-        105,
-        20,
+        2,
+        52,
+        10,
         "exponential",
-        0.1
+        0.2
+      ],
+      [
+        2,
+        52,
+        10,
+        "exponential",
+        0.5
       ]
     ],
     "open_curve_underwater": [
@@ -125,11 +133,6 @@
         0.0,
         1.0,
         0
-      ],
-      [
-        0.0,
-        2.0,
-        1
       ]
     ]
   },

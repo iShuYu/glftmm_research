@@ -37,8 +37,8 @@ except ModuleNotFoundError:
 DATE_FMT_DASH = "%Y-%m-%d"
 DATE_FMT_COMPACT = "%Y%m%d"
 MAX_DIR_SEGMENT_LEN = 240
-MIN_DAYS_FOR_NEG_STOP = 365
-MIN_DAYS_FOR_LOW_ANNUALIZED_STOP = 365
+MIN_DAYS_FOR_NEG_STOP = 60
+MIN_DAYS_FOR_LOW_ANNUALIZED_STOP = 60
 MIN_ANNUALIZED_RETURN_RATIO = 0.2
 MAX_DRAWDOWN_LIMIT_RATIO = 0.2
 _MAX_POSITION_RE = re.compile(
@@ -78,6 +78,8 @@ PARAM_KEY_ALIAS = {
     "max_holding_time": "mht",
     "freq": "fr",
     "adj_spread_intensity": "asi",
+    "adj_spread_instructor": "asir",
+    "open_passive_only": "opo",
     "adj_spread_volatility": "asv",
     "inventory_skew": "isk",
     "stoploss": "sl",
@@ -98,6 +100,8 @@ SIM_OPTIONAL_KEYS = (
     "phase_mode",
     "max_holding_time",
     "adj_spread_intensity",
+    "adj_spread_instructor",
+    "open_passive_only",
     "adj_spread_volatility",
     "inventory_skew",
     "min_order_qty",
@@ -200,9 +204,25 @@ def _short_param_key(key: str) -> str:
 def _short_param_val(val: Any) -> str:
     if isinstance(val, (list, tuple)):
         text = "x".join(_short_param_val(item) for item in val)
+    elif isinstance(val, bool):
+        text = "1" if val else "0"
     else:
         text = f"{val:.10g}" if isinstance(val, float) else str(val)
     return text.replace("/", "_").replace("-", "m").replace(".", "p").replace("+", "")
+
+
+def _parse_bool(raw: Any, key: str) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, int) and raw in (0, 1):
+        return bool(raw)
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        if value in {"true", "1", "yes", "y"}:
+            return True
+        if value in {"false", "0", "no", "n"}:
+            return False
+    raise ValueError(f"simulation.{key} must be boolean")
 
 
 def _safe_dir_segment(prefix: str, body: str) -> str:
@@ -370,6 +390,8 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
         phase_mode=str(raw.get("phase_mode", "market")).strip().lower(),
         max_holding_time=int(raw.get("max_holding_time", 0)),
         adj_spread_intensity=float(raw.get("adj_spread_intensity", 1.0)),
+        adj_spread_instructor=float(raw.get("adj_spread_instructor", 0.0)),
+        open_passive_only=_parse_bool(raw.get("open_passive_only", False), "open_passive_only"),
         adj_spread_volatility=float(raw.get("adj_spread_volatility", 0.0)),
         inventory_skew=inventory_skew,
         min_order_qty=float(raw.get("min_order_qty", 0.0)),

@@ -291,6 +291,8 @@ class SimulationConfig:
     phase_mode: str = "market"
     max_holding_time: int = 0
     adj_spread_intensity: float = 1.0
+    adj_spread_instructor: float = 0.0
+    open_passive_only: bool = False
     adj_spread_volatility: float = 0.0
     inventory_skew: Optional[tuple[float, float]] = None
     min_order_qty: float = 0.0
@@ -323,8 +325,18 @@ class SimulationConfig:
         if self.mode not in (0, 1):
             raise ValueError("mode must be 0 or 1")
         if self.name_instructor is not None:
-            if self.lookback_instructor is None or int(self.lookback_instructor) <= 0:
-                raise ValueError("lookback_instructor must be > 0 when name_instructor is provided")
+            instructor_name = str(self.name_instructor).strip().lower()
+            if self.lookback_instructor is None:
+                raise ValueError(
+                    "lookback_instructor must be provided when name_instructor is set"
+                )
+            if instructor_name == "bbo_imbalance":
+                if int(self.lookback_instructor) != 0:
+                    raise ValueError("bbo_imbalance only supports lookback_instructor 0")
+            elif int(self.lookback_instructor) <= 0:
+                raise ValueError(
+                    "lookback_instructor must be > 0 when name_instructor is provided"
+                )
         if self.lookback_intensity <= 0:
             raise ValueError("lookback_intensity must be > 0")
         if self.name_volatility is not None:
@@ -340,6 +352,10 @@ class SimulationConfig:
             raise ValueError("phase_mode must be 'market' or 'trade'")
         if self.adj_spread_intensity <= 0:
             raise ValueError("adj_spread_intensity must be > 0")
+        if not math.isfinite(float(self.adj_spread_instructor)):
+            raise ValueError("adj_spread_instructor must be finite")
+        if not isinstance(self.open_passive_only, bool):
+            raise ValueError("open_passive_only must be boolean")
         if self.adj_spread_volatility < 0:
             raise ValueError("adj_spread_volatility must be >= 0")
         if self.inventory_skew is not None:
@@ -695,7 +711,6 @@ class SimpleMakerStrategy:
         volatility_scalar: float,
         instructor_value: Optional[float] = None,
     ) -> None:
-        _ = instructor_value
         rounded_best_bid = self._round_to_precision(float(best_bid), self.sim.price_precision)
         rounded_best_ask = self._round_to_precision(float(best_ask), self.sim.price_precision)
         if (
@@ -709,15 +724,28 @@ class SimpleMakerStrategy:
         mid = 0.5 * (rounded_best_bid + rounded_best_ask)
 
         intensity_base = self._safe_non_negative(intensity_value)
+        instructor_scalar = self._safe_finite(instructor_value)
         vol_scalar = self._safe_non_negative(volatility_scalar)
         distance = (
             intensity_base * self.cfg.adj_spread_intensity
             + vol_scalar * self.cfg.adj_spread_volatility
         )
+        # Instructor values are directional alpha signals, so convert them to
+        # a common price shift applied to both sides of the quote.
+        instructor_shift = instructor_scalar * self.cfg.adj_spread_instructor * mid
+        ask_instructor_shift = instructor_shift
+        bid_instructor_shift = instructor_shift
+        if self.cfg.open_passive_only:
+            ask_instructor_shift = max(0.0, ask_instructor_shift)
+            bid_instructor_shift = min(0.0, bid_instructor_shift)
         skew_shift = self._inventory_skew_price_shift(mid=mid)
 
-        ask_price = self._price_ceil(rounded_best_ask + distance + skew_shift)
-        bid_price = self._price_floor(rounded_best_bid - distance + skew_shift)
+        ask_price = self._price_ceil(
+            rounded_best_ask + distance + ask_instructor_shift + skew_shift
+        )
+        bid_price = self._price_floor(
+            rounded_best_bid - distance + bid_instructor_shift + skew_shift
+        )
 
         ask_qty, bid_qty = self._base_symmetric_qty(mid=mid)
         ask_qty, bid_qty = self._apply_inventory_limit(mid=mid, ask_qty=ask_qty, bid_qty=bid_qty)
@@ -1317,6 +1345,14 @@ class SimpleMakerStrategy:
         if (not math.isfinite(v)) or v < 0.0:
             return 0.0
         return v
+
+    @staticmethod
+    def _safe_finite(value: Optional[float]) -> float:
+        try:
+            v = 0.0 if value is None else float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return v if math.isfinite(v) else 0.0
 
     def _selected_intensity_spec(self) -> dict[str, int | str]:
         return {

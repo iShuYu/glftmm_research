@@ -17,6 +17,7 @@ if __package__ is None or __package__ == "":
 
 from sampler.resample import (  # noqa: E402
     DEFAULT_BOOKTICKER_ROOT,
+    TICKER_VALUE_COLUMNS,
     atomic_write_parquet,
     config_paths,
     day_timestamp_grid,
@@ -25,6 +26,7 @@ from sampler.resample import (  # noqa: E402
     input_candidate_paths,
     input_path as raw_input_path,
     normalize_category,
+    output_path as sampled_ticker_path,
     previous_date_str,
     resolve_existing_input_path,
 )
@@ -33,7 +35,7 @@ from sampler.resample import (  # noqa: E402
 DEFAULT_DATA_ROOT = DEFAULT_BOOKTICKER_ROOT.parent
 DEFAULT_TRADE_ROOT = DEFAULT_DATA_ROOT / "TRADE"
 DEFAULT_INSTRUCTOR_ROOT = DEFAULT_DATA_ROOT / "INSTRUCTOR"
-SUPPORTED_INSTRUCTORS = ("trade_imbalance",)
+SUPPORTED_INSTRUCTORS = ("trade_imbalance", "bbo_imbalance")
 RAW_TRADE_TIME_COLUMN = "exchange_timestamp"
 RAW_TRADE_COLUMNS = (RAW_TRADE_TIME_COLUMN, "price", "volume", "is_buyer_maker")
 EPS = 1e-8
@@ -47,6 +49,7 @@ class Task:
     indicator: str
     lookback: int
     trade_roots: tuple[Path, ...]
+    ticker_cache_root: Path
     output_root: Path
     trade_category: str
     overwrite: bool
@@ -126,6 +129,33 @@ def read_trade_frame(
     )
     raw_df = pd.read_parquet(path, columns=list(RAW_TRADE_COLUMNS))
     return normalize_trade_frame(raw_df)
+
+
+def read_sampled_ticker_frame(
+    root: Path,
+    symbol: str,
+    date_str: str,
+    freq_ms: int,
+) -> pd.DataFrame:
+    path = sampled_ticker_path(
+        root=root,
+        symbol=symbol,
+        freq_ms=freq_ms,
+        date_str=date_str,
+    )
+    if not path.exists():
+        raise FileNotFoundError(f"missing sampled ticker: {path}")
+
+    columns = ("timestamp", *TICKER_VALUE_COLUMNS)
+    frame = pd.read_parquet(path, columns=list(columns))
+    missing = set(columns) - set(frame.columns)
+    if missing:
+        raise ValueError(f"sampled ticker missing columns: {sorted(missing)}")
+
+    frame["timestamp"] = frame["timestamp"].astype("int64")
+    for column in TICKER_VALUE_COLUMNS:
+        frame[column] = frame[column].astype("float64")
+    return frame.sort_values("timestamp", kind="mergesort", ignore_index=True)
 
 
 def lookback_periods(lookback: int, freq_ms: int) -> int:
@@ -232,6 +262,31 @@ def build_trade_imbalance_frame(
     return out.loc[:, ["timestamp", "instructor"]]
 
 
+def build_bbo_imbalance_frame(
+    symbol: str,
+    date: str,
+    freq_ms: int,
+    lookback: int,
+    ticker_cache_root: Path,
+) -> pd.DataFrame:
+    if int(lookback) != 0:
+        raise ValueError("bbo_imbalance only supports lookback 0")
+    ticker = read_sampled_ticker_frame(
+        root=ticker_cache_root,
+        symbol=symbol,
+        date_str=date,
+        freq_ms=freq_ms,
+    )
+    bid_qty = ticker["best_bid_qty"].to_numpy(dtype="float64")
+    ask_qty = ticker["best_ask_qty"].to_numpy(dtype="float64")
+
+    out = ticker.loc[:, ["timestamp"]].copy()
+    out["instructor"] = (bid_qty - ask_qty) / (bid_qty + ask_qty + EPS)
+    out["timestamp"] = out["timestamp"].astype("int64")
+    out["instructor"] = out["instructor"].astype("float64")
+    return out.loc[:, ["timestamp", "instructor"]]
+
+
 def build_trade_instructor_frame(
     symbol: str,
     date: str,
@@ -240,6 +295,7 @@ def build_trade_instructor_frame(
     indicator: str,
     trade_roots: Any,
     trade_category: str = "TRADE",
+    ticker_cache_root: Path | None = None,
 ) -> pd.DataFrame:
     if indicator == "trade_imbalance":
         return build_trade_imbalance_frame(
@@ -249,6 +305,16 @@ def build_trade_instructor_frame(
             lookback=lookback,
             trade_roots=trade_roots,
             trade_category=trade_category,
+        )
+    if indicator == "bbo_imbalance":
+        if ticker_cache_root is None:
+            raise ValueError("ticker_cache_root is required for bbo_imbalance")
+        return build_bbo_imbalance_frame(
+            symbol=symbol,
+            date=date,
+            freq_ms=freq_ms,
+            lookback=lookback,
+            ticker_cache_root=ticker_cache_root,
         )
     raise ValueError(f"unsupported instructor indicator: {indicator}")
 
@@ -309,6 +375,7 @@ def run_one(task: Task) -> str:
             indicator=task.indicator,
             trade_roots=task.trade_roots,
             trade_category=task.trade_category,
+            ticker_cache_root=task.ticker_cache_root,
         )
 
         if task.strict_validate:
@@ -330,6 +397,21 @@ def config_path(cfg: dict[str, Any], *keys: str, default: Path) -> Path:
     return config_paths(cfg, *keys, default=default)[0]
 
 
+def normalize_instructor_lookbacks(indicator: str, raw_lookbacks: Any) -> list[int]:
+    lookbacks = [int(x) for x in ensure_list(raw_lookbacks)]
+    if indicator == "bbo_imbalance":
+        if not lookbacks:
+            raise ValueError("indicator bbo_imbalance requires lookback 0")
+        if any(x != 0 for x in lookbacks):
+            raise ValueError("indicator bbo_imbalance only supports lookback 0")
+        return [0]
+
+    lookbacks = [x for x in lookbacks if x > 0]
+    if not lookbacks:
+        raise ValueError(f"indicator {indicator} requires positive lookback list")
+    return lookbacks
+
+
 def parse_indicator_lookbacks(instructor_cfg: dict[str, Any]) -> dict[str, list[int]]:
     indicators_raw = instructor_cfg.get("indicators")
     if isinstance(indicators_raw, dict) and indicators_raw:
@@ -345,11 +427,10 @@ def parse_indicator_lookbacks(instructor_cfg: dict[str, Any]) -> dict[str, list[
                 raise ValueError(f"indicator config must be object: {name}")
             if not bool(item.get("enabled", True)):
                 continue
-            lookbacks = [int(x) for x in ensure_list(item.get("lookback", []))]
-            lookbacks = [x for x in lookbacks if x > 0]
-            if not lookbacks:
-                raise ValueError(f"indicator {name} requires positive lookback list")
-            indicator_lbs[key] = lookbacks
+            indicator_lbs[key] = normalize_instructor_lookbacks(
+                key,
+                item.get("lookback", []),
+            )
         return indicator_lbs
 
     indicators = [
@@ -369,16 +450,10 @@ def parse_indicator_lookbacks(instructor_cfg: dict[str, Any]) -> dict[str, list[
                 f"unsupported instructor indicator: {indicator}, "
                 f"supported={SUPPORTED_INSTRUCTORS}"
             )
-        lookbacks = [
-            int(x)
-            for x in ensure_list(
-                instructor_cfg.get("lookback", instructor_cfg.get("lookback_instructor", []))
-            )
-        ]
-        lookbacks = [x for x in lookbacks if x > 0]
-        if not lookbacks:
-            raise ValueError("instructor.lookback requires positive values")
-        indicator_lbs[indicator] = lookbacks
+        indicator_lbs[indicator] = normalize_instructor_lookbacks(
+            indicator,
+            instructor_cfg.get("lookback", instructor_cfg.get("lookback_instructor", [])),
+        )
     return indicator_lbs
 
 
@@ -407,6 +482,18 @@ def build_tasks(cfg: dict[str, Any]) -> list[Task]:
     if not indicator_lbs:
         raise ValueError("no enabled indicators found in instructor config")
 
+    output_root = config_path(
+        cfg,
+        "instructor_cache_root",
+        "output_root",
+        default=DEFAULT_INSTRUCTOR_ROOT,
+    )
+    ticker_cache_root = config_path(
+        cfg,
+        "ticker_cache_root",
+        "sampled_ticker_root",
+        default=output_root,
+    )
     trade_category = normalize_category(
         instructor_cfg.get("trade_category", cfg.get("trade_category", "TRADE")),
         default="TRADE",
@@ -418,12 +505,6 @@ def build_tasks(cfg: dict[str, Any]) -> list[Task]:
         "trade_root",
         "trades_root",
         default=trade_root_default,
-    )
-    output_root = config_path(
-        cfg,
-        "instructor_cache_root",
-        "output_root",
-        default=DEFAULT_INSTRUCTOR_ROOT,
     )
 
     overwrite = bool(instructor_cfg.get("overwrite", cfg.get("overwrite", False)))
@@ -446,6 +527,7 @@ def build_tasks(cfg: dict[str, Any]) -> list[Task]:
                     indicator=indicator,
                     lookback=lookback,
                     trade_roots=trade_roots,
+                    ticker_cache_root=ticker_cache_root,
                     output_root=output_root,
                     trade_category=trade_category,
                     overwrite=overwrite,
@@ -524,6 +606,11 @@ def build_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     if path
                 ],
+                "ticker_cache_root": (
+                    args.ticker_cache_root
+                    or args.output_root
+                    or str(DEFAULT_INSTRUCTOR_ROOT)
+                ),
                 "output_root": args.output_root or str(DEFAULT_INSTRUCTOR_ROOT),
             },
             "instructor": {
@@ -562,6 +649,8 @@ def build_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
         cfg["paths"]["trade_roots"] = [str(path) for path in dict.fromkeys(roots)]
     if args.output_root is not None:
         cfg["paths"]["output_root"] = args.output_root
+    if args.ticker_cache_root is not None:
+        cfg["paths"]["ticker_cache_root"] = args.ticker_cache_root
 
     cfg.setdefault("instructor", {})
     if args.trade_category is not None:
@@ -572,17 +661,23 @@ def build_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Compute trade-derived instructor features")
+    parser = argparse.ArgumentParser(description="Compute instructor features")
     parser.add_argument("--config", help="optional JSON config path")
     parser.add_argument("--symbols", nargs="+", default=["BTCUSDT"])
     parser.add_argument("--date-start")
     parser.add_argument("--date-end")
     parser.add_argument("--freq", nargs="+", type=int, default=[1000])
-    parser.add_argument("--indicators", nargs="+", choices=SUPPORTED_INSTRUCTORS, default=["trade_imbalance"])
+    parser.add_argument(
+        "--indicators",
+        nargs="+",
+        choices=SUPPORTED_INSTRUCTORS,
+        default=["trade_imbalance"],
+    )
     parser.add_argument("--lookback-instructor", "--lookback", nargs="+", type=int, default=[60])
     parser.add_argument("--trade-root")
     parser.add_argument("--trade-backup-root")
     parser.add_argument("--trade-category")
+    parser.add_argument("--ticker-cache-root")
     parser.add_argument("--output-root")
     parser.add_argument("--compression", default="snappy")
     parser.add_argument("--workers", type=int, default=1)
@@ -599,11 +694,37 @@ def main() -> None:
         tasks = build_tasks(cfg)
         print(f"would process {len(tasks)} tasks")
         for task in tasks[:10]:
+            if task.indicator == "bbo_imbalance":
+                input_desc = "ticker=" + str(
+                    sampled_ticker_path(
+                        task.ticker_cache_root,
+                        task.symbol,
+                        task.freq_ms,
+                        task.date,
+                    )
+                )
+            else:
+                input_desc = "trade=" + str(
+                    input_candidate_paths(
+                        task.trade_roots,
+                        task.symbol,
+                        task.date,
+                        task.trade_category,
+                    )
+                )
+            output_path = instructor_output_path(
+                task.output_root,
+                task.symbol,
+                task.indicator,
+                task.freq_ms,
+                task.lookback,
+                task.date,
+            )
             print(
                 f"  - {task.indicator} {task.symbol} {task.date} "
                 f"freq={task.freq_ms}ms lookback={task.lookback} "
-                f"trade={input_candidate_paths(task.trade_roots, task.symbol, task.date, task.trade_category)} "
-                f"output={instructor_output_path(task.output_root, task.symbol, task.indicator, task.freq_ms, task.lookback, task.date)}"
+                f"{input_desc} "
+                f"output={output_path}"
             )
         if len(tasks) > 10:
             print(f"  ... and {len(tasks) - 10} more")

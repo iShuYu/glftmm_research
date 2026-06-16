@@ -42,7 +42,7 @@ TICKER_COLUMNS = (
 )
 PROJECT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "sampler" / "config.json"
 DEFAULT_CACHE_ROOT = Path("/data/users/kang/backtest/glftmm_var/cached")
-DEFAULT_DATA_ROOT = Path("/data/users/data-helper/PROCESSED/RHDT/BINANCE/UFUTURES")
+DEFAULT_DATA_ROOT = Path("/data/users/data-helper/PROCESSED/TARDIS/BINANCE/UFUTURES")
 DEFAULT_BACKUP_DATA_ROOT = Path("/home/kang/data_helper/PROCESSED/DATA_RECORDER/BINANCE/UFUTURES")
 
 
@@ -419,7 +419,10 @@ class BinanceEventLoader:
         if not name:
             raise ValueError("indicator name must not be empty")
         lookback = int(spec.get("lookback", 0))
-        if lookback <= 0:
+        if name == "bbo_imbalance":
+            if lookback != 0:
+                raise ValueError("bbo_imbalance lookback must be 0")
+        elif lookback <= 0:
             raise ValueError(f"{name} lookback must be > 0")
         return name, lookback
 

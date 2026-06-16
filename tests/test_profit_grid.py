@@ -34,6 +34,8 @@ def make_config(**overrides):
         "phase_mode": "market",
         "max_holding_time": -1,
         "adj_spread_intensity": 1.0,
+        "adj_spread_instructor": 0.0,
+        "open_passive_only": False,
         "adj_spread_volatility": 0.0,
         "inventory_skew": (0.0, 1.0),
         "min_order_qty": 0.0,
@@ -65,6 +67,8 @@ def raw_config(**overrides):
         "phase_mode": "market",
         "max_holding_time": -1,
         "adj_spread_intensity": 1.0,
+        "adj_spread_instructor": 0.0,
+        "open_passive_only": False,
         "adj_spread_volatility": 0.0,
         "min_order_qty": 0.0,
         "min_order_notional": 0.0,
@@ -297,12 +301,170 @@ class ProfitGridConfigTest(unittest.TestCase):
 
         self.assertEqual(cfg.phase_mode, "trade")
 
+    def test_build_config_parses_instructor_alpha_adjustment(self):
+        cfg = _build_simulation_config(
+            raw_config(
+                name_instructor="trade_imbalance",
+                lookback_instructor=5,
+                adj_spread_instructor=-1e-5,
+                open_passive_only=True,
+            )["simulation"]
+        )
+
+        self.assertEqual(cfg.name_instructor, "trade_imbalance")
+        self.assertEqual(cfg.lookback_instructor, 5)
+        self.assertEqual(cfg.adj_spread_instructor, -1e-5)
+        self.assertTrue(cfg.open_passive_only)
+
+    def test_build_config_allows_bbo_imbalance_zero_lookback(self):
+        cfg = _build_simulation_config(
+            raw_config(
+                name_instructor="bbo_imbalance",
+                lookback_instructor=0,
+            )["simulation"]
+        )
+
+        self.assertEqual(cfg.name_instructor, "bbo_imbalance")
+        self.assertEqual(cfg.lookback_instructor, 0)
+
     def test_invalid_phase_mode_is_rejected(self):
         with self.assertRaises(ValueError):
             _build_simulation_config(raw_config(phase_mode="last_open")["simulation"])
 
 
 class ProfitGridStrategyTest(unittest.TestCase):
+    def test_instructor_shifts_open_quotes_in_mid_price_units(self):
+        engine = SimpleMakerStrategy(make_config(adj_spread_instructor=0.002))
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=99.8,
+            best_ask=100.2,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+            instructor_value=0.5,
+        )
+
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.ask_maker),
+            [(100.3, 1.0)],
+        )
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.bid_maker),
+            [(99.9, 1.0)],
+        )
+
+    def test_open_passive_only_clips_alpha_shift_crossing_ask(self):
+        engine = SimpleMakerStrategy(
+            make_config(adj_spread_instructor=-0.002, open_passive_only=True)
+        )
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=99.8,
+            best_ask=100.2,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+            instructor_value=0.5,
+        )
+
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.ask_maker),
+            [(100.2, 1.0)],
+        )
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.bid_maker),
+            [(99.7, 1.0)],
+        )
+
+    def test_open_passive_only_clips_alpha_shift_crossing_bid(self):
+        engine = SimpleMakerStrategy(
+            make_config(adj_spread_instructor=0.002, open_passive_only=True)
+        )
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=99.8,
+            best_ask=100.2,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+            instructor_value=0.5,
+        )
+
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.ask_maker),
+            [(100.3, 1.0)],
+        )
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.bid_maker),
+            [(99.8, 1.0)],
+        )
+
+    def test_open_passive_only_ignores_tightening_alpha_without_clipping_distance(self):
+        engine = SimpleMakerStrategy(
+            make_config(adj_spread_instructor=0.002, open_passive_only=True)
+        )
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=99.8,
+            best_ask=100.2,
+            intensity_value=0.2,
+            volatility_scalar=0.0,
+            instructor_value=0.5,
+        )
+
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.ask_maker),
+            [(100.5, 1.0)],
+        )
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.bid_maker),
+            [(99.6, 1.0)],
+        )
+
+    def test_open_passive_only_ignores_tightening_ask_alpha_without_clipping_distance(self):
+        engine = SimpleMakerStrategy(
+            make_config(adj_spread_instructor=-0.002, open_passive_only=True)
+        )
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=99.8,
+            best_ask=100.2,
+            intensity_value=0.2,
+            volatility_scalar=0.0,
+            instructor_value=0.5,
+        )
+
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.ask_maker),
+            [(100.4, 1.0)],
+        )
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.bid_maker),
+            [(99.5, 1.0)],
+        )
+
+    def test_instructor_does_not_move_profit_grid_close_levels(self):
+        engine = SimpleMakerStrategy(make_config(adj_spread_instructor=-0.01))
+        set_position(engine, qty=1.0, cost=100.0)
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=100.4,
+            best_ask=100.6,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+            instructor_value=1.0,
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.ask_maker),
+            [(101.0, 0.334), (102.0, 0.333), (103.0, 0.333)],
+        )
+
     def test_inventory_limit_uses_cost_notional_not_mark_notional(self):
         engine = SimpleMakerStrategy(make_config(max_position_usdt=150.0))
         set_position(engine, qty=1.0, cost=100.0)
