@@ -17,8 +17,8 @@ from typing import Any
 import pandas as pd
 
 try:
-    from glftmm_var.sim.loader import BinanceEventLoader
-    from glftmm_var.sim.strategy import (
+    from glftmm_lot.sim.loader import BinanceEventLoader
+    from glftmm_lot.sim.strategy import (
         SimulationConfig,
         SimpleMakerStrategy,
         normalize_profit_grid_spec,
@@ -42,7 +42,7 @@ MIN_DAYS_FOR_LOW_ANNUALIZED_STOP = 60
 MIN_ANNUALIZED_RETURN_RATIO = 0.2
 MAX_DRAWDOWN_LIMIT_RATIO = 0.2
 _MAX_POSITION_RE = re.compile(
-    r"(?:^|__)mp([0-9]+(?:p[0-9]+)?(?:e[+-]?[0-9]+)?)(?:$|__)"
+    r"(?:^|__)mp([0-9peE+\-x]+)(?:$|__)"
 )
 
 SIM_REQUIRED_KEYS = (
@@ -73,8 +73,6 @@ PARAM_KEY_ALIAS = {
     "lookback_intensity": "lbi",
     "order_amt": "oa",
     "max_position_usdt": "mp",
-    "phase_change_position": "pcp",
-    "phase_mode": "phm",
     "max_holding_time": "mht",
     "freq": "fr",
     "adj_spread_intensity": "asi",
@@ -96,8 +94,6 @@ SIM_OPTIONAL_KEYS = (
     "name_volatility",
     "lookback_instructor",
     "lookback_volatility",
-    "phase_change_position",
-    "phase_mode",
     "max_holding_time",
     "adj_spread_intensity",
     "adj_spread_instructor",
@@ -112,6 +108,7 @@ SIM_OPTIONAL_KEYS = (
     "profit_grid_qty_distribution",
 )
 SIM_ALLOWED_KEYS = set(SIM_REQUIRED_KEYS) | set(SIM_OPTIONAL_KEYS)
+LOT_PAIRED_KEYS = ("max_position_usdt", "stoploss")
 
 
 @dataclass(frozen=True)
@@ -168,6 +165,47 @@ def _normalize_profit_grid_value(value: Any) -> list[float | int | str]:
         qty_dist.kind,
         float(qty_dist.param),
     ]
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _normalize_max_position_lot_value(value: Any) -> list[float]:
+    if _is_number(value):
+        lots = [float(value)]
+    elif isinstance(value, (list, tuple)) and value and all(_is_number(item) for item in value):
+        lots = [float(item) for item in value]
+    else:
+        raise ValueError(
+            "simulation.max_position_usdt must be a number or a non-empty list of numbers"
+        )
+    if not all(math.isfinite(item) and item >= 0.0 for item in lots):
+        raise ValueError("simulation.max_position_usdt lots must be finite and >= 0")
+    return lots
+
+
+def _normalize_stoploss_lot_value(value: Any) -> list[float]:
+    if _is_number(value):
+        lots = [float(value)]
+    elif isinstance(value, (list, tuple)) and value and all(_is_number(item) for item in value):
+        lots = [float(item) for item in value]
+    else:
+        raise ValueError(
+            "simulation.stoploss must be a number or a non-empty list of numbers"
+        )
+    if not all(math.isfinite(item) and item >= 0.0 for item in lots):
+        raise ValueError("simulation.stoploss lots must be finite and >= 0")
+    return lots
+
+
+def _max_position_total(value: Any) -> float | None:
+    try:
+        lots = _normalize_max_position_lot_value(value)
+    except (TypeError, ValueError):
+        return None
+    total = float(sum(lots))
+    return total if math.isfinite(total) and total > 0.0 else None
 
 
 def parse_date_input(s: str) -> datetime:
@@ -300,6 +338,40 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
             for row in qty_dist_rows
         ]
 
+    if "max_position_usdt" in sim_raw:
+        max_pos_raw = sim_raw["max_position_usdt"]
+        if _is_number(max_pos_raw):
+            max_pos_rows = [max_pos_raw]
+        elif (
+            isinstance(max_pos_raw, (list, tuple))
+            and max_pos_raw
+            and all(_is_number(item) for item in max_pos_raw)
+        ):
+            max_pos_rows = [max_pos_raw]
+        else:
+            max_pos_rows = ensure_list_map({"max_position_usdt": max_pos_raw})[
+                "max_position_usdt"
+            ]
+        sim_map["max_position_usdt"] = [
+            _normalize_max_position_lot_value(row) for row in max_pos_rows
+        ]
+
+    if "stoploss" in sim_raw:
+        stoploss_raw = sim_raw["stoploss"]
+        if _is_number(stoploss_raw):
+            stoploss_rows = [stoploss_raw]
+        elif (
+            isinstance(stoploss_raw, (list, tuple))
+            and stoploss_raw
+            and all(_is_number(item) for item in stoploss_raw)
+        ):
+            stoploss_rows = [stoploss_raw]
+        else:
+            stoploss_rows = ensure_list_map({"stoploss": stoploss_raw})["stoploss"]
+        sim_map["stoploss"] = [
+            _normalize_stoploss_lot_value(row) for row in stoploss_rows
+        ]
+
     if "open_curve_underwater" in sim_map:
         open_curve_rows = ensure_list_map(
             {"open_curve_underwater": sim_map["open_curve_underwater"]}
@@ -321,6 +393,50 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
     if missing:
         raise ValueError(f"missing simulation keys: {missing}")
     return sim_map
+
+
+def _build_lot_param_rows(sim_map: dict[str, list[Any]]) -> list[dict[str, Any]]:
+    max_position_rows = sim_map.get("max_position_usdt")
+    stoploss_rows = sim_map.get("stoploss")
+    if max_position_rows is None and stoploss_rows is None:
+        return [{}]
+    if max_position_rows is None:
+        return [{"stoploss": row} for row in stoploss_rows or []]
+    if stoploss_rows is None:
+        multi_lot_rows = [
+            idx
+            for idx, row in enumerate(max_position_rows, start=1)
+            if isinstance(row, (list, tuple)) and len(row) != 1
+        ]
+        if multi_lot_rows:
+            raise ValueError(
+                "simulation.stoploss is required when simulation.max_position_usdt "
+                "uses multiple lots"
+            )
+        return [{"max_position_usdt": row} for row in max_position_rows]
+
+    if len(max_position_rows) != len(stoploss_rows):
+        raise ValueError(
+            "simulation.max_position_usdt and simulation.stoploss must have the "
+            "same number of vectorized rows"
+        )
+
+    lot_rows: list[dict[str, Any]] = []
+    for idx, (max_position_row, stoploss_row) in enumerate(
+        zip(max_position_rows, stoploss_rows), start=1
+    ):
+        if len(max_position_row) != len(stoploss_row):
+            raise ValueError(
+                "simulation.max_position_usdt and simulation.stoploss row "
+                f"{idx} must have the same number of lots"
+            )
+        lot_rows.append(
+            {
+                "max_position_usdt": max_position_row,
+                "stoploss": stoploss_row,
+            }
+        )
+    return lot_rows
 
 
 def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
@@ -385,9 +501,7 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
         ),
         lookback_volatility=lookback_volatility,
         order_amt=float(raw["order_amt"]),
-        max_position_usdt=float(raw["max_position_usdt"]),
-        phase_change_position=float(raw.get("phase_change_position", 0.0)),
-        phase_mode=str(raw.get("phase_mode", "market")).strip().lower(),
+        max_position_usdt=_normalize_max_position_lot_value(raw["max_position_usdt"]),
         max_holding_time=int(raw.get("max_holding_time", 0)),
         adj_spread_intensity=float(raw.get("adj_spread_intensity", 1.0)),
         adj_spread_instructor=float(raw.get("adj_spread_instructor", 0.0)),
@@ -396,7 +510,7 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
         inventory_skew=inventory_skew,
         min_order_qty=float(raw.get("min_order_qty", 0.0)),
         min_order_notional=float(raw.get("min_order_notional", 0.0)),
-        stoploss=float(raw.get("stoploss", 0.0)),
+        stoploss=_normalize_stoploss_lot_value(raw.get("stoploss", 0.0)),
         open_curve_underwater=open_curve,
         profit_grid=profit_grid,
         profit_grid_qty_distribution=profit_grid_qty_distribution,
@@ -642,7 +756,13 @@ def _state_max_pnl_ever(state: dict[str, Any]) -> float | None:
 
 
 def _state_max_position_usdt(state: dict[str, Any]) -> float | None:
+    max_pos = _max_position_total(state.get("max_position_lots"))
+    if max_pos is not None:
+        return max_pos
     max_pos_raw = state.get("max_position_usdt")
+    if isinstance(max_pos_raw, (list, tuple)):
+        max_pos = _max_position_total(max_pos_raw)
+        return max_pos
     try:
         max_pos = float(max_pos_raw)
     except (TypeError, ValueError):
@@ -751,7 +871,7 @@ def _parse_max_position_usdt_from_path(path: str) -> float | None:
             continue
         token = match.group(1).replace("p", ".")
         try:
-            value = float(token)
+            value = sum(float(item) for item in token.split("x") if item)
         except ValueError:
             return None
         if math.isfinite(value) and value > 0.0:
@@ -1003,7 +1123,7 @@ def _run_daily_incremental(
         _annotate_state_for_stops(
             day_state,
             prev_max_pnl_ever=prev_max_pnl_ever,
-            max_position_usdt=float(simulation.max_position_usdt),
+            max_position_usdt=simulation.total_max_position_usdt,
         )
         day_total_pnl = _state_total_pnl(day_state)
         day_annualized_return_ratio = _state_annualized_return_ratio(day_state)
@@ -1062,14 +1182,25 @@ def _build_tasks(cfg: dict[str, Any]) -> list[Task]:
     dates = generate_dates(cfg["date_start"], cfg["date_end"])
     sim_map = _normalize_sim_param_map(cfg)
 
-    sim_keys = sorted(sim_map.keys())
+    lot_param_rows = _build_lot_param_rows(sim_map)
+    sim_keys = sorted(k for k in sim_map.keys() if k not in LOT_PAIRED_KEYS)
     sim_lists = [sim_map[k] for k in sim_keys]
     tasks: list[Task] = []
     for symbol in symbols:
         combos = itertools.product(*sim_lists) if sim_lists else [()]
         for combo in combos:
             sim_params = {k: combo[i] for i, k in enumerate(sim_keys)}
-            tasks.append(Task(symbol=str(symbol), dates=dates, sim_params=sim_params, cfg=cfg))
+            for lot_params in lot_param_rows:
+                paired_sim_params = dict(sim_params)
+                paired_sim_params.update(lot_params)
+                tasks.append(
+                    Task(
+                        symbol=str(symbol),
+                        dates=dates,
+                        sim_params=paired_sim_params,
+                        cfg=cfg,
+                    )
+                )
     return tasks
 
 

@@ -10,7 +10,7 @@
   "ticker_category": "BOOKTICKER",
   "trade_category": "TRADE",
   "paths": {
-    "output_dir": "/data/users/kang/backtest/glftmm_var/result"
+    "output_dir": "/data/users/kang/backtest/glftmm_lot/result"
   },
   "simulation": {
     "mode": [
@@ -56,37 +56,30 @@
     "lookback_intensity": [
       300
     ],
-    "max_position_usdt": [
-      500000
-    ],
-    "phase_change_position": [
-      300000
-    ],
-    "phase_mode": [
-      "market"
-    ],
     "max_holding_time": [
       -1
     ],
+    "max_position_usdt": [
+      [100000, 100000, 100000, 100000, 100000]
+    ],
     "stoploss": [
-      0.1
+      [20000, 20000, 20000, 20000, 20000]
     ],
     "order_amt": [
-      1000
+      1000,
+      2000
     ],
     "min_order_qty": [
       0.0
     ],
     "adj_spread_intensity": [
-      1.0
+      1.0,
+      1.5
     ],
     "adj_spread_instructor": [
-      0,
-      1e-5,
-      5e-5
+      0
     ],
     "open_passive_only": [
-      false,
       true
     ],
     "adj_spread_volatility": [
@@ -122,10 +115,9 @@
       ],
       [
         2,
-        52,
-        10,
-        "exponential",
-        0.5
+        22,
+        5,
+        "exponential"
       ]
     ],
     "open_curve_underwater": [
@@ -144,6 +136,6 @@
     "summary_csv": "strategy_summary.csv"
   },
   "parallel": {
-    "num_workers": 48
+    "num_workers": 32
   }
 }

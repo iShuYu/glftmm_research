@@ -1,0 +1,213 @@
+\documentclass[11pt,a4paper]{ctexart}
+
+\usepackage[margin=2.0cm]{geometry}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage[hidelinks]{hyperref}
+
+\usetikzlibrary{arrows.meta,positioning,calc}
+
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.45em}
+\linespread{1.15}
+\sloppy
+
+\definecolor{lotblue}{HTML}{2563EB}
+\definecolor{lotgreen}{HTML}{16A34A}
+\definecolor{lotorange}{HTML}{EA580C}
+\definecolor{lotred}{HTML}{DC2626}
+\definecolor{lotgray}{HTML}{64748B}
+\definecolor{lotline}{HTML}{334155}
+\definecolor{lotfill}{HTML}{F8FAFC}
+\definecolor{lotsoftblue}{HTML}{DBEAFE}
+\definecolor{lotsoftgreen}{HTML}{DCFCE7}
+\definecolor{lotsoftorange}{HTML}{FFEDD5}
+\definecolor{lotsoftred}{HTML}{FEE2E2}
+\definecolor{lotsoftgray}{HTML}{E2E8F0}
+
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+
+\tikzset{
+  lot/.style={
+    draw=lotline,
+    rounded corners=2pt,
+    fill=lotfill,
+    align=center,
+    minimum width=2.0cm,
+    minimum height=1.05cm,
+    inner xsep=4pt,
+    inner ysep=4pt,
+    font=\small
+  },
+  emptylot/.style={lot, draw=lotgray, fill=lotsoftgray},
+  openlot/.style={lot, draw=lotblue, fill=lotsoftblue},
+  closelot/.style={lot, draw=lotgreen, fill=lotsoftgreen},
+  fulllot/.style={lot, draw=lotorange, fill=lotsoftorange},
+  stoplot/.style={lot, draw=lotred, fill=lotsoftred},
+  arrow/.style={-{Latex[length=2.3mm]}, thick, draw=lotline},
+  bluearrow/.style={-{Latex[length=2.3mm]}, thick, draw=lotblue},
+  greenarrow/.style={-{Latex[length=2.3mm]}, thick, draw=lotgreen},
+  orangearrow/.style={-{Latex[length=2.3mm]}, thick, draw=lotorange},
+  redarrow/.style={-{Latex[length=2.3mm]}, thick, draw=lotred},
+  note/.style={align=left, font=\small, text=lotline}
+}
+
+\title{Multi-Lot 操作机制说明}
+\author{glftmm\_lot}
+\date{2026-06-16}
+
+\begin{document}
+\maketitle
+
+\section{Lot 栈定义}
+
+当前只看 lot 的操作机制，不重复策略 overview。
+
+现在一共有 5 个 lot。起始状态下，5 个 lot 全部都是空 lot。
+从内层到外层，依次标记为 lot 0、lot 1、lot 2、lot 3、lot 4。
+
+\begin{center}
+\begin{tikzpicture}[node distance=5mm]
+  \node[emptylot] (l0) {lot 0\\空};
+  \node[emptylot, right=of l0] (l1) {lot 1\\空};
+  \node[emptylot, right=of l1] (l2) {lot 2\\空};
+  \node[emptylot, right=of l2] (l3) {lot 3\\空};
+  \node[emptylot, right=of l3] (l4) {lot 4\\空};
+  \node[note, above=7mm of l0, align=center] {内层};
+  \node[note, above=7mm of l4, align=center] {外层};
+  \node[note, below=6mm of l2, text width=11.5cm] {
+    初始时没有任何 lot 持仓。第一层仓位只能先从 lot 0 开始建立；
+    后面的 lot 不会提前启用。
+  };
+\end{tikzpicture}
+\end{center}
+
+\section{Open / Close 权限}
+
+核心规则只有一句：只有最外层的非空 lot 能正常 open + close。
+
+如果某一层的外层已经是非空 lot，这一层就只能 close-only。
+close-only 的意思是只能减仓或平仓，不能继续 open。
+它要么等到水上平仓离场，要么触发 stoploss 止损离场。
+
+\begin{center}
+\begin{tikzpicture}[node distance=5mm]
+  \node[closelot] (l0) {lot 0\\有仓位\\close-only};
+  \node[closelot, right=of l0] (l1) {lot 1\\有仓位\\close-only};
+  \node[openlot, right=of l1] (l2) {lot 2\\有仓位\\open + close};
+  \node[emptylot, right=of l2] (l3) {lot 3\\空\\等待};
+  \node[emptylot, right=of l3] (l4) {lot 4\\空\\等待};
+
+  \draw[bluearrow] ($(l2.north)+(0,0.55)$) -- ($(l2.north)+(0,0.05)$);
+  \node[note, above=8mm of l2, align=center] {最外层非空 lot\\正常 open + close};
+
+  \node[note, below=6mm of l2, text width=12cm] {
+    这里 lot 2 是最外层非空 lot，所以 lot 2 能 open + close。
+    lot 0 和 lot 1 的外层已经有非空 lot，所以它们只能 close-only。
+  };
+\end{tikzpicture}
+\end{center}
+
+\section{下一层开启条件}
+
+只有第 \(n\) 层满仓了，才会开启第 \(n+1\) 层。
+一旦第 \(n+1\) 层开启，第 \(n\) 层进入 close-only，不再接新的 open。
+
+\begin{center}
+\begin{tikzpicture}
+  \node[openlot] (a0) at (0,0) {lot n\\非空未满\\open + close};
+  \node[emptylot] (a1) at (5.0,0) {lot n+1\\空\\等待};
+
+  \node[fulllot] (b0) at (0,-2.4) {lot n\\已满仓\\转 close-only};
+  \node[openlot] (b1) at (5.0,-2.4) {lot n+1\\开启\\open + close};
+
+  \draw[orangearrow] (a0.south) -- node[left,font=\small] {lot n 满仓} (b0.north);
+  \draw[bluearrow] (a1.south) -- node[right,font=\small] {被开启} (b1.north);
+  \draw[bluearrow] (b0.east) -- node[below,font=\small] {新 open 交给外层} (b1.west);
+\end{tikzpicture}
+\end{center}
+
+例如 lot 0 满仓后，lot 1 才开启；此时 lot 0 进入 close-only。
+如果 lot 1 也满仓，lot 2 才开启；此时 lot 1 进入 close-only。
+
+\section{订单处理顺序}
+
+一个订单来了，先从内层开始看能不能关掉内层仓位。
+顺序固定从里到外刷一遍：
+
+\[
+\text{lot 0} \rightarrow \text{lot 1} \rightarrow \text{lot 2}
+\rightarrow \text{lot 3} \rightarrow \text{lot 4}
+\]
+
+如果 lot 0 可以被这个订单 close，就先 close lot 0。
+如果订单还有剩余量，再看 lot 1；再剩余，再看 lot 2。
+这个过程一直刷到最外层。
+
+\begin{center}
+  \begin{tikzpicture}[node distance=10mm]
+  \node[closelot] (l0) {lot 0\\先看};
+  \node[closelot, right=of l0] (l1) {lot 1\\再看};
+  \node[openlot, right=of l1] (l2) {lot 2\\再看};
+  \node[emptylot, right=of l2] (l3) {lot 3\\再看};
+  \node[emptylot, right=of l3] (l4) {lot 4\\最后};
+
+  \draw[greenarrow] (l0) -- node[above,font=\scriptsize] {剩余} (l1);
+  \draw[greenarrow] (l1) -- node[above,font=\scriptsize] {剩余} (l2);
+  \draw[greenarrow] (l2) -- node[above,font=\scriptsize] {剩余} (l3);
+  \draw[greenarrow] (l3) -- node[above,font=\scriptsize] {剩余} (l4);
+
+  \node[note, below=6mm of l2, text width=12cm] {
+    这一步的重点是：订单优先给内层退出机会。
+    即使最外层非空 lot 可以 open + close，撮合检查仍然从 lot 0 开始。
+  };
+\end{tikzpicture}
+\end{center}
+
+\section{内部层平完后的旋转}
+
+如果内部某一层被平完了，这一层会被挪到最外层。
+它外面的层整体向内移动一格，所以这些外部层的 index 都减 1。
+
+例子：lot 0、lot 1、lot 2 都有仓位，其中 lot 2 是最外层非空 lot。
+如果内部的 lot 1 被平完，lot 1 会挪到最外层；
+原来的 lot 2 向内移动，index 从 2 变成 1。
+
+\begin{center}
+\begin{tikzpicture}[node distance=5mm]
+  \node[note] at (-0.2,1.25) {平完前};
+  \node[closelot] (a0) at (0,0) {lot 0\\有仓位};
+  \node[closelot] (a1) at (2.25,0) {lot 1\\平完};
+  \node[openlot] (a2) at (4.50,0) {lot 2\\有仓位};
+  \node[emptylot] (a3) at (6.75,0) {lot 3\\空};
+  \node[emptylot] (a4) at (9.00,0) {lot 4\\空};
+
+  \node[note] at (-0.2,-1.65) {平完后};
+  \node[closelot] (b0) at (0,-2.9) {lot 0\\有仓位};
+  \node[openlot] (b1) at (2.25,-2.9) {lot 1\\原 lot 2};
+  \node[emptylot] (b2) at (4.50,-2.9) {lot 2\\原 lot 3};
+  \node[emptylot] (b3) at (6.75,-2.9) {lot 3\\原 lot 4};
+  \node[emptylot] (b4) at (9.00,-2.9) {lot 4\\原 lot 1};
+
+  \draw[arrow] (a0) -- (b0);
+  \draw[bluearrow] (a2) -- node[right,font=\scriptsize] {index - 1} (b1);
+  \draw[bluearrow] (a3) -- node[right,font=\scriptsize] {index - 1} (b2);
+  \draw[bluearrow] (a4) -- node[right,font=\scriptsize] {index - 1} (b3);
+  \draw[orangearrow] (a1) .. controls (5.0,-1.0) and (8.5,-1.6) .. node[right,font=\scriptsize] {挪到最外层} (b4);
+\end{tikzpicture}
+\end{center}
+
+\section{七条规则}
+
+\begin{enumerate}
+  \item 当前是 5 个 lot。
+  \item 起始状态是 5 个 lot 均为空 lot。
+  \item 5 个 lot 从内到外依次标记为 0、1、2、3、4。
+  \item 只有最外层的非空 lot 能正常 open + close；如果一层的外层是非空的，这一层只能 close-only，要么等水上平仓离场，要么止损离场。
+  \item 只有第 \(n\) 层满仓了，才能开启第 \(n+1\) 层；此时第 \(n\) 层进入 close-only。
+  \item 一个订单来了，优先从内层开始看是否能够关掉内层仓位，从里到外刷一遍。
+  \item 当内部某一层被平完了，把这一层挪到最外层，其外部层的 index 减 1。
+\end{enumerate}
+
+\end{document}

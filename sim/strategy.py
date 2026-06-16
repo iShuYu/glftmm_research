@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, Optional, Sequence
 
 import pandas as pd
@@ -286,9 +286,7 @@ class SimulationConfig:
     name_volatility: Optional[str] = None
     lookback_volatility: Optional[int] = None
     order_amt: float = 0.0
-    max_position_usdt: float = 0.0
-    phase_change_position: float = 0.0
-    phase_mode: str = "market"
+    max_position_usdt: float | tuple[float, ...] = 0.0
     max_holding_time: int = 0
     adj_spread_intensity: float = 1.0
     adj_spread_instructor: float = 0.0
@@ -297,7 +295,7 @@ class SimulationConfig:
     inventory_skew: Optional[tuple[float, float]] = None
     min_order_qty: float = 0.0
     min_order_notional: float = 0.0
-    stoploss: float = 0.0
+    stoploss: float | tuple[float, ...] = 0.0
     open_curve_underwater: Optional[tuple[float, float, float]] = None
     profit_grid: Optional[tuple[float, float, int]] = None
     profit_grid_qty_distribution: object | None = None
@@ -313,7 +311,22 @@ class SimulationConfig:
             "profit_grid_qty_distribution",
             profit_grid_qty_distribution,
         )
-        object.__setattr__(self, "phase_mode", str(self.phase_mode).strip().lower())
+        max_position_lots = self._normalize_max_position_lots(self.max_position_usdt)
+        stoploss_lots = self._normalize_stoploss_lots(self.stoploss)
+        if len(stoploss_lots) != len(max_position_lots):
+            raise ValueError(
+                "stoploss and max_position_usdt must have the same number of lots"
+            )
+        object.__setattr__(
+            self,
+            "max_position_usdt",
+            max_position_lots[0] if len(max_position_lots) == 1 else max_position_lots,
+        )
+        object.__setattr__(
+            self,
+            "stoploss",
+            stoploss_lots[0] if len(stoploss_lots) == 1 else stoploss_lots,
+        )
         if self.freq <= 0:
             raise ValueError("freq must be > 0")
         if self.latency < 0:
@@ -344,12 +357,8 @@ class SimulationConfig:
                 raise ValueError("lookback_volatility must be > 0 when name_volatility is provided")
         if self.order_amt < 0:
             raise ValueError("order_amt must be >= 0")
-        if self.max_position_usdt < 0:
-            raise ValueError("max_position_usdt must be >= 0")
-        if self.phase_change_position < 0:
-            raise ValueError("phase_change_position must be >= 0")
-        if self.phase_mode not in ("market", "trade"):
-            raise ValueError("phase_mode must be 'market' or 'trade'")
+        if any(value < 0 for value in max_position_lots):
+            raise ValueError("max_position_usdt lots must be >= 0")
         if self.adj_spread_intensity <= 0:
             raise ValueError("adj_spread_intensity must be > 0")
         if not math.isfinite(float(self.adj_spread_instructor)):
@@ -371,8 +380,8 @@ class SimulationConfig:
             raise ValueError("min_order_qty must be >= 0")
         if self.min_order_notional < 0:
             raise ValueError("min_order_notional must be >= 0")
-        if self.stoploss < 0:
-            raise ValueError("stoploss must be >= 0")
+        if any(value < 0 for value in stoploss_lots):
+            raise ValueError("stoploss lots must be >= 0")
         if self.profit_grid is not None:
             lower_bps = float(self.profit_grid[0])
             upper_bps = float(self.profit_grid[1])
@@ -405,8 +414,44 @@ class SimulationConfig:
     def step_size(self) -> float:
         return 10.0 ** (-self.qty_precision)
 
+    @staticmethod
+    def _normalize_max_position_lots(value: object) -> tuple[float, ...]:
+        if isinstance(value, (list, tuple)):
+            if not value:
+                raise ValueError("max_position_usdt must not be empty")
+            lots = tuple(float(item) for item in value)
+        else:
+            lots = (float(value),)
+        if not all(math.isfinite(item) for item in lots):
+            raise ValueError("max_position_usdt lots must be finite")
+        return lots
 
-class SimpleMakerStrategy:
+    @property
+    def max_position_lots(self) -> tuple[float, ...]:
+        return self._normalize_max_position_lots(self.max_position_usdt)
+
+    @property
+    def total_max_position_usdt(self) -> float:
+        return float(sum(self.max_position_lots))
+
+    @staticmethod
+    def _normalize_stoploss_lots(value: object) -> tuple[float, ...]:
+        if isinstance(value, (list, tuple)):
+            if not value:
+                raise ValueError("stoploss must not be empty")
+            lots = tuple(float(item) for item in value)
+        else:
+            lots = (float(value),)
+        if not all(math.isfinite(item) for item in lots):
+            raise ValueError("stoploss lots must be finite")
+        return lots
+
+    @property
+    def stoploss_lots(self) -> tuple[float, ...]:
+        return self._normalize_stoploss_lots(self.stoploss)
+
+
+class _SingleLotMakerStrategy:
     EPS = 1e-12
 
     def __init__(
@@ -439,11 +484,11 @@ class SimpleMakerStrategy:
         self._max_holding_was_at_limit: bool = False
         self._pending_maker_quotes: deque[PendingMakerQuote] = deque()
         self._active_profit_grid_key: tuple | None = None
-        self._phase_best_mid: Optional[float] = None
-        self._phase_side: int = 0
 
     def snapshot_state(self) -> dict:
         pos = self.manager.position
+        realized_pnl = float(pos.realized_pnl)
+        unrealized_pnl = float(pos.unrealized_pnl)
         return {
             "position": {
                 "qty": float(pos.qty),
@@ -451,18 +496,21 @@ class SimpleMakerStrategy:
                 "mark_notional_usdt": float(pos.mark_notional_usdt),
                 "cost_notional_usdt": float(pos.cost_notional_usdt),
                 "gross_cost_notional_usdt": float(pos.gross_cost_notional_usdt),
-                "realized_pnl": float(pos.realized_pnl),
-                "unrealized_pnl": float(pos.unrealized_pnl),
+                "realized_pnl": realized_pnl,
+                "unrealized_pnl": unrealized_pnl,
                 "mid": float(pos.mid),
             },
+            "realized_pnl": realized_pnl,
+            "unrealized_pnl": unrealized_pnl,
+            "total_pnl": float(realized_pnl + unrealized_pnl),
+            "max_position_usdt": float(self.cfg.max_position_usdt),
+            "stoploss_usdt": float(self.cfg.stoploss),
             "traded_volume": float(self._traded_volume),
             "latest_best_ask": self._latest_best_ask,
             "latest_best_bid": self._latest_best_bid,
             "reach_and_release_active": bool(self._reach_and_release_active),
             "max_holding_start_ts": self._max_holding_start_ts,
             "max_holding_was_at_limit": bool(self._max_holding_was_at_limit),
-            "phase_best_mid": self._phase_best_mid,
-            "phase_side": int(self._phase_side),
             "pending_maker_quotes": [
                 {
                     "active_ts": int(active_ts),
@@ -518,11 +566,6 @@ class SimpleMakerStrategy:
         start_ts_raw = state.get("max_holding_start_ts")
         self._max_holding_start_ts = None if start_ts_raw is None else int(start_ts_raw)
         self._max_holding_was_at_limit = bool(state.get("max_holding_was_at_limit", False))
-        phase_best_mid_raw = state.get("phase_best_mid")
-        self._phase_best_mid = (
-            None if phase_best_mid_raw is None else float(phase_best_mid_raw)
-        )
-        self._phase_side = int(state.get("phase_side", 0))
         self._pending_maker_quotes = deque()
         self._active_profit_grid_key = None
         pending_quotes = state.get("pending_maker_quotes", [])
@@ -652,11 +695,11 @@ class SimpleMakerStrategy:
         is_buyer_maker: bool,
         trade_price: float,
         trade_qty: float,
-    ) -> None:
+    ) -> float:
         trade_price = self._round_to_precision(float(trade_price), self.sim.price_precision)
         trade_qty = self._round_to_precision(float(trade_qty), self.sim.qty_precision)
         if trade_price <= 0.0 or trade_qty <= 0.0:
-            return
+            return 0.0
 
         prev_abs_pos_qty = abs(float(self.manager.position.qty))
         # is_buyer_maker=True means public sell flow hits passive bids.
@@ -689,18 +732,7 @@ class SimpleMakerStrategy:
             timestamp=int(trade_time),
             position_reduced=position_reduced,
         )
-        if self.cfg.phase_mode == "trade":
-            phase_reference = self._phase_reference_from_fills(maker_fills + taker_fills)
-            if phase_reference is not None:
-                self._update_phase_change_tracking(
-                    reference_mid=phase_reference,
-                    position_reduced=position_reduced,
-                )
-        else:
-            self._update_phase_change_tracking(
-                reference_mid=float(trade_price),
-                position_reduced=position_reduced,
-            )
+        return float(filled_qty)
 
     def _on_ticker_event(
         self,
@@ -710,6 +742,7 @@ class SimpleMakerStrategy:
         intensity_value: Optional[float],
         volatility_scalar: float,
         instructor_value: Optional[float] = None,
+        open_allowed: bool = True,
     ) -> None:
         rounded_best_bid = self._round_to_precision(float(best_bid), self.sim.price_precision)
         rounded_best_ask = self._round_to_precision(float(best_ask), self.sim.price_precision)
@@ -769,14 +802,12 @@ class SimpleMakerStrategy:
             best_ask=rounded_best_ask,
             best_bid=rounded_best_bid,
         )
-        ask_levels, bid_levels = self._apply_phase_change_open_gate(
-            mid=mid,
-            ask_levels=ask_levels,
-            bid_levels=bid_levels,
-            close_only=quote_close_only,
-        )
-        if self.cfg.phase_mode == "market" or abs(float(self.manager.position.qty)) <= self.EPS:
-            self._update_phase_change_tracking(reference_mid=mid)
+        if not open_allowed:
+            ask_levels, bid_levels = self._close_only_maker_levels(
+                ask_levels=ask_levels,
+                bid_levels=bid_levels,
+            )
+            quote_close_only = bool(ask_levels or bid_levels)
         self._update_max_holding_tracking(timestamp=timestamp)
 
         if self._should_activate_stoploss(mid=mid):
@@ -831,11 +862,8 @@ class SimpleMakerStrategy:
         )
 
     def _should_activate_stoploss(self, mid: float) -> bool:
-        stoploss_ratio = float(self.cfg.stoploss)
-        if stoploss_ratio <= self.EPS:
-            return False
-        max_pos_usdt = float(self.cfg.max_position_usdt)
-        if max_pos_usdt <= self.EPS:
+        stoploss_usdt = float(self.cfg.stoploss)
+        if stoploss_usdt <= self.EPS:
             return False
 
         pos = self.manager.position
@@ -848,7 +876,7 @@ class SimpleMakerStrategy:
 
         floating_unrealized = pos_qty * (float(mid) - cost)
         floating_loss = max(0.0, -floating_unrealized)
-        return floating_loss + self.EPS >= max_pos_usdt * stoploss_ratio
+        return floating_loss + self.EPS >= stoploss_usdt
 
     def _should_activate_max_holding_timeout(self, timestamp: int) -> bool:
         max_holding_time = int(self.cfg.max_holding_time)
@@ -885,92 +913,9 @@ class SimpleMakerStrategy:
             >= max_pos_usdt
         )
 
-    def _phase_change_active(self) -> bool:
-        threshold = float(self.cfg.phase_change_position)
-        if threshold <= self.EPS:
-            return False
-        pos = self.manager.position
-        pos_qty = float(pos.qty)
-        cost = float(pos.cost)
-        if abs(pos_qty) <= self.EPS or not math.isfinite(cost) or cost <= 0.0:
-            return False
-        return float(pos.gross_cost_notional_usdt) > threshold + self.EPS
-
-    def _phase_open_allowed(self, mid: float, side: int) -> bool:
-        if not self._phase_change_active():
-            return True
-        if self._phase_best_mid is None or self._phase_side != side:
-            return True
-        if side > 0:
-            return float(mid) + self.EPS < float(self._phase_best_mid)
-        if side < 0:
-            return float(mid) > float(self._phase_best_mid) + self.EPS
-        return True
-
-    def _apply_phase_change_open_gate(
-        self,
-        *,
-        mid: float,
-        ask_levels: list[MakerLevel],
-        bid_levels: list[MakerLevel],
-        close_only: bool,
-    ) -> tuple[list[MakerLevel], list[MakerLevel]]:
-        if close_only or not self._phase_change_active():
-            return ask_levels, bid_levels
-
-        pos_qty = float(self.manager.position.qty)
-        if pos_qty > self.EPS and not self._phase_open_allowed(mid=mid, side=1):
-            return ask_levels, []
-        if pos_qty < -self.EPS and not self._phase_open_allowed(mid=mid, side=-1):
-            return [], bid_levels
-        return ask_levels, bid_levels
-
     @staticmethod
     def _filled_qty_from_fills(fills: Sequence[MakerLevel]) -> float:
         return sum(float(qty) for _, qty in fills)
-
-    def _phase_reference_from_fills(
-        self,
-        fills: Sequence[MakerLevel],
-    ) -> Optional[float]:
-        prices = [
-            float(price)
-            for price, qty in fills
-            if float(qty) > self.EPS and math.isfinite(float(price)) and float(price) > 0.0
-        ]
-        if not prices:
-            return None
-
-        pos_qty = float(self.manager.position.qty)
-        if pos_qty > self.EPS:
-            return min(prices)
-        if pos_qty < -self.EPS:
-            return max(prices)
-        return prices[-1]
-
-    def _update_phase_change_tracking(
-        self,
-        reference_mid: float,
-        position_reduced: bool = False,
-    ) -> None:
-        if not math.isfinite(reference_mid) or reference_mid <= 0.0:
-            return
-        pos_qty = float(self.manager.position.qty)
-        if abs(pos_qty) <= self.EPS:
-            self._phase_best_mid = None
-            self._phase_side = 0
-            return
-
-        side = 1 if pos_qty > 0.0 else -1
-        if position_reduced or self._phase_side != side or self._phase_best_mid is None:
-            self._phase_side = side
-            self._phase_best_mid = float(reference_mid)
-            return
-
-        if side > 0:
-            self._phase_best_mid = min(float(self._phase_best_mid), float(reference_mid))
-        else:
-            self._phase_best_mid = max(float(self._phase_best_mid), float(reference_mid))
 
     def _place_reach_and_release_taker(self, mid: float) -> bool:
         del mid
@@ -1141,6 +1086,19 @@ class SimpleMakerStrategy:
         cost_key = None if math.isnan(cost) else self._round_to_precision(cost, self.sim.price_precision)
         return ask_key, bid_key, cost_key
 
+    def _close_only_maker_levels(
+        self,
+        *,
+        ask_levels: Sequence[MakerLevel],
+        bid_levels: Sequence[MakerLevel],
+    ) -> tuple[list[MakerLevel], list[MakerLevel]]:
+        pos_qty = float(self.manager.position.qty)
+        if pos_qty > self.EPS:
+            return list(ask_levels), []
+        if pos_qty < -self.EPS:
+            return [], list(bid_levels)
+        return [], []
+
     def _profit_grid_enabled(self) -> bool:
         return self.cfg.profit_grid is not None
 
@@ -1173,7 +1131,7 @@ class SimpleMakerStrategy:
             )
             return [(price, close_qty)] if price > 0.0 else []
 
-        return build_profit_grid_levels(
+        levels = build_profit_grid_levels(
             lower_bps=float(lower_bps),
             upper_bps=float(upper_bps),
             num_grid=int(num_grid),
@@ -1188,6 +1146,33 @@ class SimpleMakerStrategy:
             min_order_notional=float(self.cfg.min_order_notional),
             qty_distribution=self.cfg.profit_grid_qty_distribution,
         )
+        return self._clip_profit_close_levels_to_bbo(
+            levels=levels,
+            is_long=pos_qty > 0.0,
+            best_ask=best_ask,
+            best_bid=best_bid,
+        )
+
+    def _clip_profit_close_levels_to_bbo(
+        self,
+        *,
+        levels: Sequence[MakerLevel],
+        is_long: bool,
+        best_ask: float,
+        best_bid: float,
+    ) -> list[MakerLevel]:
+        clipped: list[MakerLevel] = []
+        for price, qty in levels:
+            price = float(price)
+            qty = float(qty)
+            if qty <= self.EPS:
+                continue
+            if is_long and price < best_ask:
+                price = float(best_ask)
+            elif (not is_long) and price > best_bid:
+                price = float(best_bid)
+            clipped.append((price, qty))
+        return clipped
 
     def _is_past_profit_upper(self, mid: float, pos_qty: float, cost: float) -> bool:
         if self.cfg.profit_grid is None:
@@ -1381,3 +1366,452 @@ class SimpleMakerStrategy:
                 "lookback": int(self.sim.lookback_volatility),
             }
         ]
+
+
+class SimpleMakerStrategy(_SingleLotMakerStrategy):
+    def __init__(
+        self,
+        simulation: SimulationConfig,
+        strategy: Optional[SimulationConfig] = None,
+        loader: Optional[BinanceEventLoader] = None,
+        position: Optional[Position] = None,
+    ):
+        self._lot_strategies: list[_SingleLotMakerStrategy] = []
+        cfg = strategy or simulation
+        lots = cfg.max_position_lots
+        if len(lots) <= 1:
+            super().__init__(
+                simulation=simulation,
+                strategy=strategy,
+                loader=loader,
+                position=position,
+            )
+            return
+
+        if position is not None:
+            raise ValueError("multi-lot strategy does not support injecting a shared position")
+        self.sim = simulation
+        self.cfg = cfg
+        self.loader = loader or BinanceEventLoader()
+        self._records: list[
+            tuple[int, float, float, float, float, float, float, float, float]
+        ] = []
+        self._lot_strategies = [
+            _SingleLotMakerStrategy(
+                simulation=replace(
+                    simulation,
+                    max_position_usdt=float(max_position_usdt),
+                    stoploss=float(stoploss_usdt),
+                ),
+                strategy=replace(
+                    cfg,
+                    max_position_usdt=float(max_position_usdt),
+                    stoploss=float(stoploss_usdt),
+                ),
+                loader=self.loader,
+            )
+            for max_position_usdt, stoploss_usdt in zip(lots, cfg.stoploss_lots)
+        ]
+        self._active_lot_count: int = 1
+        self._active_lot_indices: list[int] = [0]
+        self._frozen_lot_indices: list[int] = list(range(1, len(self._lot_strategies)))
+
+    @property
+    def _is_multi_lot(self) -> bool:
+        return bool(self._lot_strategies)
+
+    def run_day(self, symbol: str, date: DateLike) -> pd.DataFrame:
+        if not self._is_multi_lot:
+            return super().run_day(symbol=symbol, date=date)
+
+        self._records = []
+        for lot in self._lot_strategies:
+            lot._records = []
+
+        vol_specs = self._selected_volatility_specs()
+        ti_spec = self._selected_intensity_spec()
+        instructor_spec = self._selected_instructor_spec()
+
+        for event in self.loader.iter_merged_alpha_trade_tuples(
+            symbol=symbol,
+            date=date,
+            freq=self.sim.freq,
+            trade_intensity_spec=ti_spec,
+            volatility_specs=vol_specs,
+            instructor_spec=instructor_spec,
+        ):
+            kind = event[0]
+            ts = int(event[1])
+            for lot in self._lot_strategies:
+                lot._activate_pending_maker_quotes(current_timestamp=ts)
+            if kind == "trade":
+                self._on_trade_event(
+                    trade_time=ts,
+                    is_buyer_maker=bool(event[2]),
+                    trade_price=float(event[3]),
+                    trade_qty=float(event[4]),
+                )
+            else:
+                best_bid = float(event[2])
+                best_ask = float(event[3])
+                mid = 0.5 * (best_bid + best_ask)
+                self._sync_lot_stack()
+                self._activate_backup_lot_if_needed(mid=mid)
+                openable_idx = self._openable_lot_index()
+                for idx, lot in enumerate(self._lot_strategies):
+                    if idx >= self._active_lot_count:
+                        self._cancel_inactive_flat_lot(lot)
+                        continue
+                    if idx != openable_idx and not self._lot_has_position(lot):
+                        self._cancel_inactive_flat_lot(lot)
+                        continue
+                    lot._on_ticker_event(
+                        timestamp=ts,
+                        best_bid=best_bid,
+                        best_ask=best_ask,
+                        instructor_value=event[4],
+                        intensity_value=event[5],
+                        volatility_scalar=float(event[6]),
+                        open_allowed=idx == openable_idx,
+                    )
+                self._sync_lot_stack()
+                self._append_aggregate_record(timestamp=ts, mid=mid)
+
+        return pd.DataFrame(
+            self._records,
+            columns=[
+                "timestamp",
+                "price",
+                "position",
+                "mark_notional_usdt",
+                "cost_notional_usdt",
+                "gross_cost_notional_usdt",
+                "realized_pnl",
+                "unrealized_pnl",
+                "traded_volume",
+            ],
+        )
+
+    def run_dates(self, symbol: str, dates: Iterable[DateLike]) -> pd.DataFrame:
+        if not self._is_multi_lot:
+            return super().run_dates(symbol=symbol, dates=dates)
+        frames = [self.run_day(symbol=symbol, date=date) for date in dates]
+        if not frames:
+            return pd.DataFrame(
+                columns=[
+                    "timestamp",
+                    "price",
+                    "position",
+                    "mark_notional_usdt",
+                    "cost_notional_usdt",
+                    "gross_cost_notional_usdt",
+                    "realized_pnl",
+                    "unrealized_pnl",
+                    "traded_volume",
+                ]
+            )
+        return pd.concat(frames, ignore_index=True)
+
+    def snapshot_state(self) -> dict:
+        if not self._is_multi_lot:
+            return super().snapshot_state()
+        lots = [lot.snapshot_state() for lot in self._lot_strategies]
+        state = self._aggregate_state_from_lots(lots)
+        state["lots"] = lots
+        state["max_position_usdt"] = float(
+            sum(float(lot.cfg.max_position_usdt) for lot in self._lot_strategies)
+        )
+        state["max_position_lots"] = [
+            float(lot.cfg.max_position_usdt) for lot in self._lot_strategies
+        ]
+        state["stoploss_lots"] = [
+            float(lot.cfg.stoploss) for lot in self._lot_strategies
+        ]
+        state["active_lot_count"] = int(self._active_lot_count)
+        state["active_lot_indices"] = list(self._active_lot_indices)
+        state["frozen_lot_indices"] = list(self._frozen_lot_indices)
+        return state
+
+    def restore_state(self, state: dict) -> None:
+        if not self._is_multi_lot:
+            super().restore_state(state)
+            return
+        lot_states = state.get("lots") if isinstance(state, dict) else None
+        if not isinstance(lot_states, list):
+            if self._lot_strategies:
+                self._lot_strategies[0].restore_state(state)
+            return
+        for lot, lot_state in zip(self._lot_strategies, lot_states):
+            if isinstance(lot_state, dict):
+                lot.restore_state(lot_state)
+                self._restore_lot_config(lot, lot_state)
+        self._restore_lot_stack(state)
+        self._sync_lot_stack()
+
+    def _append_aggregate_record(self, timestamp: int, mid: float) -> None:
+        state = self._aggregate_state_from_lots(
+            [lot.snapshot_state() for lot in self._lot_strategies]
+        )
+        pos = state["position"]
+        self._records.append(
+            (
+                int(timestamp),
+                float(mid),
+                float(pos["qty"]),
+                float(pos["mark_notional_usdt"]),
+                float(pos["cost_notional_usdt"]),
+                float(pos["gross_cost_notional_usdt"]),
+                float(pos["realized_pnl"]),
+                float(pos["unrealized_pnl"]),
+                float(state["traded_volume"]),
+            )
+        )
+
+    def _on_trade_event(
+        self,
+        trade_time: int,
+        is_buyer_maker: bool,
+        trade_price: float,
+        trade_qty: float,
+    ) -> float:
+        if not self._is_multi_lot:
+            return super()._on_trade_event(
+                trade_time=trade_time,
+                is_buyer_maker=is_buyer_maker,
+                trade_price=trade_price,
+                trade_qty=trade_qty,
+            )
+
+        trade_price = self._round_to_precision(float(trade_price), self.sim.price_precision)
+        trade_qty = self._round_to_precision(float(trade_qty), self.sim.qty_precision)
+        if trade_price <= 0.0 or trade_qty <= 0.0:
+            return 0.0
+
+        self._sync_lot_stack()
+        remaining_qty = trade_qty
+        filled_qty = 0.0
+        for lot in self._lot_strategies[: self._active_lot_count]:
+            if remaining_qty <= self.EPS:
+                break
+            lot_filled = lot._on_trade_event(
+                trade_time=trade_time,
+                is_buyer_maker=is_buyer_maker,
+                trade_price=trade_price,
+                trade_qty=remaining_qty,
+            )
+            lot_filled = min(remaining_qty, max(0.0, float(lot_filled)))
+            if lot_filled <= self.EPS:
+                continue
+            filled_qty = self._round_to_precision(
+                filled_qty + lot_filled,
+                self.sim.qty_precision,
+            )
+            remaining_qty = self._round_to_precision(
+                remaining_qty - lot_filled,
+                self.sim.qty_precision,
+            )
+
+        self._sync_lot_stack()
+        return float(filled_qty)
+
+    def _lot_should_run_on_ticker(self, *, idx: int, mid: float) -> bool:
+        del mid
+        self._sync_lot_stack()
+        if idx < 0 or idx >= self._active_lot_count:
+            return False
+        if idx == self._openable_lot_index():
+            return True
+        return self._lot_has_position(self._lot_strategies[idx])
+
+    def _restore_lot_config(self, lot: _SingleLotMakerStrategy, state: dict) -> None:
+        max_position_raw = state.get("max_position_usdt")
+        stoploss_raw = state.get("stoploss_usdt")
+        updates: dict[str, float] = {}
+        try:
+            if max_position_raw is not None:
+                max_position_usdt = float(max_position_raw)
+                if math.isfinite(max_position_usdt):
+                    updates["max_position_usdt"] = max_position_usdt
+            if stoploss_raw is not None:
+                stoploss = float(stoploss_raw)
+                if math.isfinite(stoploss):
+                    updates["stoploss"] = stoploss
+        except (TypeError, ValueError):
+            return
+        if not updates:
+            return
+        lot.sim = replace(lot.sim, **updates)
+        lot.cfg = replace(lot.cfg, **updates)
+
+    def _restore_lot_stack(self, state: dict) -> None:
+        count_raw = state.get("active_lot_count")
+        if count_raw is None:
+            active_raw = state.get("active_lot_indices")
+            count_raw = len(active_raw) if isinstance(active_raw, list) else 1
+        try:
+            active_count = int(count_raw)
+        except (TypeError, ValueError):
+            active_count = 1
+        self._active_lot_count = active_count
+        self._refresh_lot_index_state()
+
+    def _sync_lot_pools(self) -> None:
+        self._sync_lot_stack()
+
+    def _sync_lot_stack(self) -> None:
+        if not self._lot_strategies:
+            self._active_lot_count = 0
+            self._active_lot_indices = []
+            self._frozen_lot_indices = []
+            return
+
+        self._active_lot_count = max(
+            1,
+            min(int(self._active_lot_count), len(self._lot_strategies)),
+        )
+        self._include_positioned_lots_in_active_prefix()
+        self._rotate_flat_inner_lots()
+
+        if self._outermost_nonempty_lot_index() is None:
+            self._active_lot_count = 1
+
+        for idx, lot in enumerate(self._lot_strategies):
+            if idx >= self._active_lot_count:
+                self._cancel_inactive_flat_lot(lot)
+        self._refresh_lot_index_state()
+
+    def _activate_backup_lot_if_needed(self, *, mid: float) -> None:
+        del mid
+        self._sync_lot_stack()
+        if self._active_lot_count >= len(self._lot_strategies):
+            return
+        previous_lot = self._lot_strategies[self._active_lot_count - 1]
+        if not self._lot_has_position(previous_lot):
+            return
+        if not previous_lot._is_at_max_position():
+            return
+        self._active_lot_count += 1
+        self._refresh_lot_index_state()
+
+    def _include_positioned_lots_in_active_prefix(self) -> None:
+        positioned = [
+            idx
+            for idx, lot in enumerate(self._lot_strategies)
+            if self._lot_has_position(lot)
+        ]
+        if positioned:
+            self._active_lot_count = max(self._active_lot_count, max(positioned) + 1)
+
+    def _rotate_flat_inner_lots(self) -> None:
+        while True:
+            outer_idx = self._outermost_nonempty_lot_index()
+            if outer_idx is None or outer_idx <= 0:
+                return
+            moved = False
+            for idx in range(min(outer_idx, self._active_lot_count)):
+                lot = self._lot_strategies[idx]
+                if self._lot_has_position(lot):
+                    continue
+                self._cancel_inactive_flat_lot(lot)
+                moved_lot = self._lot_strategies.pop(idx)
+                insert_idx = max(0, min(self._active_lot_count - 1, len(self._lot_strategies)))
+                self._lot_strategies.insert(insert_idx, moved_lot)
+                moved = True
+                break
+            if not moved:
+                return
+
+    def _refresh_lot_index_state(self) -> None:
+        self._active_lot_count = max(
+            0,
+            min(int(self._active_lot_count), len(self._lot_strategies)),
+        )
+        self._active_lot_indices = list(range(self._active_lot_count))
+        self._frozen_lot_indices = list(
+            range(self._active_lot_count, len(self._lot_strategies))
+        )
+
+    def _openable_lot_index(self) -> Optional[int]:
+        if not self._lot_strategies:
+            return None
+        outer_idx = self._outermost_nonempty_lot_index()
+        if outer_idx is None:
+            return 0
+        backup_idx = outer_idx + 1
+        if (
+            backup_idx < self._active_lot_count
+            and not self._lot_has_position(self._lot_strategies[backup_idx])
+            and self._lot_strategies[outer_idx]._is_at_max_position()
+        ):
+            return backup_idx
+        return outer_idx
+
+    def _outermost_nonempty_lot_index(self) -> Optional[int]:
+        upper = min(self._active_lot_count, len(self._lot_strategies))
+        for idx in range(upper - 1, -1, -1):
+            if self._lot_has_position(self._lot_strategies[idx]):
+                return idx
+        return None
+
+    def _cancel_inactive_flat_lot(self, lot: _SingleLotMakerStrategy) -> None:
+        if self._lot_has_position(lot):
+            return
+        lot._pending_maker_quotes.clear()
+        lot._active_profit_grid_key = None
+        lot._clear_maker_books()
+        lot._clear_taker_books()
+
+    @staticmethod
+    def _lot_has_position(lot: _SingleLotMakerStrategy) -> bool:
+        return abs(float(lot.manager.position.qty)) > lot.EPS
+
+    @staticmethod
+    def _lot_needs_next_layer(lot: _SingleLotMakerStrategy, *, mid: float) -> bool:
+        del mid
+        return SimpleMakerStrategy._lot_has_position(lot) and lot._is_at_max_position()
+
+    @staticmethod
+    def _aggregate_state_from_lots(lots: Sequence[dict]) -> dict:
+        qty = 0.0
+        mark_notional = 0.0
+        cost_notional = 0.0
+        gross_cost_notional = 0.0
+        realized = 0.0
+        unrealized = 0.0
+        volume = 0.0
+        latest_best_ask = None
+        latest_best_bid = None
+        for lot_state in lots:
+            pos = lot_state.get("position") if isinstance(lot_state, dict) else {}
+            if not isinstance(pos, dict):
+                pos = {}
+            qty += float(pos.get("qty", 0.0))
+            mark_notional += float(pos.get("mark_notional_usdt", 0.0))
+            cost_notional += float(pos.get("cost_notional_usdt", 0.0))
+            gross_cost_notional += float(pos.get("gross_cost_notional_usdt", 0.0))
+            realized += float(pos.get("realized_pnl", 0.0))
+            unrealized += float(pos.get("unrealized_pnl", 0.0))
+            volume += float(lot_state.get("traded_volume", 0.0))
+            latest_best_ask = lot_state.get("latest_best_ask", latest_best_ask)
+            latest_best_bid = lot_state.get("latest_best_bid", latest_best_bid)
+
+        cost = None if abs(qty) <= _SingleLotMakerStrategy.EPS else cost_notional / qty
+        mid = 0.0 if abs(qty) <= _SingleLotMakerStrategy.EPS else mark_notional / qty
+        return {
+            "position": {
+                "qty": float(qty),
+                "cost": cost,
+                "mark_notional_usdt": float(mark_notional),
+                "cost_notional_usdt": float(cost_notional),
+                "gross_cost_notional_usdt": float(gross_cost_notional),
+                "realized_pnl": float(realized),
+                "unrealized_pnl": float(unrealized),
+                "mid": float(mid),
+            },
+            "realized_pnl": float(realized),
+            "unrealized_pnl": float(unrealized),
+            "total_pnl": float(realized + unrealized),
+            "traded_volume": float(volume),
+            "latest_best_ask": latest_best_ask,
+            "latest_best_bid": latest_best_bid,
+        }

@@ -41,7 +41,7 @@ TICKER_COLUMNS = (
     "best_ask_price",
 )
 PROJECT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "sampler" / "config.json"
-DEFAULT_CACHE_ROOT = Path("/data/users/kang/backtest/glftmm_var/cached")
+DEFAULT_CACHE_ROOT = Path("/data/users/kang/backtest/glftmm_lot/cached")
 DEFAULT_DATA_ROOT = Path("/data/users/data-helper/PROCESSED/TARDIS/BINANCE/UFUTURES")
 DEFAULT_BACKUP_DATA_ROOT = Path("/home/kang/data_helper/PROCESSED/DATA_RECORDER/BINANCE/UFUTURES")
 
