@@ -1,0 +1,25 @@
+{
+  "symbols": ["BTCUSDT"],
+  "date_start": "2025-01-01",
+  "date_end": "2026-05-31",
+  "input_path": "/data/users/data-helper/PROCESSED/TARDIS/BINANCE/UFUTURES",
+  "input_backup_path": "/home/kang/data_helper/PROCESSED/DATA_RECORDER/BINANCE/UFUTURES",
+  "output_path": "/data/users/kang/backtest/glftmm/cached",
+  "freq_ms": [100],
+  "scheme_shift": [50],
+  "name_instructor": ["bbo_imbalance"],
+  "lookback_instructor": [0],
+  "name_intensity": ["k"],
+  "lookback_intensity": [600],
+  "name_volatility": ["sigma"],
+  "lookback_volatility": [600],
+ 
+  "num_worker": 16,
+  "ticker_category": "BOOKTICKER",
+  "trade_category": "TRADE",
+  "overwrite": false,
+  "strict_validate": true,
+  "compression": "snappy",
+  "min_periods": 1,
+  "annualize": false
+}
