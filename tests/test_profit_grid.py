@@ -874,7 +874,7 @@ class ProfitGridStrategyTest(unittest.TestCase):
         self.assertEqual(engine._lot_strategies[0].cfg.stoploss, 5.0)
         self.assertEqual(engine._lot_strategies[1].cfg.stoploss, 20.0)
 
-    def test_flat_inner_lot_rotates_to_outer_active_slot(self):
+    def test_flat_inner_lot_rotates_to_outermost_slot(self):
         engine = SimpleMakerStrategy(
             make_config(
                 max_position_usdt=[100.0, 200.0, 300.0, 400.0],
@@ -893,15 +893,16 @@ class ProfitGridStrategyTest(unittest.TestCase):
         self.assertEqual(engine._frozen_lot_indices, [3])
         self.assertEqual(
             [lot.cfg.max_position_usdt for lot in engine._lot_strategies],
-            [200.0, 300.0, 100.0, 400.0],
+            [200.0, 300.0, 400.0, 100.0],
         )
         self.assertEqual(
             [lot.cfg.stoploss for lot in engine._lot_strategies],
-            [20.0, 30.0, 10.0, 40.0],
+            [20.0, 30.0, 40.0, 10.0],
         )
         self.assertTrue(engine._lot_has_position(engine._lot_strategies[0]))
         self.assertTrue(engine._lot_has_position(engine._lot_strategies[1]))
         self.assertFalse(engine._lot_has_position(engine._lot_strategies[2]))
+        self.assertFalse(engine._lot_has_position(engine._lot_strategies[3]))
 
     def test_active_backup_opens_only_after_outer_nonempty_lot_is_full(self):
         engine = SimpleMakerStrategy(
@@ -955,6 +956,38 @@ class ProfitGridStrategyTest(unittest.TestCase):
         )
 
         self.assertEqual(engine._openable_lot_index(), 1)
+        self.assertEqual(price_levels(lot0, lot0.manager.books.bid_maker), [])
+        self.assertEqual(price_levels(lot1, lot1.manager.books.bid_maker), [(98.9, 1.01)])
+
+    def test_inner_lot_is_close_only_when_outer_lot_is_nonempty(self):
+        engine = SimpleMakerStrategy(
+            make_config(max_position_usdt=[200.0, 200.0], stoploss=[0.0, 0.0])
+        )
+        lot0, lot1 = engine._lot_strategies
+        engine._active_lot_count = 2
+        set_position(lot0, qty=1.0, cost=100.0)
+        set_position(lot1, qty=0.5, cost=100.0)
+        engine._sync_lot_pools()
+
+        self.assertEqual(engine._openable_lot_index(), 1)
+
+        lot0._on_ticker_event(
+            timestamp=1,
+            best_bid=98.9,
+            best_ask=99.1,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+            open_allowed=engine._openable_lot_index() == 0,
+        )
+        lot1._on_ticker_event(
+            timestamp=1,
+            best_bid=98.9,
+            best_ask=99.1,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+            open_allowed=engine._openable_lot_index() == 1,
+        )
+
         self.assertEqual(price_levels(lot0, lot0.manager.books.bid_maker), [])
         self.assertEqual(price_levels(lot1, lot1.manager.books.bid_maker), [(98.9, 1.01)])
 

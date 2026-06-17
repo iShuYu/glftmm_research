@@ -1714,8 +1714,7 @@ class SimpleMakerStrategy(_SingleLotMakerStrategy):
                     continue
                 self._cancel_inactive_flat_lot(lot)
                 moved_lot = self._lot_strategies.pop(idx)
-                insert_idx = max(0, min(self._active_lot_count - 1, len(self._lot_strategies)))
-                self._lot_strategies.insert(insert_idx, moved_lot)
+                self._lot_strategies.append(moved_lot)
                 moved = True
                 break
             if not moved:
