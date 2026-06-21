@@ -22,13 +22,18 @@ from sampler.resample import (  # noqa: E402
     config_paths,
     day_timestamp_grid,
     ensure_list,
+    freq_path_component,
     generate_dates,
     input_candidate_paths,
     input_path as raw_input_path,
+    normalize_scheme_shift,
+    normalize_scheme_shift_list,
     normalize_category,
     output_path as sampled_ticker_path,
     previous_date_str,
     resolve_existing_input_path,
+    scheme_shift_path_component,
+    shifted_bucket_timestamps,
 )
 
 
@@ -46,6 +51,7 @@ class Task:
     symbol: str
     date: str
     freq_ms: int
+    scheme_shift_ms: int
     indicator: str
     lookback: int
     trade_roots: tuple[Path, ...]
@@ -73,12 +79,14 @@ def instructor_output_path(
     freq_ms: int,
     lookback: int,
     date_str: str,
+    scheme_shift_ms: int = 0,
 ) -> Path:
     return (
         root
         / symbol
         / "instructor"
-        / f"freq_{freq_ms}ms"
+        / freq_path_component(freq_ms)
+        / scheme_shift_path_component(freq_ms, scheme_shift_ms)
         / indicator
         / f"lookback_{lookback}"
         / f"{date_str}.parquet"
@@ -136,12 +144,14 @@ def read_sampled_ticker_frame(
     symbol: str,
     date_str: str,
     freq_ms: int,
+    scheme_shift_ms: int = 0,
 ) -> pd.DataFrame:
     path = sampled_ticker_path(
         root=root,
         symbol=symbol,
         freq_ms=freq_ms,
         date_str=date_str,
+        scheme_shift_ms=scheme_shift_ms,
     )
     if not path.exists():
         raise FileNotFoundError(f"missing sampled ticker: {path}")
@@ -166,8 +176,13 @@ def lookback_periods(lookback: int, freq_ms: int) -> int:
     return max(1, int(np.ceil(float(lookback) * 1000.0 / float(freq_ms))))
 
 
-def warmup_timestamp_grid(date_str: str, freq_ms: int, periods: int) -> np.ndarray:
-    day_grid = day_timestamp_grid(date_str, freq_ms)
+def warmup_timestamp_grid(
+    date_str: str,
+    freq_ms: int,
+    periods: int,
+    scheme_shift_ms: int = 0,
+) -> np.ndarray:
+    day_grid = day_timestamp_grid(date_str, freq_ms, scheme_shift_ms)
     if len(day_grid) == 0:
         return day_grid
     start = int(day_grid[0]) - periods * int(freq_ms)
@@ -182,7 +197,9 @@ def build_trade_imbalance_frame(
     lookback: int,
     trade_roots: Any,
     trade_category: str = "TRADE",
+    scheme_shift_ms: int = 0,
 ) -> pd.DataFrame:
+    scheme_shift_ms = normalize_scheme_shift(scheme_shift_ms, freq_ms)
     periods = lookback_periods(lookback, freq_ms)
     date_list = [previous_date_str(date), date]
     trade_frames: list[pd.DataFrame] = []
@@ -201,14 +218,18 @@ def build_trade_imbalance_frame(
         if not trades.empty:
             trade_frames.append(trades)
 
-    grid = warmup_timestamp_grid(date, freq_ms, periods)
+    grid = warmup_timestamp_grid(date, freq_ms, periods, scheme_shift_ms)
     out = pd.DataFrame({"timestamp": grid})
     out["trade_qty_bid"] = 0.0
     out["trade_qty_ask"] = 0.0
 
     if trade_frames:
         trades = pd.concat(trade_frames, ignore_index=True)
-        trades["bucket_ts"] = ((trades["timestamp"] // freq_ms) * freq_ms).astype("int64")
+        trades["bucket_ts"] = shifted_bucket_timestamps(
+            trades["timestamp"],
+            freq_ms=freq_ms,
+            scheme_shift_ms=scheme_shift_ms,
+        )
         trades = trades[
             (trades["bucket_ts"] >= int(grid[0]))
             & (trades["bucket_ts"] <= int(grid[-1]))
@@ -251,7 +272,7 @@ def build_trade_imbalance_frame(
     )
     out["instructor"] = (bid_roll - ask_roll) / (bid_roll + ask_roll + EPS)
 
-    day_grid = day_timestamp_grid(date, freq_ms)
+    day_grid = day_timestamp_grid(date, freq_ms, scheme_shift_ms)
     out = out[out["timestamp"].isin(day_grid)].sort_values(
         "timestamp",
         kind="mergesort",
@@ -268,14 +289,17 @@ def build_bbo_imbalance_frame(
     freq_ms: int,
     lookback: int,
     ticker_cache_root: Path,
+    scheme_shift_ms: int = 0,
 ) -> pd.DataFrame:
     if int(lookback) != 0:
         raise ValueError("bbo_imbalance only supports lookback 0")
+    scheme_shift_ms = normalize_scheme_shift(scheme_shift_ms, freq_ms)
     ticker = read_sampled_ticker_frame(
         root=ticker_cache_root,
         symbol=symbol,
         date_str=date,
         freq_ms=freq_ms,
+        scheme_shift_ms=scheme_shift_ms,
     )
     bid_qty = ticker["best_bid_qty"].to_numpy(dtype="float64")
     ask_qty = ticker["best_ask_qty"].to_numpy(dtype="float64")
@@ -296,7 +320,9 @@ def build_trade_instructor_frame(
     trade_roots: Any,
     trade_category: str = "TRADE",
     ticker_cache_root: Path | None = None,
+    scheme_shift_ms: int = 0,
 ) -> pd.DataFrame:
+    scheme_shift_ms = normalize_scheme_shift(scheme_shift_ms, freq_ms)
     if indicator == "trade_imbalance":
         return build_trade_imbalance_frame(
             symbol=symbol,
@@ -305,6 +331,7 @@ def build_trade_instructor_frame(
             lookback=lookback,
             trade_roots=trade_roots,
             trade_category=trade_category,
+            scheme_shift_ms=scheme_shift_ms,
         )
     if indicator == "bbo_imbalance":
         if ticker_cache_root is None:
@@ -315,11 +342,17 @@ def build_trade_instructor_frame(
             freq_ms=freq_ms,
             lookback=lookback,
             ticker_cache_root=ticker_cache_root,
+            scheme_shift_ms=scheme_shift_ms,
         )
     raise ValueError(f"unsupported instructor indicator: {indicator}")
 
 
-def validate_instructor_frame(df: pd.DataFrame, date_str: str, freq_ms: int) -> None:
+def validate_instructor_frame(
+    df: pd.DataFrame,
+    date_str: str,
+    freq_ms: int,
+    scheme_shift_ms: int = 0,
+) -> None:
     required = {"timestamp", "instructor"}
     missing = required - set(df.columns)
     if missing:
@@ -340,9 +373,11 @@ def validate_instructor_frame(df: pd.DataFrame, date_str: str, freq_ms: int) -> 
             f"found examples: {bad_steps.tolist()}"
         )
 
-    expected_rows = len(day_timestamp_grid(date_str, freq_ms))
-    if len(df) != expected_rows:
-        raise ValueError(f"expected {expected_rows} rows, got {len(df)}")
+    expected_grid = day_timestamp_grid(date_str, freq_ms, scheme_shift_ms)
+    if len(df) != len(expected_grid):
+        raise ValueError(f"expected {len(expected_grid)} rows, got {len(df)}")
+    if not np.array_equal(timestamps, expected_grid):
+        raise ValueError("instructor timestamp grid does not match scheme_shift")
 
     values = df["instructor"].to_numpy(dtype="float64")
     if not np.isfinite(values).all():
@@ -359,11 +394,13 @@ def run_one(task: Task) -> str:
         freq_ms=task.freq_ms,
         lookback=task.lookback,
         date_str=task.date,
+        scheme_shift_ms=task.scheme_shift_ms,
     )
     if path.exists() and not task.overwrite:
         return (
             f"[skip] {task.indicator} {task.symbol} {task.date} "
-            f"freq={task.freq_ms} lookback={task.lookback} -> {path}"
+            f"freq={task.freq_ms} scheme_shift={task.scheme_shift_ms} "
+            f"lookback={task.lookback} -> {path}"
         )
 
     try:
@@ -376,20 +413,28 @@ def run_one(task: Task) -> str:
             trade_roots=task.trade_roots,
             trade_category=task.trade_category,
             ticker_cache_root=task.ticker_cache_root,
+            scheme_shift_ms=task.scheme_shift_ms,
         )
 
         if task.strict_validate:
-            validate_instructor_frame(df=frame, date_str=task.date, freq_ms=task.freq_ms)
+            validate_instructor_frame(
+                df=frame,
+                date_str=task.date,
+                freq_ms=task.freq_ms,
+                scheme_shift_ms=task.scheme_shift_ms,
+            )
 
         atomic_write_parquet(frame, path, compression=task.compression)
         return (
             f"[done] {task.indicator} {task.symbol} {task.date} "
-            f"freq={task.freq_ms} lookback={task.lookback} rows={len(frame)} -> {path}"
+            f"freq={task.freq_ms} scheme_shift={task.scheme_shift_ms} "
+            f"lookback={task.lookback} rows={len(frame)} -> {path}"
         )
     except Exception as exc:
         return (
             f"[error] {task.indicator} {task.symbol} {task.date} "
-            f"freq={task.freq_ms} lookback={task.lookback}: {exc}"
+            f"freq={task.freq_ms} scheme_shift={task.scheme_shift_ms} "
+            f"lookback={task.lookback}: {exc}"
         )
 
 
@@ -486,12 +531,15 @@ def build_tasks(cfg: dict[str, Any]) -> list[Task]:
         cfg,
         "instructor_cache_root",
         "output_root",
+        "output_path",
         default=DEFAULT_INSTRUCTOR_ROOT,
     )
     ticker_cache_root = config_path(
         cfg,
         "ticker_cache_root",
         "sampled_ticker_root",
+        "output_root",
+        "output_path",
         default=output_root,
     )
     trade_category = normalize_category(
@@ -510,6 +558,7 @@ def build_tasks(cfg: dict[str, Any]) -> list[Task]:
     overwrite = bool(instructor_cfg.get("overwrite", cfg.get("overwrite", False)))
     strict_validate = bool(instructor_cfg.get("strict_validate", cfg.get("strict_validate", True)))
     compression = str(instructor_cfg.get("compression", cfg.get("compression", "snappy")))
+    raw_scheme_shift = instructor_cfg.get("scheme_shift", cfg.get("scheme_shift", [0]))
 
     tasks: list[Task] = []
     for symbol, date_str, freq_ms, indicator in product(
@@ -518,23 +567,25 @@ def build_tasks(cfg: dict[str, Any]) -> list[Task]:
         freqs,
         sorted(indicator_lbs.keys()),
     ):
-        for lookback in indicator_lbs[indicator]:
-            tasks.append(
-                Task(
-                    symbol=symbol,
-                    date=date_str,
-                    freq_ms=freq_ms,
-                    indicator=indicator,
-                    lookback=lookback,
-                    trade_roots=trade_roots,
-                    ticker_cache_root=ticker_cache_root,
-                    output_root=output_root,
-                    trade_category=trade_category,
-                    overwrite=overwrite,
-                    strict_validate=strict_validate,
-                    compression=compression,
+        for scheme_shift_ms in normalize_scheme_shift_list(raw_scheme_shift, freq_ms):
+            for lookback in indicator_lbs[indicator]:
+                tasks.append(
+                    Task(
+                        symbol=symbol,
+                        date=date_str,
+                        freq_ms=freq_ms,
+                        scheme_shift_ms=scheme_shift_ms,
+                        indicator=indicator,
+                        lookback=lookback,
+                        trade_roots=trade_roots,
+                        ticker_cache_root=ticker_cache_root,
+                        output_root=output_root,
+                        trade_category=trade_category,
+                        overwrite=overwrite,
+                        strict_validate=strict_validate,
+                        compression=compression,
+                    )
                 )
-            )
     return tasks
 
 
@@ -615,6 +666,7 @@ def build_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
             },
             "instructor": {
                 "freq": args.freq,
+                "scheme_shift": [0] if args.scheme_shift is None else args.scheme_shift,
                 "indicator": args.indicators,
                 "lookback": args.lookback_instructor,
                 "trade_category": args.trade_category or "TRADE",
@@ -655,6 +707,8 @@ def build_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
     cfg.setdefault("instructor", {})
     if args.trade_category is not None:
         cfg["instructor"]["trade_category"] = args.trade_category
+    if args.scheme_shift is not None:
+        cfg["instructor"]["scheme_shift"] = args.scheme_shift
     if args.overwrite:
         cfg["instructor"]["overwrite"] = True
     return cfg
@@ -667,6 +721,7 @@ def main() -> None:
     parser.add_argument("--date-start")
     parser.add_argument("--date-end")
     parser.add_argument("--freq", nargs="+", type=int, default=[1000])
+    parser.add_argument("--scheme-shift", nargs="+", type=int)
     parser.add_argument(
         "--indicators",
         nargs="+",
@@ -701,6 +756,7 @@ def main() -> None:
                         task.symbol,
                         task.freq_ms,
                         task.date,
+                        task.scheme_shift_ms,
                     )
                 )
             else:
@@ -719,10 +775,12 @@ def main() -> None:
                 task.freq_ms,
                 task.lookback,
                 task.date,
+                task.scheme_shift_ms,
             )
             print(
                 f"  - {task.indicator} {task.symbol} {task.date} "
-                f"freq={task.freq_ms}ms lookback={task.lookback} "
+                f"freq={task.freq_ms}ms scheme_shift={task.scheme_shift_ms}ms "
+                f"lookback={task.lookback} "
                 f"{input_desc} "
                 f"output={output_path}"
             )

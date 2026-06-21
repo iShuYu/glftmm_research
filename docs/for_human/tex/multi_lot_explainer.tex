@@ -111,7 +111,8 @@ close-only 的意思是只能减仓或平仓，不能继续 open。
 
 \section{下一层开启条件}
 
-只有第 \(n\) 层满仓了，才会开启第 \(n+1\) 层。
+只有第 \(n\) 层满仓，并且价格相对第 \(n\) 层成本价继续逆向偏离达到 \code{new_open_lot_crit}，才会开启第 \(n+1\) 层。
+当前配置 \code{new_open_lot_crit=0.01}，也就是 1\%。
 一旦第 \(n+1\) 层开启，第 \(n\) 层进入 close-only，不再接新的 open。
 
 \begin{center}
@@ -119,17 +120,17 @@ close-only 的意思是只能减仓或平仓，不能继续 open。
   \node[openlot] (a0) at (0,0) {lot n\\非空未满\\open + close};
   \node[emptylot] (a1) at (5.0,0) {lot n+1\\空\\等待};
 
-  \node[fulllot] (b0) at (0,-2.4) {lot n\\已满仓\\转 close-only};
+  \node[fulllot] (b0) at (0,-2.4) {lot n\\满仓且逆向偏离\\转 close-only};
   \node[openlot] (b1) at (5.0,-2.4) {lot n+1\\开启\\open + close};
 
-  \draw[orangearrow] (a0.south) -- node[left,font=\small] {lot n 满仓} (b0.north);
+  \draw[orangearrow] (a0.south) -- node[left,font=\small] {满仓 + 价格门槛} (b0.north);
   \draw[bluearrow] (a1.south) -- node[right,font=\small] {被开启} (b1.north);
   \draw[bluearrow] (b0.east) -- node[below,font=\small] {新 open 交给外层} (b1.west);
 \end{tikzpicture}
 \end{center}
 
-例如 lot 0 满仓后，lot 1 才开启；此时 lot 0 进入 close-only。
-如果 lot 1 也满仓，lot 2 才开启；此时 lot 1 进入 close-only。
+例如 lot 0 是多头，成本价为 100，且已经满仓；只有当 mid 跌到 99 或更低时，lot 1 才开启。
+如果 lot 0 是空头，成本价为 100，且已经满仓；只有当 mid 涨到 101 或更高时，lot 1 才开启。
 
 \section{订单处理顺序}
 
@@ -205,7 +206,7 @@ close-only 的意思是只能减仓或平仓，不能继续 open。
   \item 起始状态是 5 个 lot 均为空 lot。
   \item 5 个 lot 从内到外依次标记为 0、1、2、3、4。
   \item 只有最外层的非空 lot 能正常 open + close；如果一层的外层是非空的，这一层只能 close-only，要么等水上平仓离场，要么止损离场。
-  \item 只有第 \(n\) 层满仓了，才能开启第 \(n+1\) 层；此时第 \(n\) 层进入 close-only。
+  \item 只有第 \(n\) 层满仓，并且价格相对第 \(n\) 层成本价逆向偏离达到 \code{new_open_lot_crit}，才能开启第 \(n+1\) 层；此时第 \(n\) 层进入 close-only。
   \item 一个订单来了，优先从内层开始看是否能够关掉内层仓位，从里到外刷一遍。
   \item 当内部某一层被平完了，把这一层挪到最外层，其外部层的 index 减 1。
 \end{enumerate}

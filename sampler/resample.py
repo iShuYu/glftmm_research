@@ -54,6 +54,7 @@ class Task:
     symbol: str
     date: str
     freq_ms: int
+    scheme_shift_ms: int
     bookticker_roots: tuple[Path, ...]
     ticker_category: str
     output_root: Path
@@ -190,8 +191,59 @@ def resolve_existing_input_path(
     )
 
 
-def output_path(root: Path, symbol: str, freq_ms: int, date_str: str) -> Path:
-    return root / symbol / "resample" / f"freq_{freq_ms}ms" / f"{date_str}.parquet"
+def normalize_scheme_shift(value: Any, freq_ms: int) -> int:
+    freq = int(freq_ms)
+    if freq <= 0:
+        raise ValueError(f"freq_ms must be positive, got {freq_ms}")
+    shift = 0 if value in (None, "", []) else int(value)
+    if shift < 0:
+        raise ValueError(f"scheme_shift must be >= 0, got {shift}")
+    if shift >= freq:
+        raise ValueError(
+            f"scheme_shift must be < freq_ms, got scheme_shift={shift}, freq_ms={freq}"
+        )
+    return shift
+
+
+def normalize_scheme_shift_list(value: Any, freq_ms: int) -> list[int]:
+    shifts: list[int] = []
+    seen: set[int] = set()
+    raw_values = [0] if value in (None, "", []) else ensure_list(value)
+    for raw in raw_values:
+        shift = normalize_scheme_shift(raw, freq_ms)
+        if shift in seen:
+            continue
+        seen.add(shift)
+        shifts.append(shift)
+    if not shifts:
+        shifts.append(0)
+    return shifts
+
+
+def freq_path_component(freq_ms: int) -> str:
+    return f"freq_{int(freq_ms)}ms"
+
+
+def scheme_shift_path_component(freq_ms: int, scheme_shift_ms: int = 0) -> str:
+    shift = normalize_scheme_shift(scheme_shift_ms, freq_ms)
+    return f"scheme_shift_{shift}ms"
+
+
+def output_path(
+    root: Path,
+    symbol: str,
+    freq_ms: int,
+    date_str: str,
+    scheme_shift_ms: int = 0,
+) -> Path:
+    return (
+        root
+        / symbol
+        / "resample"
+        / freq_path_component(freq_ms)
+        / scheme_shift_path_component(freq_ms, scheme_shift_ms)
+        / f"{date_str}.parquet"
+    )
 
 
 def previous_date_str(date_str: str) -> str:
@@ -199,13 +251,33 @@ def previous_date_str(date_str: str) -> str:
     return (current - dt.timedelta(days=1)).isoformat()
 
 
-def day_timestamp_grid(date_str: str, freq_ms: int) -> np.ndarray:
+def day_timestamp_grid(
+    date_str: str,
+    freq_ms: int,
+    scheme_shift_ms: int = 0,
+) -> np.ndarray:
+    shift = normalize_scheme_shift(scheme_shift_ms, freq_ms)
     date_obj = dt.date.fromisoformat(date_str)
     day_start = dt.datetime.combine(date_obj, dt.time.min)
     epoch = dt.datetime(1970, 1, 1)
     day_start_ms = int((day_start - epoch).total_seconds() * MS_IN_SECOND)
     next_day_start_ms = day_start_ms + MS_IN_DAY
-    return np.arange(day_start_ms, next_day_start_ms, freq_ms, dtype=np.int64)
+    return np.arange(
+        day_start_ms + shift,
+        next_day_start_ms + shift,
+        int(freq_ms),
+        dtype=np.int64,
+    )
+
+
+def shifted_bucket_timestamps(
+    timestamps: Any,
+    freq_ms: int,
+    scheme_shift_ms: int = 0,
+) -> np.ndarray:
+    shift = normalize_scheme_shift(scheme_shift_ms, freq_ms)
+    ts = np.asarray(timestamps, dtype="int64")
+    return (((ts - shift) // int(freq_ms)) * int(freq_ms) + shift).astype("int64")
 
 
 def normalize_bookticker_frame(raw_df: pd.DataFrame) -> pd.DataFrame:
@@ -348,6 +420,7 @@ def read_bookticker_tail(
     symbol: str,
     date_str: str,
     category: str = "BOOKTICKER",
+    before_timestamp_ms: int | None = None,
 ) -> pd.DataFrame | None:
     try:
         path = resolve_existing_input_path(
@@ -369,6 +442,8 @@ def read_bookticker_tail(
                 columns=list(RAW_TICKER_COLUMNS),
             )
             tail = normalize_bookticker_frame(table.to_pandas())
+            if before_timestamp_ms is not None and not tail.empty:
+                tail = tail[tail["timestamp"] <= int(before_timestamp_ms)]
             if not tail.empty:
                 return tail.tail(1).reset_index(drop=True)
         return None
@@ -379,6 +454,8 @@ def read_bookticker_tail(
         return None
 
     tail = normalize_bookticker_frame(raw_tail)
+    if before_timestamp_ms is not None and not tail.empty:
+        tail = tail[tail["timestamp"] <= int(before_timestamp_ms)]
     if tail.empty:
         return None
     return tail.tail(1).reset_index(drop=True)
@@ -389,12 +466,19 @@ def previous_day_ticker_tail(
     symbol: str,
     date_str: str,
     category: str = "BOOKTICKER",
+    freq_ms: int | None = None,
+    scheme_shift_ms: int = 0,
 ) -> pd.DataFrame | None:
+    before_timestamp_ms = None
+    if freq_ms is not None:
+        grid = day_timestamp_grid(date_str, freq_ms, scheme_shift_ms)
+        before_timestamp_ms = int(grid[0]) if len(grid) else None
     return read_bookticker_tail(
         root=root,
         symbol=symbol,
         date_str=previous_date_str(date_str),
         category=category,
+        before_timestamp_ms=before_timestamp_ms,
     )
 
 
@@ -421,11 +505,13 @@ class TickerResampler:
     def __init__(
         self,
         freq_ms: int,
+        scheme_shift_ms: int = 0,
         value_columns: tuple[str, ...] = TICKER_VALUE_COLUMNS,
     ) -> None:
         if freq_ms <= 0:
             raise ValueError(f"freq_ms must be positive, got {freq_ms}")
         self.freq_ms = int(freq_ms)
+        self.scheme_shift_ms = normalize_scheme_shift(scheme_shift_ms, self.freq_ms)
         self.value_columns = value_columns
 
     def resample(
@@ -434,7 +520,9 @@ class TickerResampler:
         date_str: str,
         prev_tail: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        full_grid = pd.DataFrame({"timestamp": day_timestamp_grid(date_str, self.freq_ms)})
+        full_grid = pd.DataFrame(
+            {"timestamp": day_timestamp_grid(date_str, self.freq_ms, self.scheme_shift_ms)}
+        )
         if full_grid.empty:
             return self._empty_result(full_grid)
 
@@ -466,7 +554,7 @@ class TickerResampler:
         date_str: str,
         prev_tail: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        grid = day_timestamp_grid(date_str, self.freq_ms)
+        grid = day_timestamp_grid(date_str, self.freq_ms, self.scheme_shift_ms)
         sampled_values = np.full(
             (len(grid), len(self.value_columns)),
             np.nan,
@@ -564,7 +652,13 @@ class TickerResampler:
         return result
 
 
-def validate_sampled_ticker(df: pd.DataFrame, freq_ms: int, require_values: bool = True) -> None:
+def validate_sampled_ticker(
+    df: pd.DataFrame,
+    freq_ms: int,
+    require_values: bool = True,
+    date_str: str | None = None,
+    scheme_shift_ms: int = 0,
+) -> None:
     required = {"timestamp", *TICKER_VALUE_COLUMNS}
     missing = required - set(df.columns)
     if missing:
@@ -584,6 +678,13 @@ def validate_sampled_ticker(df: pd.DataFrame, freq_ms: int, require_values: bool
             f"timestamp step is not constant {freq_ms}ms; "
             f"found examples: {bad_steps.tolist()}"
         )
+
+    if date_str is not None:
+        expected_grid = day_timestamp_grid(date_str, freq_ms, scheme_shift_ms)
+        if len(df) != len(expected_grid):
+            raise ValueError(f"expected {len(expected_grid)} rows, got {len(df)}")
+        if not np.array_equal(timestamps, expected_grid):
+            raise ValueError("sampled ticker timestamp grid does not match scheme_shift")
 
     if require_values and df.loc[:, TICKER_VALUE_COLUMNS].isna().any().any():
         nan_counts = df.loc[:, TICKER_VALUE_COLUMNS].isna().sum()
@@ -609,10 +710,14 @@ def run_one(task: Task) -> str:
         symbol=task.symbol,
         freq_ms=task.freq_ms,
         date_str=task.date,
+        scheme_shift_ms=task.scheme_shift_ms,
     )
 
     if out_path.exists() and not task.overwrite:
-        return f"[skip] {task.symbol} {task.date} freq={task.freq_ms} -> {out_path}"
+        return (
+            f"[skip] {task.symbol} {task.date} freq={task.freq_ms} "
+            f"scheme_shift={task.scheme_shift_ms} -> {out_path}"
+        )
 
     try:
         in_path = resolve_existing_input_path(
@@ -627,8 +732,13 @@ def run_one(task: Task) -> str:
             symbol=task.symbol,
             date_str=task.date,
             category=task.ticker_category,
+            freq_ms=task.freq_ms,
+            scheme_shift_ms=task.scheme_shift_ms,
         )
-        frame = TickerResampler(freq_ms=task.freq_ms).resample_file(
+        frame = TickerResampler(
+            freq_ms=task.freq_ms,
+            scheme_shift_ms=task.scheme_shift_ms,
+        ).resample_file(
             path=in_path,
             date_str=task.date,
             prev_tail=prev_tail,
@@ -639,16 +749,22 @@ def run_one(task: Task) -> str:
                 df=frame,
                 freq_ms=task.freq_ms,
                 require_values=prev_tail is not None,
+                date_str=task.date,
+                scheme_shift_ms=task.scheme_shift_ms,
             )
 
         atomic_write_parquet(frame, out_path, compression=task.compression)
         size = out_path.stat().st_size if out_path.exists() else 0
         return (
             f"[done] {task.symbol} {task.date} freq={task.freq_ms} "
+            f"scheme_shift={task.scheme_shift_ms} "
             f"rows={len(frame)} size={size} bytes -> {out_path}"
         )
     except Exception as exc:
-        return f"[error] {task.symbol} {task.date} freq={task.freq_ms}: {exc}"
+        return (
+            f"[error] {task.symbol} {task.date} freq={task.freq_ms} "
+            f"scheme_shift={task.scheme_shift_ms}: {exc}"
+        )
 
 
 def _config_path(cfg: dict[str, Any], *keys: str, default: Path) -> Path:
@@ -690,27 +806,31 @@ def build_tasks(cfg: dict[str, Any]) -> list[Task]:
         cfg,
         "ticker_cache_root",
         "output_root",
+        "output_path",
         default=DEFAULT_OUTPUT_ROOT,
     )
     overwrite = bool(sampler_cfg.get("overwrite", cfg.get("overwrite", False)))
     strict_validate = bool(sampler_cfg.get("strict_validate", cfg.get("strict_validate", True)))
     compression = str(sampler_cfg.get("compression", cfg.get("compression", "snappy")))
+    raw_scheme_shift = sampler_cfg.get("scheme_shift", cfg.get("scheme_shift", [0]))
 
     tasks = []
     for symbol, date_str, freq_ms in product(symbols, generate_dates(date_start, date_end), freqs):
-        tasks.append(
-            Task(
-                symbol=symbol,
-                date=date_str,
-                freq_ms=freq_ms,
-                bookticker_roots=bookticker_roots,
-                ticker_category=ticker_category,
-                output_root=output_root,
-                overwrite=overwrite,
-                strict_validate=strict_validate,
-                compression=compression,
+        for scheme_shift_ms in normalize_scheme_shift_list(raw_scheme_shift, freq_ms):
+            tasks.append(
+                Task(
+                    symbol=symbol,
+                    date=date_str,
+                    freq_ms=freq_ms,
+                    scheme_shift_ms=scheme_shift_ms,
+                    bookticker_roots=bookticker_roots,
+                    ticker_category=ticker_category,
+                    output_root=output_root,
+                    overwrite=overwrite,
+                    strict_validate=strict_validate,
+                    compression=compression,
+                )
             )
-        )
     return tasks
 
 
@@ -786,6 +906,7 @@ def build_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
             },
             "sampler": {
                 "freq": args.freq,
+                "scheme_shift": [0] if args.scheme_shift is None else args.scheme_shift,
                 "ticker_category": args.ticker_category or "BOOKTICKER",
                 "overwrite": args.overwrite,
                 "strict_validate": not args.no_strict_validate,
@@ -822,6 +943,8 @@ def build_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
     cfg.setdefault("sampler", {})
     if args.ticker_category is not None:
         cfg["sampler"]["ticker_category"] = args.ticker_category
+    if args.scheme_shift is not None:
+        cfg["sampler"]["scheme_shift"] = args.scheme_shift
     if args.overwrite:
         cfg["sampler"]["overwrite"] = True
     return cfg
@@ -834,6 +957,7 @@ def main() -> None:
     parser.add_argument("--date-start")
     parser.add_argument("--date-end")
     parser.add_argument("--freq", nargs="+", type=int, default=[1000])
+    parser.add_argument("--scheme-shift", nargs="+", type=int)
     parser.add_argument("--bookticker-root")
     parser.add_argument("--bookticker-backup-root")
     parser.add_argument("--ticker-category")
@@ -855,8 +979,9 @@ def main() -> None:
         for task in tasks[:10]:
             print(
                 f"  - {task.symbol} {task.date} freq={task.freq_ms}ms "
+                f"scheme_shift={task.scheme_shift_ms}ms "
                 f"input={input_candidate_paths(task.bookticker_roots, task.symbol, task.date, task.ticker_category)} "
-                f"output={output_path(task.output_root, task.symbol, task.freq_ms, task.date)}"
+                f"output={output_path(task.output_root, task.symbol, task.freq_ms, task.date, task.scheme_shift_ms)}"
             )
         if len(tasks) > 10:
             print(f"  ... and {len(tasks) - 10} more")

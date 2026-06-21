@@ -24,14 +24,19 @@ from sampler.resample import (  # noqa: E402
     config_paths,
     day_timestamp_grid,
     ensure_list,
+    freq_path_component,
     generate_dates,
     input_candidate_paths,
     input_path as raw_input_path,
+    normalize_scheme_shift,
+    normalize_scheme_shift_list,
     normalize_category,
     output_path as sampled_ticker_path,
     previous_date_str,
     previous_day_ticker_tail,
     resolve_existing_input_path,
+    scheme_shift_path_component,
+    shifted_bucket_timestamps,
 )
 
 
@@ -50,6 +55,7 @@ class Task:
     symbol: str
     date: str
     freq_ms: int
+    scheme_shift_ms: int
     indicator: str
     lookback: int
     ticker_cache_root: Path
@@ -100,12 +106,14 @@ def volatility_output_path(
     freq_ms: int,
     lookback: int,
     date_str: str,
+    scheme_shift_ms: int = 0,
 ) -> Path:
     return (
         root
         / symbol
         / "volatility"
-        / f"freq_{freq_ms}ms"
+        / freq_path_component(freq_ms)
+        / scheme_shift_path_component(freq_ms, scheme_shift_ms)
         / indicator
         / f"lookback_{lookback}"
         / f"{date_str}.parquet"
@@ -159,12 +167,14 @@ def read_sampled_ticker(
     symbol: str,
     date_str: str,
     freq_ms: int,
+    scheme_shift_ms: int = 0,
 ) -> pd.DataFrame:
     path = sampled_ticker_path(
         root=root,
         symbol=symbol,
         freq_ms=freq_ms,
         date_str=date_str,
+        scheme_shift_ms=scheme_shift_ms,
     )
     if not path.exists():
         raise FileNotFoundError(path)
@@ -186,6 +196,7 @@ def read_or_build_sampled_ticker(
     symbol: str,
     date_str: str,
     freq_ms: int,
+    scheme_shift_ms: int,
     ticker_category: str,
     auto_resample: bool,
     compression: str,
@@ -196,6 +207,7 @@ def read_or_build_sampled_ticker(
             symbol=symbol,
             date_str=date_str,
             freq_ms=freq_ms,
+            scheme_shift_ms=scheme_shift_ms,
         )
     except FileNotFoundError:
         if not auto_resample:
@@ -213,8 +225,13 @@ def read_or_build_sampled_ticker(
         symbol=symbol,
         date_str=date_str,
         category=ticker_category,
+        freq_ms=freq_ms,
+        scheme_shift_ms=scheme_shift_ms,
     )
-    frame = TickerResampler(freq_ms=freq_ms).resample_file(
+    frame = TickerResampler(
+        freq_ms=freq_ms,
+        scheme_shift_ms=scheme_shift_ms,
+    ).resample_file(
         path=in_path,
         date_str=date_str,
         prev_tail=prev_tail,
@@ -224,6 +241,7 @@ def read_or_build_sampled_ticker(
         symbol=symbol,
         freq_ms=freq_ms,
         date_str=date_str,
+        scheme_shift_ms=scheme_shift_ms,
     )
     atomic_write_parquet(frame, path, compression=compression)
     return frame.loc[:, TICKER_COLUMNS]
@@ -240,11 +258,14 @@ def build_base_frame(
     trade_category: str = "TRADE",
     auto_resample: bool = False,
     compression: str = "snappy",
+    scheme_shift_ms: int = 0,
 ) -> pd.DataFrame:
+    scheme_shift_ms = normalize_scheme_shift(scheme_shift_ms, freq_ms)
     cache_key = (
         symbol,
         date,
         freq_ms,
+        scheme_shift_ms,
         str(ticker_cache_root),
         tuple(str(path) for path in input_candidate_paths(trade_roots, symbol, date, trade_category)),
         tuple(str(path) for path in input_candidate_paths(bookticker_roots, symbol, date, ticker_category)),
@@ -267,6 +288,7 @@ def build_base_frame(
                 symbol=symbol,
                 date_str=one_date,
                 freq_ms=freq_ms,
+                scheme_shift_ms=scheme_shift_ms,
                 ticker_category=ticker_category,
                 auto_resample=auto_resample,
                 compression=compression,
@@ -308,7 +330,11 @@ def build_base_frame(
 
     if trade_frames:
         trades = pd.concat(trade_frames, ignore_index=True)
-        trades["bucket_ts"] = ((trades["timestamp"] // freq_ms) * freq_ms).astype("int64")
+        trades["bucket_ts"] = shifted_bucket_timestamps(
+            trades["timestamp"],
+            freq_ms=freq_ms,
+            scheme_shift_ms=scheme_shift_ms,
+        )
         ohlc = (
             trades.groupby("bucket_ts", as_index=False, sort=True)["price"]
             .agg(
@@ -332,7 +358,7 @@ def build_base_frame(
     base["low"] = base["low"].fillna(base["close"])
     base["open"] = base["open"].fillna(base["close"])
 
-    day_grid = day_timestamp_grid(date, freq_ms)
+    day_grid = day_timestamp_grid(date, freq_ms, scheme_shift_ms)
     base = base[base["timestamp"].isin(day_grid)].sort_values(
         "timestamp",
         kind="mergesort",
@@ -595,7 +621,12 @@ class VolatilityCalculator:
         return frame
 
 
-def validate_volatility_frame(df: pd.DataFrame, date_str: str, freq_ms: int) -> None:
+def validate_volatility_frame(
+    df: pd.DataFrame,
+    date_str: str,
+    freq_ms: int,
+    scheme_shift_ms: int = 0,
+) -> None:
     required = {"timestamp", "volatility"}
     missing = required - set(df.columns)
     if missing:
@@ -616,9 +647,11 @@ def validate_volatility_frame(df: pd.DataFrame, date_str: str, freq_ms: int) -> 
             f"found examples: {bad_steps.tolist()}"
         )
 
-    expected_rows = len(day_timestamp_grid(date_str, freq_ms))
-    if len(df) != expected_rows:
-        raise ValueError(f"expected {expected_rows} rows, got {len(df)}")
+    expected_grid = day_timestamp_grid(date_str, freq_ms, scheme_shift_ms)
+    if len(df) != len(expected_grid):
+        raise ValueError(f"expected {len(expected_grid)} rows, got {len(df)}")
+    if not np.array_equal(timestamps, expected_grid):
+        raise ValueError("volatility timestamp grid does not match scheme_shift")
 
     value_cols = [col for col in df.columns if col != "timestamp"]
     values = df.loc[:, value_cols].to_numpy(dtype="float64")
@@ -636,11 +669,13 @@ def run_one(task: Task) -> str:
         freq_ms=task.freq_ms,
         lookback=task.lookback,
         date_str=task.date,
+        scheme_shift_ms=task.scheme_shift_ms,
     )
     if path.exists() and not task.overwrite:
         return (
             f"[skip] {task.indicator} {task.symbol} {task.date} "
-            f"freq={task.freq_ms} lookback={task.lookback} -> {path}"
+            f"freq={task.freq_ms} scheme_shift={task.scheme_shift_ms} "
+            f"lookback={task.lookback} -> {path}"
         )
 
     try:
@@ -655,11 +690,13 @@ def run_one(task: Task) -> str:
             trade_category=task.trade_category,
             auto_resample=task.auto_resample,
             compression=task.compression,
+            scheme_shift_ms=task.scheme_shift_ms,
         )
         if base.empty:
             return (
                 f"[empty] {task.indicator} {task.symbol} {task.date} "
-                f"freq={task.freq_ms} lookback={task.lookback} -> no data"
+                f"freq={task.freq_ms} scheme_shift={task.scheme_shift_ms} "
+                f"lookback={task.lookback} -> no data"
             )
 
         config = VolatilityConfig(
@@ -675,17 +712,24 @@ def run_one(task: Task) -> str:
         )
 
         if task.strict_validate:
-            validate_volatility_frame(df=frame, date_str=task.date, freq_ms=task.freq_ms)
+            validate_volatility_frame(
+                df=frame,
+                date_str=task.date,
+                freq_ms=task.freq_ms,
+                scheme_shift_ms=task.scheme_shift_ms,
+            )
 
         atomic_write_parquet(frame, path, compression=task.compression)
         return (
             f"[done] {task.indicator} {task.symbol} {task.date} "
-            f"freq={task.freq_ms} lookback={task.lookback} rows={len(frame)} -> {path}"
+            f"freq={task.freq_ms} scheme_shift={task.scheme_shift_ms} "
+            f"lookback={task.lookback} rows={len(frame)} -> {path}"
         )
     except Exception as exc:
         return (
             f"[error] {task.indicator} {task.symbol} {task.date} "
-            f"freq={task.freq_ms} lookback={task.lookback}: {exc}"
+            f"freq={task.freq_ms} scheme_shift={task.scheme_shift_ms} "
+            f"lookback={task.lookback}: {exc}"
         )
 
 
@@ -773,6 +817,8 @@ def build_tasks(cfg: dict[str, Any]) -> list[Task]:
         cfg,
         "ticker_cache_root",
         "sampled_ticker_root",
+        "output_root",
+        "output_path",
         default=DEFAULT_TICKER_CACHE_ROOT,
     )
     bookticker_roots = config_paths(
@@ -792,6 +838,7 @@ def build_tasks(cfg: dict[str, Any]) -> list[Task]:
         cfg,
         "volatility_cache_root",
         "output_root",
+        "output_path",
         default=DEFAULT_VOLATILITY_ROOT,
     )
 
@@ -804,6 +851,7 @@ def build_tasks(cfg: dict[str, Any]) -> list[Task]:
         vol_cfg.get("trading_minutes_per_year", cfg.get("trading_minutes_per_year", 365 * 24 * 60))
     )
     compression = str(vol_cfg.get("compression", cfg.get("compression", "snappy")))
+    raw_scheme_shift = vol_cfg.get("scheme_shift", cfg.get("scheme_shift", [0]))
 
     tasks: list[Task] = []
     for symbol, date_str, freq_ms, indicator in product(
@@ -812,29 +860,31 @@ def build_tasks(cfg: dict[str, Any]) -> list[Task]:
         freqs,
         sorted(indicator_lbs.keys()),
     ):
-        for lookback in indicator_lbs[indicator]:
-            tasks.append(
-                Task(
-                    symbol=symbol,
-                    date=date_str,
-                    freq_ms=freq_ms,
-                    indicator=indicator,
-                    lookback=lookback,
-                    ticker_cache_root=ticker_cache_root,
-                    trade_roots=trade_roots,
-                    output_root=output_root,
-                    bookticker_roots=bookticker_roots,
-                    ticker_category=ticker_category,
-                    trade_category=trade_category,
-                    auto_resample=auto_resample,
-                    overwrite=overwrite,
-                    strict_validate=strict_validate,
-                    annualize=annualize,
-                    trading_minutes_per_year=trading_minutes_per_year,
-                    min_periods=min_periods,
-                    compression=compression,
+        for scheme_shift_ms in normalize_scheme_shift_list(raw_scheme_shift, freq_ms):
+            for lookback in indicator_lbs[indicator]:
+                tasks.append(
+                    Task(
+                        symbol=symbol,
+                        date=date_str,
+                        freq_ms=freq_ms,
+                        scheme_shift_ms=scheme_shift_ms,
+                        indicator=indicator,
+                        lookback=lookback,
+                        ticker_cache_root=ticker_cache_root,
+                        trade_roots=trade_roots,
+                        output_root=output_root,
+                        bookticker_roots=bookticker_roots,
+                        ticker_category=ticker_category,
+                        trade_category=trade_category,
+                        auto_resample=auto_resample,
+                        overwrite=overwrite,
+                        strict_validate=strict_validate,
+                        annualize=annualize,
+                        trading_minutes_per_year=trading_minutes_per_year,
+                        min_periods=min_periods,
+                        compression=compression,
+                    )
                 )
-            )
     return tasks
 
 
@@ -919,6 +969,7 @@ def build_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
             },
             "volatility": {
                 "freq": args.freq,
+                "scheme_shift": [0] if args.scheme_shift is None else args.scheme_shift,
                 "indicator": args.indicators,
                 "lookback": args.lookback,
                 "ticker_category": args.ticker_category or "BOOKTICKER",
@@ -982,6 +1033,8 @@ def build_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
         cfg["volatility"]["ticker_category"] = args.ticker_category
     if args.trade_category is not None:
         cfg["volatility"]["trade_category"] = args.trade_category
+    if args.scheme_shift is not None:
+        cfg["volatility"]["scheme_shift"] = args.scheme_shift
     if args.overwrite:
         cfg["volatility"]["overwrite"] = True
     if args.auto_resample:
@@ -998,6 +1051,7 @@ def main() -> None:
     parser.add_argument("--date-start")
     parser.add_argument("--date-end")
     parser.add_argument("--freq", nargs="+", type=int, default=[1000])
+    parser.add_argument("--scheme-shift", nargs="+", type=int)
     parser.add_argument("--indicators", nargs="+", choices=SUPPORTED_INDICATORS, default=["sigma"])
     parser.add_argument("--lookback", nargs="+", type=int, default=[60])
     parser.add_argument("--ticker-cache-root")
@@ -1029,10 +1083,11 @@ def main() -> None:
         for task in tasks[:10]:
             print(
                 f"  - {task.indicator} {task.symbol} {task.date} "
-                f"freq={task.freq_ms}ms lookback={task.lookback} "
-                f"ticker={sampled_ticker_path(task.ticker_cache_root, task.symbol, task.freq_ms, task.date)} "
+                f"freq={task.freq_ms}ms scheme_shift={task.scheme_shift_ms}ms "
+                f"lookback={task.lookback} "
+                f"ticker={sampled_ticker_path(task.ticker_cache_root, task.symbol, task.freq_ms, task.date, task.scheme_shift_ms)} "
                 f"trade={input_candidate_paths(task.trade_roots, task.symbol, task.date, task.trade_category)} "
-                f"output={volatility_output_path(task.output_root, task.symbol, task.indicator, task.freq_ms, task.lookback, task.date)}"
+                f"output={volatility_output_path(task.output_root, task.symbol, task.indicator, task.freq_ms, task.lookback, task.date, task.scheme_shift_ms)}"
             )
         if len(tasks) > 10:
             print(f"  ... and {len(tasks) - 10} more")

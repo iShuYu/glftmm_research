@@ -12,6 +12,7 @@ from run_strategy import (
     _build_tasks,
     _build_simulation_config,
     _normalize_sim_param_map,
+    scheme_shift_path_component,
     _state_cost_notional_usdt,
     _state_realized_pnl,
     _state_total_pnl,
@@ -33,6 +34,7 @@ def make_config(**overrides):
         "lookback_volatility": 300,
         "order_amt": 100.0,
         "max_position_usdt": 100000.0,
+        "new_open_lot_crit": 0.0,
         "max_holding_time": -1,
         "adj_spread_intensity": 1.0,
         "adj_spread_instructor": 0.0,
@@ -64,6 +66,7 @@ def raw_config(**overrides):
         "lookback_volatility": 300,
         "order_amt": 100.0,
         "max_position_usdt": 100000.0,
+        "new_open_lot_crit": 0.0,
         "max_holding_time": -1,
         "adj_spread_intensity": 1.0,
         "adj_spread_instructor": 0.0,
@@ -319,6 +322,13 @@ class ProfitGridConfigTest(unittest.TestCase):
         self.assertEqual(cfg.total_max_position_usdt, 1000.0)
         self.assertEqual(cfg.stoploss_lots, (25.0, 75.0))
 
+    def test_build_config_parses_new_open_lot_crit(self):
+        cfg = _build_simulation_config(
+            raw_config(new_open_lot_crit=0.01)["simulation"]
+        )
+
+        self.assertEqual(cfg.new_open_lot_crit, 0.01)
+
     def test_normalizes_max_position_and_stoploss_lists_as_lot_groups(self):
         sim_map = _normalize_sim_param_map(
             raw_config(
@@ -367,6 +377,19 @@ class ProfitGridConfigTest(unittest.TestCase):
         )
         self.assertEqual([task.sim_params["mode"] for task in tasks].count(0), 2)
         self.assertEqual([task.sim_params["mode"] for task in tasks].count(1), 2)
+        self.assertEqual({task.scheme_shift for task in tasks}, {0})
+
+        crit_tasks = _build_tasks(raw_task_config(new_open_lot_crit=[0.0, 0.01]))
+        self.assertEqual(
+            [task.sim_params["new_open_lot_crit"] for task in crit_tasks],
+            [0.0, 0.01],
+        )
+
+        shifted_cfg = raw_task_config()
+        shifted_cfg["scheme_shift"] = 250
+        shifted_tasks = _build_tasks(shifted_cfg)
+        self.assertEqual([task.scheme_shift for task in shifted_tasks], [250])
+        self.assertEqual(scheme_shift_path_component(250), "scheme_shift_250ms")
 
     def test_vectorized_lot_row_counts_must_match(self):
         with self.assertRaisesRegex(ValueError, "same number of vectorized rows"):
@@ -958,6 +981,50 @@ class ProfitGridStrategyTest(unittest.TestCase):
         self.assertEqual(engine._openable_lot_index(), 1)
         self.assertEqual(price_levels(lot0, lot0.manager.books.bid_maker), [])
         self.assertEqual(price_levels(lot1, lot1.manager.books.bid_maker), [(98.9, 1.01)])
+
+    def test_new_lot_requires_adverse_cost_deviation_for_long(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                max_position_usdt=[100.0, 100.0],
+                stoploss=[0.0, 0.0],
+                new_open_lot_crit=0.01,
+            )
+        )
+        lot0, _lot1 = engine._lot_strategies
+        set_position(lot0, qty=1.0, cost=100.0)
+        engine._sync_lot_pools()
+
+        engine._activate_backup_lot_if_needed(mid=99.1)
+
+        self.assertEqual(engine._active_lot_count, 1)
+
+        engine._activate_backup_lot_if_needed(mid=99.0)
+
+        self.assertEqual(engine._active_lot_count, 2)
+        self.assertEqual(engine._openable_lot_index(mid=99.1), 0)
+        self.assertEqual(engine._openable_lot_index(mid=99.0), 1)
+
+    def test_new_lot_requires_adverse_cost_deviation_for_short(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                max_position_usdt=[100.0, 100.0],
+                stoploss=[0.0, 0.0],
+                new_open_lot_crit=0.01,
+            )
+        )
+        lot0, _lot1 = engine._lot_strategies
+        set_position(lot0, qty=-1.0, cost=100.0)
+        engine._sync_lot_pools()
+
+        engine._activate_backup_lot_if_needed(mid=100.9)
+
+        self.assertEqual(engine._active_lot_count, 1)
+
+        engine._activate_backup_lot_if_needed(mid=101.0)
+
+        self.assertEqual(engine._active_lot_count, 2)
+        self.assertEqual(engine._openable_lot_index(mid=100.9), 0)
+        self.assertEqual(engine._openable_lot_index(mid=101.0), 1)
 
     def test_inner_lot_is_close_only_when_outer_lot_is_nonempty(self):
         engine = SimpleMakerStrategy(

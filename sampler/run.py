@@ -174,6 +174,12 @@ def build_stage_configs(
     freqs = [int(freq) for freq in ensure_list(require_non_empty(cfg, "freq_ms"))]
     if not freqs:
         raise ValueError("config requires freq_ms")
+    scheme_shift = [int(shift) for shift in ensure_list(cfg.get("scheme_shift", [0]))]
+    if not scheme_shift:
+        scheme_shift = [0]
+    for freq in freqs:
+        for shift in scheme_shift:
+            resample.normalize_scheme_shift(shift, freq)
 
     name_instructor = [
         str(name).strip().lower()
@@ -221,6 +227,7 @@ def build_stage_configs(
         },
         "sampler": {
             "freq": freqs,
+            "scheme_shift": scheme_shift,
             "ticker_category": input_paths.ticker_category,
             "overwrite": overwrite,
             "strict_validate": strict_validate,
@@ -238,6 +245,7 @@ def build_stage_configs(
         },
         "instructor": {
             "freq": freqs,
+            "scheme_shift": scheme_shift,
             "indicator": name_instructor,
             "lookback": lookback_instructor,
             "trade_category": input_paths.trade_category,
@@ -258,6 +266,7 @@ def build_stage_configs(
         },
         "intensity": {
             "freq": freqs,
+            "scheme_shift": scheme_shift,
             "indicator": name_intensity,
             "lookback": lookback_intensity,
             "ticker_category": input_paths.ticker_category,
@@ -280,6 +289,7 @@ def build_stage_configs(
         },
         "volatility": {
             "freq": freqs,
+            "scheme_shift": scheme_shift,
             "indicator": name_volatility,
             "lookback": lookback_volatility,
             "ticker_category": input_paths.ticker_category,
@@ -330,9 +340,13 @@ def main() -> None:
         description="Run resample, instructor, intensity, and volatility stages in order."
     )
     parser.add_argument("--config", default="config.json")
+    parser.add_argument("--scheme-shift", nargs="+", type=int)
     args = parser.parse_args()
 
-    run_pipeline(load_config(args.config))
+    cfg = load_config(args.config)
+    if args.scheme_shift is not None:
+        cfg["scheme_shift"] = args.scheme_shift
+    run_pipeline(cfg)
 
 
 if __name__ == "__main__":

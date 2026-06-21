@@ -73,6 +73,7 @@ PARAM_KEY_ALIAS = {
     "lookback_intensity": "lbi",
     "order_amt": "oa",
     "max_position_usdt": "mp",
+    "new_open_lot_crit": "nolc",
     "max_holding_time": "mht",
     "freq": "fr",
     "adj_spread_intensity": "asi",
@@ -94,6 +95,7 @@ SIM_OPTIONAL_KEYS = (
     "name_volatility",
     "lookback_instructor",
     "lookback_volatility",
+    "new_open_lot_crit",
     "max_holding_time",
     "adj_spread_intensity",
     "adj_spread_instructor",
@@ -117,6 +119,7 @@ class Task:
     dates: list[str]
     sim_params: dict[str, Any]
     cfg: dict[str, Any]
+    scheme_shift: int
 
 
 def load_config(path: str) -> dict[str, Any]:
@@ -284,6 +287,10 @@ def build_param_path_parts(sim_params: dict[str, Any]) -> tuple[str, str]:
     sim_body = _build_param_body(sim_params)
     sim_dir = _safe_dir_segment(prefix="sim__", body=sim_body)
     return sim_dir, "strat__all"
+
+
+def scheme_shift_path_component(scheme_shift: int) -> str:
+    return f"scheme_shift_{int(scheme_shift)}ms"
 
 
 def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
@@ -502,6 +509,7 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
         lookback_volatility=lookback_volatility,
         order_amt=float(raw["order_amt"]),
         max_position_usdt=_normalize_max_position_lot_value(raw["max_position_usdt"]),
+        new_open_lot_crit=float(raw.get("new_open_lot_crit", 0.0)),
         max_holding_time=int(raw.get("max_holding_time", 0)),
         adj_spread_intensity=float(raw.get("adj_spread_intensity", 1.0)),
         adj_spread_instructor=float(raw.get("adj_spread_instructor", 0.0)),
@@ -552,6 +560,7 @@ def _config_paths(cfg: dict[str, Any]) -> dict[str, Any]:
         "bookticker_backup_path",
         "trade_path",
         "trade_backup_path",
+        "scheme_shift",
     ):
         if key in cfg and key not in paths:
             paths[key] = cfg[key]
@@ -563,6 +572,16 @@ def _normalize_category(value: Any, default: str) -> str:
     if not category:
         raise ValueError("category must not be empty")
     return category
+
+
+def _scalar_scheme_shift(value: Any) -> int:
+    if value in (None, "", []):
+        return 0
+    if isinstance(value, (list, tuple)):
+        if len(value) != 1:
+            raise ValueError("strategy config requires exactly one scheme_shift")
+        return int(value[0])
+    return int(value)
 
 
 def _ensure_path_list(value: Any) -> list[str]:
@@ -655,6 +674,7 @@ def _build_loader(cfg: dict[str, Any], require_volatility_cache: bool = False) -
         volatility_cache_root=volatility_cache_root,
         trade_category=trade_category,
         ticker_category=ticker_category,
+        scheme_shift=_scalar_scheme_shift(paths.get("scheme_shift", cfg.get("scheme_shift", 0))),
     )
 
 
@@ -1181,6 +1201,8 @@ def _build_tasks(cfg: dict[str, Any]) -> list[Task]:
 
     dates = generate_dates(cfg["date_start"], cfg["date_end"])
     sim_map = _normalize_sim_param_map(cfg)
+    paths = _config_paths(cfg)
+    scheme_shift = _scalar_scheme_shift(paths.get("scheme_shift", cfg.get("scheme_shift", 0)))
 
     lot_param_rows = _build_lot_param_rows(sim_map)
     sim_keys = sorted(k for k in sim_map.keys() if k not in LOT_PAIRED_KEYS)
@@ -1199,6 +1221,7 @@ def _build_tasks(cfg: dict[str, Any]) -> list[Task]:
                         dates=dates,
                         sim_params=paired_sim_params,
                         cfg=cfg,
+                        scheme_shift=scheme_shift,
                     )
                 )
     return tasks
@@ -1215,7 +1238,8 @@ def _run_strategy_task(task: Task) -> dict[str, Any]:
     )
 
     sim_dir, strat_dir = build_param_path_parts(task.sim_params)
-    out_dir = os.path.join(out_root, task.symbol, sim_dir, strat_dir)
+    shift_dir = scheme_shift_path_component(task.scheme_shift)
+    out_dir = os.path.join(out_root, task.symbol, shift_dir, sim_dir, strat_dir)
 
     output_cfg = cfg.get("output", {})
     overwrite = bool(output_cfg.get("overwrite", False))
@@ -1232,6 +1256,7 @@ def _run_strategy_task(task: Task) -> dict[str, Any]:
         "symbol": task.symbol,
         "sim_dir": sim_dir,
         "strat_dir": strat_dir,
+        "scheme_shift": task.scheme_shift,
         "output_dir": out_dir,
     }
     row.update(task.sim_params)
@@ -1250,6 +1275,7 @@ def run_all_strategy(cfg: dict[str, Any]) -> None:
                 dates=[first.dates[0]],
                 sim_params=first.sim_params,
                 cfg=first.cfg,
+                scheme_shift=first.scheme_shift,
             )
         ]
         print(

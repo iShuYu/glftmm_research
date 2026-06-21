@@ -80,16 +80,16 @@
 \code{min_order_notional=100} & 开仓部分必须满足最小名义金额。\\
 \code{inventory_skew=[0,1]} & 最大 skew tick 为 0，所以当前不开库存偏移。\\
 \code{open_curve_underwater} & 当前为 \code{[0,1,0]}，order 为 0，所以当前不开水下补仓数量衰减。\\
+\code{new_open_lot_crit=0.01} & 下一层 lot 只有在上一层满仓且价格相对上一层成本价逆向偏离 1\% 后才允许开仓。\\
 \code{max_holding_time=-1} & 不启用持仓超时强平。\\
 \code{profit_grid} & 四组止盈网格，分别测试不同盈利带和数量分布。\\
 \bottomrule
 \end{longtable}
 
-两组 lot 结构如下：
+当前 lot 结构如下：
 
 \begin{itemize}
-  \item 五层 lot：每层 \code{max_position_usdt=100000}，每层 \code{stoploss=20000}，总仓位上限 500000 USDT。
-  \item 两层 lot：每层 \code{max_position_usdt=250000}，每层 \code{stoploss=25000}，总仓位上限 500000 USDT。
+  \item 五层 lot：每层 \code{max_position_usdt=100000}，每层 \code{stoploss=30000}，总仓位上限 500000 USDT。
 \end{itemize}
 
 \section{数据流和时间顺序}
@@ -435,12 +435,14 @@ floating\_loss=\max(0,-floating\_unrealized).
 \begin{itemize}
   \item 该 lot 已经达到自己的仓位上限；
   \item 判断标准是 \code{gross_cost_notional_usdt >= max_position_usdt}；
-  \item 多头满仓和空头满仓都可以触发，不要求当前一定水下，也不因为 stoploss 可能触发而阻止备用层开放；
+  \item 当前价格相对该 lot 成本价达到 \code{new_open_lot_crit} 的逆向偏离；
+  \item 多头满仓时要求 \code{mid <= cost * (1 - new_open_lot_crit)}，空头满仓时要求 \code{mid >= cost * (1 + new_open_lot_crit)}；
+  \item 这个价格门槛只控制下一层是否能开仓，不改变当前 lot 的 stoploss 和 close-only 流程；
 \end{itemize}
 
-则 \code{active_lot_count} 加 1，下一层外侧备用 lot 被开放。这个开放发生在 ticker 事件上；如果某一笔 trade 刚好让当前外层 lot 达到满仓，下一层会在后续 ticker 同步时开放。
+则 \code{active_lot_count} 加 1，下一层外侧备用 lot 被开放。这个开放发生在 ticker 事件上；如果某一笔 trade 刚好让当前外层 lot 达到满仓，下一层会在后续 ticker 同步时检查满仓和价格偏离是否同时满足。
 
-因此，多 lot 不是同时开所有层，而是只有上一层达到任意方向满仓后才启用下一层。这个机制把加仓风险拆成一层一层向外展开的仓位单元。
+因此，多 lot 不是同时开所有层，而是只有上一层达到任意方向满仓，并且行情继续朝该层不利方向移动足够远后才启用下一层。这个机制把加仓风险拆成一层一层向外展开的仓位单元，并降低单边行情里快速打满所有 lot 的速度。
 
 \subsection{谁可以开仓，谁只能平仓}
 
@@ -449,7 +451,7 @@ ticker 事件上，multi-lot 会先找当前可开仓 lot：
 \begin{itemize}
   \item 如果 active 前缀里没有任何仓位，则第 0 层可以按原单 lot 规则双边开仓。
   \item 如果已经有非空 lot，通常只有最外层非空 lot 可以按原单 lot 规则自由开平仓。
-  \item 如果最外层非空 lot 已经满仓，并且外侧存在一个刚开放但仍为空的备用 lot，则这个空备用 lot 是当前可开仓 lot。
+  \item 如果最外层非空 lot 已经满仓、价格偏离条件仍然满足，并且外侧存在一个刚开放但仍为空的备用 lot，则这个空备用 lot 是当前可开仓 lot。
   \item 其他更内层的非空 lot 不允许开仓，只能保留现有规则下的减仓侧报价。例如多头只保留 ask 平仓侧，空头只保留 bid 平仓侧。
 \end{itemize}
 
@@ -502,7 +504,7 @@ remaining\_qty_{i+1}=remaining\_qty_i-filled_i.
   \item \code{traded_volume}：各 lot 成交额求和。
 \end{itemize}
 
-状态 JSON 里会保留 \code{lots}，包含每一层 lot 的独立状态。这里的 \code{lots} 顺序是当前逻辑顺序，而不一定是最初配置顺序。状态也会保存 \code{active_lot_count}、\code{active_lot_indices}、\code{frozen_lot_indices}、\code{max_position_lots} 和 \code{stoploss_lots}，用于断点续跑。
+状态 JSON 里会保留 \code{lots}，包含每一层 lot 的独立状态。这里的 \code{lots} 顺序是当前逻辑顺序，而不一定是最初配置顺序。状态也会保存 \code{active_lot_count}、\code{active_lot_indices}、\code{frozen_lot_indices}、\code{max_position_lots}、\code{stoploss_lots} 和 \code{new_open_lot_crit}，用于断点续跑和输出复盘。
 
 \section{仓位和 PnL}
 
@@ -594,6 +596,7 @@ cost\_notional\_usdt=qty\cdot cost.
   \item \code{intensity=k, lookback=300, adj_spread_intensity=1}：决定普通报价离 BBO 的距离。
   \item \code{order_amt=1000} 和最小下单约束：决定普通开仓数量。
   \item \code{max_position_usdt} 和 \code{stoploss} 的多 lot 向量：决定分层仓位与每层止损。
+  \item \code{new_open_lot_crit=0.01}：决定下一层 lot 需要相对上一层成本价逆向偏离 1\% 才能开仓。
   \item \code{profit_grid}：决定盈利区的 close-only 分层止盈。
   \item 每日状态恢复和三类提前停止规则：决定长区间批量回测是否继续。
 \end{itemize}
@@ -613,7 +616,7 @@ cost\_notional\_usdt=qty\cdot cost.
 \begin{itemize}
   \item \textbf{profit grid 不是止损。} 它只在持仓盈利时挂 close-only 网格。亏损时只有当前可开仓 lot 仍可能补仓；内层非空 lot 只允许平仓。
   \item \textbf{止损不是立即改仓。} 止损触发后放 taker close-only 单，仍需要后续 trade 事件撮合。
-  \item \textbf{多 lot 不是简单提高单层 max position，也不是多个独立策略。} 每一层有独立成本、独立订单簿、独立止损；但开仓权限、成交数量和 index 轮换由外层 lot 栈统一调度。
+  \item \textbf{多 lot 不是简单提高单层 max position，也不是多个独立策略。} 每一层有独立成本、独立订单簿、独立止损；但开仓权限、成交数量、下一层价格门槛和 index 轮换由外层 lot 栈统一调度。
   \item \textbf{仓位上限用成本名义金额。} 它不随 mark price 波动直接变化，除非成交改变平均成本或数量。
   \item \textbf{mode=1 更保守。} 等价价格不成交，只有严格穿过才成交。
   \item \textbf{当前 instructor 不生效。} 文档里解释了 instructor 公式，但当前参数缩放为 0。

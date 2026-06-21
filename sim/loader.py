@@ -10,6 +10,7 @@ import pandas as pd
 
 from sampler.instructor import instructor_output_path
 from sampler.intensity import intensity_output_path
+from sampler.resample import normalize_scheme_shift
 from sampler.resample import output_path as sampled_ticker_path
 from sampler.resample import resolve_existing_input_path
 from sampler.volatility import volatility_output_path
@@ -81,6 +82,21 @@ def _configured_cache_root() -> Path:
     return DEFAULT_CACHE_ROOT
 
 
+def _scalar_scheme_shift(value: Any, source: str) -> int:
+    if value in (None, "", []):
+        return 0
+    if isinstance(value, (list, tuple)):
+        if len(value) != 1:
+            raise ValueError(f"{source} must contain exactly one scheme_shift")
+        return int(value[0])
+    return int(value)
+
+
+def _configured_scheme_shift() -> int:
+    cfg = _load_project_config()
+    return _scalar_scheme_shift(cfg.get("scheme_shift", 0), "sampler/config.json")
+
+
 def _configured_trade_roots(trade_category: str) -> tuple[Path, ...]:
     cfg = _load_project_config()
     roots: list[Path] = []
@@ -139,6 +155,7 @@ class BinanceEventLoader:
         trade_roots: Iterable[str | Path] | None = None,
         trade_category: str | None = None,
         ticker_category: str | None = None,
+        scheme_shift: int | list[int] | tuple[int, ...] | None = None,
     ) -> None:
         project_cfg = _load_project_config()
         category = str(
@@ -158,6 +175,10 @@ class BinanceEventLoader:
 
         default_cache_root = Path(cache_root) if cache_root is not None else _configured_cache_root()
         self.cache_root = default_cache_root
+        self.scheme_shift = _scalar_scheme_shift(
+            _configured_scheme_shift() if scheme_shift is None else scheme_shift,
+            "scheme_shift",
+        )
         if bookticker_root is not None:
             self.bookticker_root = Path(bookticker_root)
         elif input_path is not None:
@@ -296,6 +317,7 @@ class BinanceEventLoader:
             symbol=symbol,
             freq_ms=freq_ms,
             date_str=date,
+            scheme_shift_ms=normalize_scheme_shift(self.scheme_shift, freq_ms),
         )
         if not path.exists():
             raise FileNotFoundError(f"missing sampled ticker: {path}")
@@ -321,6 +343,7 @@ class BinanceEventLoader:
             freq_ms=freq_ms,
             lookback=lookback,
             date_str=date,
+            scheme_shift_ms=normalize_scheme_shift(self.scheme_shift, freq_ms),
         )
         if not path.exists():
             raise FileNotFoundError(f"missing instructor: {path}")
@@ -345,6 +368,7 @@ class BinanceEventLoader:
             freq_ms=freq_ms,
             lookback=lookback,
             date_str=date,
+            scheme_shift_ms=normalize_scheme_shift(self.scheme_shift, freq_ms),
         )
         if not path.exists():
             raise FileNotFoundError(f"missing intensity: {path}")
@@ -369,6 +393,7 @@ class BinanceEventLoader:
             freq_ms=freq_ms,
             lookback=lookback,
             date_str=date,
+            scheme_shift_ms=normalize_scheme_shift(self.scheme_shift, freq_ms),
         )
         if not path.exists():
             raise FileNotFoundError(f"missing volatility: {path}")

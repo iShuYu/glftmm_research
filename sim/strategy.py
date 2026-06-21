@@ -287,6 +287,7 @@ class SimulationConfig:
     lookback_volatility: Optional[int] = None
     order_amt: float = 0.0
     max_position_usdt: float | tuple[float, ...] = 0.0
+    new_open_lot_crit: float = 0.0
     max_holding_time: int = 0
     adj_spread_intensity: float = 1.0
     adj_spread_instructor: float = 0.0
@@ -313,10 +314,12 @@ class SimulationConfig:
         )
         max_position_lots = self._normalize_max_position_lots(self.max_position_usdt)
         stoploss_lots = self._normalize_stoploss_lots(self.stoploss)
+        new_open_lot_crit = float(self.new_open_lot_crit)
         if len(stoploss_lots) != len(max_position_lots):
             raise ValueError(
                 "stoploss and max_position_usdt must have the same number of lots"
             )
+        object.__setattr__(self, "new_open_lot_crit", new_open_lot_crit)
         object.__setattr__(
             self,
             "max_position_usdt",
@@ -359,6 +362,10 @@ class SimulationConfig:
             raise ValueError("order_amt must be >= 0")
         if any(value < 0 for value in max_position_lots):
             raise ValueError("max_position_usdt lots must be >= 0")
+        if not math.isfinite(new_open_lot_crit):
+            raise ValueError("new_open_lot_crit must be finite")
+        if new_open_lot_crit < 0.0 or new_open_lot_crit >= 1.0:
+            raise ValueError("new_open_lot_crit must be in [0, 1)")
         if self.adj_spread_intensity <= 0:
             raise ValueError("adj_spread_intensity must be > 0")
         if not math.isfinite(float(self.adj_spread_instructor)):
@@ -504,6 +511,7 @@ class _SingleLotMakerStrategy:
             "unrealized_pnl": unrealized_pnl,
             "total_pnl": float(realized_pnl + unrealized_pnl),
             "max_position_usdt": float(self.cfg.max_position_usdt),
+            "new_open_lot_crit": float(self.cfg.new_open_lot_crit),
             "stoploss_usdt": float(self.cfg.stoploss),
             "traded_volume": float(self._traded_volume),
             "latest_best_ask": self._latest_best_ask,
@@ -1457,7 +1465,7 @@ class SimpleMakerStrategy(_SingleLotMakerStrategy):
                 mid = 0.5 * (best_bid + best_ask)
                 self._sync_lot_stack()
                 self._activate_backup_lot_if_needed(mid=mid)
-                openable_idx = self._openable_lot_index()
+                openable_idx = self._openable_lot_index(mid=mid)
                 for idx, lot in enumerate(self._lot_strategies):
                     if idx >= self._active_lot_count:
                         self._cancel_inactive_flat_lot(lot)
@@ -1527,6 +1535,7 @@ class SimpleMakerStrategy(_SingleLotMakerStrategy):
         state["stoploss_lots"] = [
             float(lot.cfg.stoploss) for lot in self._lot_strategies
         ]
+        state["new_open_lot_crit"] = float(self.cfg.new_open_lot_crit)
         state["active_lot_count"] = int(self._active_lot_count)
         state["active_lot_indices"] = list(self._active_lot_indices)
         state["frozen_lot_indices"] = list(self._frozen_lot_indices)
@@ -1619,7 +1628,7 @@ class SimpleMakerStrategy(_SingleLotMakerStrategy):
         self._sync_lot_stack()
         if idx < 0 or idx >= self._active_lot_count:
             return False
-        if idx == self._openable_lot_index():
+        if idx == self._openable_lot_index(mid=mid):
             return True
         return self._lot_has_position(self._lot_strategies[idx])
 
@@ -1681,7 +1690,6 @@ class SimpleMakerStrategy(_SingleLotMakerStrategy):
         self._refresh_lot_index_state()
 
     def _activate_backup_lot_if_needed(self, *, mid: float) -> None:
-        del mid
         self._sync_lot_stack()
         if self._active_lot_count >= len(self._lot_strategies):
             return
@@ -1689,6 +1697,8 @@ class SimpleMakerStrategy(_SingleLotMakerStrategy):
         if not self._lot_has_position(previous_lot):
             return
         if not previous_lot._is_at_max_position():
+            return
+        if not self._new_open_lot_crit_reached(previous_lot, mid=mid):
             return
         self._active_lot_count += 1
         self._refresh_lot_index_state()
@@ -1730,7 +1740,7 @@ class SimpleMakerStrategy(_SingleLotMakerStrategy):
             range(self._active_lot_count, len(self._lot_strategies))
         )
 
-    def _openable_lot_index(self) -> Optional[int]:
+    def _openable_lot_index(self, *, mid: Optional[float] = None) -> Optional[int]:
         if not self._lot_strategies:
             return None
         outer_idx = self._outermost_nonempty_lot_index()
@@ -1741,9 +1751,40 @@ class SimpleMakerStrategy(_SingleLotMakerStrategy):
             backup_idx < self._active_lot_count
             and not self._lot_has_position(self._lot_strategies[backup_idx])
             and self._lot_strategies[outer_idx]._is_at_max_position()
+            and self._new_open_lot_crit_reached(
+                self._lot_strategies[outer_idx],
+                mid=mid,
+            )
         ):
             return backup_idx
         return outer_idx
+
+    def _new_open_lot_crit_reached(
+        self,
+        previous_lot: _SingleLotMakerStrategy,
+        *,
+        mid: Optional[float],
+    ) -> bool:
+        crit = float(self.cfg.new_open_lot_crit)
+        if crit <= self.EPS:
+            return True
+        if mid is None:
+            return False
+        mid = float(mid)
+        if not math.isfinite(mid) or mid <= self.EPS:
+            return False
+
+        pos = previous_lot.manager.position
+        qty = float(pos.qty)
+        cost = float(pos.cost)
+        if abs(qty) <= previous_lot.EPS:
+            return False
+        if not math.isfinite(cost) or cost <= previous_lot.EPS:
+            return False
+
+        if qty > 0.0:
+            return mid <= cost * (1.0 - crit) + self.EPS
+        return mid >= cost * (1.0 + crit) - self.EPS
 
     def _outermost_nonempty_lot_index(self) -> Optional[int]:
         upper = min(self._active_lot_count, len(self._lot_strategies))
@@ -1766,8 +1807,21 @@ class SimpleMakerStrategy(_SingleLotMakerStrategy):
 
     @staticmethod
     def _lot_needs_next_layer(lot: _SingleLotMakerStrategy, *, mid: float) -> bool:
-        del mid
-        return SimpleMakerStrategy._lot_has_position(lot) and lot._is_at_max_position()
+        if not SimpleMakerStrategy._lot_has_position(lot) or not lot._is_at_max_position():
+            return False
+        crit = float(lot.cfg.new_open_lot_crit)
+        if crit <= lot.EPS:
+            return True
+        mid = float(mid)
+        if not math.isfinite(mid) or mid <= lot.EPS:
+            return False
+        qty = float(lot.manager.position.qty)
+        cost = float(lot.manager.position.cost)
+        if not math.isfinite(cost) or cost <= lot.EPS:
+            return False
+        if qty > 0.0:
+            return mid <= cost * (1.0 - crit) + lot.EPS
+        return mid >= cost * (1.0 + crit) - lot.EPS
 
     @staticmethod
     def _aggregate_state_from_lots(lots: Sequence[dict]) -> dict:

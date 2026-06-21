@@ -6,7 +6,8 @@
   "date_end": "2026-06-01",
   "input_path": "/data/users/data-helper/PROCESSED/TARDIS/BINANCE/UFUTURES",
   "input_backup_path": "/home/kang/data_helper/PROCESSED/DATA_RECORDER/BINANCE/UFUTURES",
-  "output_path": "/data/users/kang/backtest/glftmm_var/cached",
+  "output_path": "/data/users/kang/backtest/glftmm/cached",
+  "scheme_shift": 0,
   "ticker_category": "BOOKTICKER",
   "trade_category": "TRADE",
   "paths": {
@@ -45,13 +46,13 @@
       "sigma"
     ],
     "name_instructor": [
-      "bbo_imbalance"
+      "trade_imbalance"
     ],
     "lookback_volatility": [
       300
     ],
     "lookback_instructor": [
-      0
+      10
     ],
     "lookback_intensity": [
       300
@@ -63,20 +64,25 @@
       [100000, 100000, 100000, 100000, 100000],
       [100000, 100000, 100000, 100000, 100000]
     ],
+    "new_open_lot_crit": [
+      0.01,
+      0.02
+    ],
     "stoploss": [
-      [5000, 5000, 5000, 5000, 5000],
-      [10000, 10000, 10000, 10000, 10000]
+      [20000, 20000, 20000, 20000, 20000],
+      [30000, 30000, 30000, 30000, 30000]
     ],
     "order_amt": [
-      1000,
+      1500,
       2000
     ],
     "min_order_qty": [
       0.0
     ],
     "adj_spread_intensity": [
-      1.0,
-      1.5
+      1.5,
+      2,
+      3
     ],
     "adj_spread_instructor": [
       0

@@ -6,6 +6,7 @@
   "input_backup_path": "/home/kang/data_helper/PROCESSED/DATA_RECORDER/BINANCE/UFUTURES",
   "output_path": "/data/users/kang/backtest/glftmm_lot/cached",
   "freq_ms": [1000],
+  "scheme_shift": [0],
   "name_instructor": ["bbo_imbalance"],
   "lookback_instructor": [0],
   "name_intensity": ["k"],
