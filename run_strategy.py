@@ -17,7 +17,7 @@ from typing import Any
 import pandas as pd
 
 try:
-    from glftmm_var.sim.loader import BinanceEventLoader
+    from glftmm_var.sim.loader import BinanceEventLoader, parse_orderbook_replay_config
     from glftmm_var.sim.strategy import (
         SimulationConfig,
         SimpleMakerStrategy,
@@ -25,7 +25,7 @@ try:
         normalize_profit_grid_qty_distribution,
     )
 except ModuleNotFoundError:
-    from sim.loader import BinanceEventLoader
+    from sim.loader import BinanceEventLoader, parse_orderbook_replay_config
     from sim.strategy import (
         SimulationConfig,
         SimpleMakerStrategy,
@@ -37,8 +37,8 @@ except ModuleNotFoundError:
 DATE_FMT_DASH = "%Y-%m-%d"
 DATE_FMT_COMPACT = "%Y%m%d"
 MAX_DIR_SEGMENT_LEN = 240
-MIN_DAYS_FOR_NEG_STOP = 60
-MIN_DAYS_FOR_LOW_ANNUALIZED_STOP = 60
+MIN_DAYS_FOR_NEG_STOP = 365
+MIN_DAYS_FOR_LOW_ANNUALIZED_STOP = 365
 MIN_ANNUALIZED_RETURN_RATIO = 0.2
 MAX_DRAWDOWN_LIMIT_RATIO = 0.2
 _MAX_POSITION_RE = re.compile(
@@ -74,12 +74,14 @@ PARAM_KEY_ALIAS = {
     "order_amt": "oa",
     "max_position_usdt": "mp",
     "phase_change_position": "pcp",
+    "boost_phase_change": "bpc",
     "phase_mode": "phm",
     "max_holding_time": "mht",
     "freq": "fr",
     "adj_spread_intensity": "asi",
     "adj_spread_instructor": "asir",
     "open_passive_only": "opo",
+    "optimize_by_orderbook": "obo",
     "adj_spread_volatility": "asv",
     "inventory_skew": "isk",
     "stoploss": "sl",
@@ -97,11 +99,13 @@ SIM_OPTIONAL_KEYS = (
     "lookback_instructor",
     "lookback_volatility",
     "phase_change_position",
+    "boost_phase_change",
     "phase_mode",
     "max_holding_time",
     "adj_spread_intensity",
     "adj_spread_instructor",
     "open_passive_only",
+    "optimize_by_orderbook",
     "adj_spread_volatility",
     "inventory_skew",
     "min_order_qty",
@@ -223,6 +227,18 @@ def _parse_bool(raw: Any, key: str) -> bool:
         if value in {"false", "0", "no", "n"}:
             return False
     raise ValueError(f"simulation.{key} must be boolean")
+
+
+def _parse_orderbook_optimizer_threshold(raw: Any) -> float:
+    if isinstance(raw, bool):
+        raise ValueError("simulation.optimize_by_orderbook must be -1, 0, or a notional threshold")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError("simulation.optimize_by_orderbook must be -1, 0, or a notional threshold") from None
+    if not math.isfinite(value) or (value < 0.0 and abs(value + 1.0) > 1e-12):
+        raise ValueError("simulation.optimize_by_orderbook must be -1, 0, or a notional threshold")
+    return value
 
 
 def _safe_dir_segment(prefix: str, body: str) -> str:
@@ -387,11 +403,15 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
         order_amt=float(raw["order_amt"]),
         max_position_usdt=float(raw["max_position_usdt"]),
         phase_change_position=float(raw.get("phase_change_position", 0.0)),
+        boost_phase_change=float(raw.get("boost_phase_change", 1.0)),
         phase_mode=str(raw.get("phase_mode", "market")).strip().lower(),
         max_holding_time=int(raw.get("max_holding_time", 0)),
         adj_spread_intensity=float(raw.get("adj_spread_intensity", 1.0)),
         adj_spread_instructor=float(raw.get("adj_spread_instructor", 0.0)),
         open_passive_only=_parse_bool(raw.get("open_passive_only", False), "open_passive_only"),
+        optimize_by_orderbook=_parse_orderbook_optimizer_threshold(
+            raw.get("optimize_by_orderbook", -1),
+        ),
         adj_spread_volatility=float(raw.get("adj_spread_volatility", 0.0)),
         inventory_skew=inventory_skew,
         min_order_qty=float(raw.get("min_order_qty", 0.0)),
@@ -438,6 +458,7 @@ def _config_paths(cfg: dict[str, Any]) -> dict[str, Any]:
         "bookticker_backup_path",
         "trade_path",
         "trade_backup_path",
+        "scheme_shift",
     ):
         if key in cfg and key not in paths:
             paths[key] = cfg[key]
@@ -457,6 +478,19 @@ def _ensure_path_list(value: Any) -> list[str]:
     if isinstance(value, (list, tuple)):
         return [str(item) for item in value if item not in (None, "", [])]
     return [str(value)]
+
+
+def _scalar_scheme_shift(value: Any) -> int:
+    if value in (None, "", []):
+        return 0
+    if isinstance(value, (list, tuple)):
+        if len(value) != 1:
+            raise ValueError(
+                "strategy runs require one concrete scheme_shift; "
+                "run separate configs when sampler caches contain multiple shifts"
+            )
+        return int(value[0])
+    return int(value)
 
 
 def _resolve_category_roots(
@@ -498,7 +532,11 @@ def _output_dir_from_cfg(cfg: dict[str, Any]) -> str:
     return out_dir
 
 
-def _build_loader(cfg: dict[str, Any], require_volatility_cache: bool = False) -> BinanceEventLoader:
+def _build_loader(
+    cfg: dict[str, Any],
+    require_volatility_cache: bool = False,
+    simulation: SimulationConfig | None = None,
+) -> BinanceEventLoader:
     paths = _config_paths(cfg)
     sampler_output_root = _path_value(paths, "output_path")
     ticker_cache_root = _path_value(paths, "ticker_cache_root") or sampler_output_root
@@ -532,6 +570,20 @@ def _build_loader(cfg: dict[str, Any], require_volatility_cache: bool = False) -
         explicit_backup_path_keys=("bookticker_backup_path",),
         require_input_path=False,
     )
+    orderbook_replay_config = None
+    if simulation is not None and float(simulation.optimize_by_orderbook) >= 0.0:
+        orderbook_replay_config = parse_orderbook_replay_config(cfg)
+        if abs(float(orderbook_replay_config.tick_size) - float(simulation.tick_size)) > 1e-12:
+            raise ValueError(
+                "orderbook_replay.tick_size must match simulation tick size "
+                f"({orderbook_replay_config.tick_size} != {simulation.tick_size})"
+            )
+        if int(orderbook_replay_config.sample_interval_ms) != int(simulation.freq):
+            raise ValueError(
+                "orderbook_replay.sample_interval_ms must match simulation.freq "
+                f"({orderbook_replay_config.sample_interval_ms} != {simulation.freq})"
+            )
+
     return BinanceEventLoader(
         trade_roots=trade_roots,
         bookticker_root=bookticker_roots[0] if bookticker_roots else None,
@@ -541,6 +593,8 @@ def _build_loader(cfg: dict[str, Any], require_volatility_cache: bool = False) -
         volatility_cache_root=volatility_cache_root,
         trade_category=trade_category,
         ticker_category=ticker_category,
+        scheme_shift=_scalar_scheme_shift(paths.get("scheme_shift", 0)),
+        orderbook_replay_config=orderbook_replay_config,
     )
 
 
@@ -1081,6 +1135,7 @@ def _run_strategy_task(task: Task) -> dict[str, Any]:
     loader = _build_loader(
         cfg=cfg,
         require_volatility_cache=simulation.name_volatility is not None,
+        simulation=simulation,
     )
 
     sim_dir, strat_dir = build_param_path_parts(task.sim_params)

@@ -4,19 +4,53 @@ from pathlib import Path
 
 import pandas as pd
 
+from sampler.intensity import build_tasks as build_intensity_tasks
 from sampler.intensity import intensity_output_path
 from sampler.instructor import (
     build_trade_instructor_frame,
     instructor_output_path,
     validate_instructor_frame,
 )
-from sampler.resample import day_timestamp_grid, output_path as sampled_ticker_path
+from sampler.resample import (
+    TickerResampler,
+    build_tasks as build_resample_tasks,
+    day_timestamp_grid,
+    output_path as sampled_ticker_path,
+)
 from sampler.volatility import volatility_output_path
 from sampler.run import build_stage_configs
 from sim.loader import BinanceEventLoader
 
 
 class SamplerInstructorTest(unittest.TestCase):
+    def test_resample_scheme_shift_moves_grid_and_path(self):
+        date = "2025-01-01"
+        base_grid = day_timestamp_grid(date, 1000)
+        shifted_grid = day_timestamp_grid(date, 1000, scheme_shift_ms=250)
+
+        self.assertEqual(int(shifted_grid[0]), int(base_grid[0]) + 250)
+        self.assertEqual(len(shifted_grid), len(base_grid))
+        self.assertEqual(
+            sampled_ticker_path(Path("/tmp/cache"), "BTCUSDT", 1000, date, 250),
+            Path("/tmp/cache/BTCUSDT/resample/freq_1000ms/scheme_shift_250ms/2025-01-01.parquet"),
+        )
+
+        raw = pd.DataFrame(
+            {
+                "timestamp": [int(base_grid[0]) + 100, int(base_grid[0]) + 1500],
+                "best_bid_price": [100.0, 101.0],
+                "best_ask_price": [100.5, 101.5],
+                "best_bid_qty": [1.0, 2.0],
+                "best_ask_qty": [1.0, 2.0],
+            }
+        )
+        out = TickerResampler(freq_ms=1000, scheme_shift_ms=250).resample(raw, date)
+
+        self.assertEqual(int(out.loc[0, "timestamp"]), int(base_grid[0]) + 250)
+        self.assertEqual(float(out.loc[0, "best_bid_price"]), 100.0)
+        self.assertEqual(float(out.loc[1, "best_bid_price"]), 100.0)
+        self.assertEqual(float(out.loc[2, "best_bid_price"]), 101.0)
+
     def test_trade_imbalance_uses_prior_buckets_only(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / "TRADE"
@@ -155,6 +189,7 @@ class SamplerInstructorTest(unittest.TestCase):
                 instructor_cache_root=root,
                 trade_intensity_cache_root=root,
                 volatility_cache_root=root,
+                scheme_shift=0,
             )
             alpha = loader._read_alpha_frame(
                 symbol=symbol,
@@ -180,6 +215,55 @@ class SamplerInstructorTest(unittest.TestCase):
             self.assertEqual(alpha["intensity"].tolist(), [1.5, 2.5])
             self.assertEqual(alpha["volatility_scalar"].tolist(), [0.1, 0.2])
 
+    def test_loader_uses_shifted_cache_paths(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "cache"
+            symbol = "BTCUSDT"
+            date = "2025-01-01"
+            freq_ms = 1000
+            scheme_shift = 250
+            ts0 = int(day_timestamp_grid(date, freq_ms, scheme_shift)[0])
+            timestamps = [ts0, ts0 + freq_ms]
+
+            ticker_path = sampled_ticker_path(root, symbol, freq_ms, date, scheme_shift)
+            ticker_path.parent.mkdir(parents=True)
+            pd.DataFrame(
+                {
+                    "timestamp": timestamps,
+                    "best_bid_price": [100.0, 101.0],
+                    "best_ask_price": [100.5, 101.5],
+                    "best_bid_qty": [1.0, 1.0],
+                    "best_ask_qty": [1.0, 1.0],
+                }
+            ).to_parquet(ticker_path, index=False)
+
+            intensity_path = intensity_output_path(
+                root,
+                symbol,
+                "k",
+                freq_ms,
+                300,
+                date,
+                scheme_shift,
+            )
+            intensity_path.parent.mkdir(parents=True)
+            pd.DataFrame(
+                {"timestamp": timestamps, "intensity": [1.5, 2.5]}
+            ).to_parquet(intensity_path, index=False)
+
+            loader = BinanceEventLoader(cache_root=root, scheme_shift=scheme_shift)
+            alpha = loader._read_alpha_frame(
+                symbol=symbol,
+                date=date,
+                freq_ms=freq_ms,
+                trade_intensity_spec={"name": "k", "lookback": 300},
+                volatility_specs=[],
+                instructor_spec=None,
+            )
+
+            self.assertEqual(alpha["timestamp"].tolist(), timestamps)
+            self.assertEqual(alpha["intensity"].tolist(), [1.5, 2.5])
+
     def test_loader_allows_bbo_imbalance_zero_lookback(self):
         self.assertEqual(
             BinanceEventLoader._parse_spec(
@@ -201,6 +285,7 @@ class SamplerInstructorTest(unittest.TestCase):
             "input_path": "/tmp/input",
             "output_path": "/tmp/output",
             "freq_ms": [1000],
+            "scheme_shift": [0, 250],
             "name_instructor": ["bbo_imbalance"],
             "lookback_instructor": [0],
             "name_intensity": ["k"],
@@ -209,16 +294,27 @@ class SamplerInstructorTest(unittest.TestCase):
             "lookback_volatility": [600],
         }
 
-        _, instructor_cfg, intensity_cfg, volatility_cfg = build_stage_configs(cfg)
+        resample_cfg, instructor_cfg, intensity_cfg, volatility_cfg = build_stage_configs(cfg)
 
         self.assertEqual(
             instructor_cfg["instructor"]["indicator"],
             ["bbo_imbalance"],
         )
         self.assertEqual(instructor_cfg["instructor"]["lookback"], [0])
+        self.assertEqual(instructor_cfg["instructor"]["scheme_shift"], [0, 250])
         self.assertEqual(instructor_cfg["paths"]["ticker_cache_root"], "/tmp/output")
         self.assertEqual(intensity_cfg["intensity"]["lookback"], [300])
+        self.assertEqual(intensity_cfg["intensity"]["scheme_shift"], [0, 250])
         self.assertEqual(volatility_cfg["volatility"]["lookback"], [600])
+        self.assertEqual(volatility_cfg["volatility"]["scheme_shift"], [0, 250])
+        self.assertEqual(
+            [task.scheme_shift_ms for task in build_resample_tasks(resample_cfg)],
+            [0, 250],
+        )
+        self.assertEqual(
+            [task.scheme_shift_ms for task in build_intensity_tasks(intensity_cfg)],
+            [0, 250],
+        )
         self.assertEqual(
             instructor_output_path(
                 Path("/tmp/output"),
@@ -227,9 +323,15 @@ class SamplerInstructorTest(unittest.TestCase):
                 1000,
                 0,
                 "2025-01-01",
+                250,
             ),
-            Path("/tmp/output/BTCUSDT/instructor/freq_1000ms/bbo_imbalance/lookback_0/2025-01-01.parquet"),
+            Path("/tmp/output/BTCUSDT/instructor/freq_1000ms/scheme_shift_250ms/bbo_imbalance/lookback_0/2025-01-01.parquet"),
         )
+
+        bad_cfg = dict(cfg)
+        bad_cfg["scheme_shift"] = [0, 1000]
+        with self.assertRaisesRegex(ValueError, "scheme_shift"):
+            build_stage_configs(bad_cfg)
 
 
 if __name__ == "__main__":

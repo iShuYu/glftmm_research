@@ -6,19 +6,29 @@
   "date_end": "2026-06-01",
   "input_path": "/data/users/data-helper/PROCESSED/TARDIS/BINANCE/UFUTURES",
   "input_backup_path": "/home/kang/data_helper/PROCESSED/DATA_RECORDER/BINANCE/UFUTURES",
-  "output_path": "/data/users/kang/backtest/glftmm_var/cached",
+  "output_path": "/data/users/kang/backtest/glftmm/cached",
   "ticker_category": "BOOKTICKER",
   "trade_category": "TRADE",
+  "scheme_shift": 0,
+  "orderbook_path": "/home/kang/data/wallmaker/cached",
+  "orderbook_replay": {
+    "replay_levels": 1000,
+    "sample_interval_ms": 1000,
+    "tick_size": 0.1,
+    "depth_price_min": 20000.0,
+    "depth_price_max": 200000.0,
+    "raw_quantity_max": 10000.0
+  },
   "paths": {
     "output_dir": "/data/users/kang/backtest/glftmm_var/result"
   },
   "simulation": {
     "mode": [
-      1,
-      0
+      0,
+      1
     ],
     "latency": [
-      2
+      1.5
     ],
     "price_precision": [
       1
@@ -45,22 +55,25 @@
       "sigma"
     ],
     "name_instructor": [
-      "bbo_imbalance"
+      "trade_imbalance"
     ],
     "lookback_volatility": [
       300
     ],
     "lookback_instructor": [
-      0
+      1
     ],
     "lookback_intensity": [
       300
     ],
     "max_position_usdt": [
-      500000
+      2000000
     ],
     "phase_change_position": [
-      300000
+      1000000
+    ],
+    "boost_phase_change": [
+      2.0
     ],
     "phase_mode": [
       "market"
@@ -72,25 +85,28 @@
       0.1
     ],
     "order_amt": [
-      1000
+      2000
     ],
     "min_order_qty": [
       0.0
     ],
     "adj_spread_intensity": [
-      1.0
+      1.5,
+      2.0
     ],
     "adj_spread_instructor": [
-      0,
-      1e-5,
-      5e-5
+      0
     ],
     "open_passive_only": [
-      false,
       true
     ],
+    "optimize_by_orderbook": [
+      10000,
+      100000,
+      200000
+    ],
     "adj_spread_volatility": [
-      0.0
+      0
     ],
     "inventory_skew": [
       [
@@ -100,32 +116,11 @@
     ],
     "profit_grid": [
       [
-        5,
-        105,
+        20,
+        120,
         10,
         "exponential",
         0.2
-      ],
-      [
-        5,
-        105,
-        10,
-        "exponential",
-        0.5
-      ],
-      [
-        2,
-        52,
-        10,
-        "exponential",
-        0.2
-      ],
-      [
-        2,
-        52,
-        10,
-        "exponential",
-        0.5
       ]
     ],
     "open_curve_underwater": [
@@ -144,6 +139,6 @@
     "summary_csv": "strategy_summary.csv"
   },
   "parallel": {
-    "num_workers": 48
+    "num_workers": 12
   }
 }

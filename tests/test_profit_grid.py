@@ -9,6 +9,7 @@ from sim.strategy import (
     build_profit_grid_levels,
 )
 from run_strategy import (
+    _build_loader,
     _build_simulation_config,
     _normalize_sim_param_map,
     _state_cost_notional_usdt,
@@ -31,11 +32,13 @@ def make_config(**overrides):
         "order_amt": 100.0,
         "max_position_usdt": 100000.0,
         "phase_change_position": 0.0,
+        "boost_phase_change": 1.0,
         "phase_mode": "market",
         "max_holding_time": -1,
         "adj_spread_intensity": 1.0,
         "adj_spread_instructor": 0.0,
         "open_passive_only": False,
+        "optimize_by_orderbook": -1,
         "adj_spread_volatility": 0.0,
         "inventory_skew": (0.0, 1.0),
         "min_order_qty": 0.0,
@@ -64,11 +67,13 @@ def raw_config(**overrides):
         "order_amt": 100.0,
         "max_position_usdt": 100000.0,
         "phase_change_position": 0.0,
+        "boost_phase_change": 1.0,
         "phase_mode": "market",
         "max_holding_time": -1,
         "adj_spread_intensity": 1.0,
         "adj_spread_instructor": 0.0,
         "open_passive_only": False,
+        "optimize_by_orderbook": -1,
         "adj_spread_volatility": 0.0,
         "min_order_qty": 0.0,
         "min_order_notional": 0.0,
@@ -294,6 +299,13 @@ class ProfitGridConfigTest(unittest.TestCase):
 
         self.assertEqual(cfg.phase_change_position, 250.0)
 
+    def test_build_config_parses_boost_phase_change(self):
+        cfg = _build_simulation_config(
+            raw_config(boost_phase_change=2.5)["simulation"]
+        )
+
+        self.assertEqual(cfg.boost_phase_change, 2.5)
+
     def test_build_config_parses_phase_mode(self):
         cfg = _build_simulation_config(
             raw_config(phase_mode="trade")["simulation"]
@@ -316,6 +328,17 @@ class ProfitGridConfigTest(unittest.TestCase):
         self.assertEqual(cfg.adj_spread_instructor, -1e-5)
         self.assertTrue(cfg.open_passive_only)
 
+    def test_build_config_parses_optimize_by_orderbook(self):
+        cfg = _build_simulation_config(
+            raw_config(optimize_by_orderbook=1000)["simulation"]
+        )
+
+        self.assertEqual(cfg.optimize_by_orderbook, 1000.0)
+
+    def test_build_config_rejects_boolean_optimize_by_orderbook(self):
+        with self.assertRaises(ValueError):
+            _build_simulation_config(raw_config(optimize_by_orderbook=True)["simulation"])
+
     def test_build_config_allows_bbo_imbalance_zero_lookback(self):
         cfg = _build_simulation_config(
             raw_config(
@@ -330,6 +353,19 @@ class ProfitGridConfigTest(unittest.TestCase):
     def test_invalid_phase_mode_is_rejected(self):
         with self.assertRaises(ValueError):
             _build_simulation_config(raw_config(phase_mode="last_open")["simulation"])
+
+    def test_invalid_boost_phase_change_is_rejected(self):
+        with self.assertRaises(ValueError):
+            _build_simulation_config(raw_config(boost_phase_change=-1.0)["simulation"])
+
+    def test_loader_requires_orderbook_path_when_optimize_by_orderbook_enabled(self):
+        cfg = raw_config(optimize_by_orderbook=0)
+        cfg["output_path"] = "/tmp/cache"
+        cfg["input_path"] = "/tmp/input"
+        sim = _build_simulation_config(cfg["simulation"])
+
+        with self.assertRaises(ValueError):
+            _build_loader(cfg, simulation=sim)
 
 
 class ProfitGridStrategyTest(unittest.TestCase):
@@ -465,6 +501,179 @@ class ProfitGridStrategyTest(unittest.TestCase):
             [(101.0, 0.334), (102.0, 0.333), (103.0, 0.333)],
         )
 
+    def test_open_liquidity_snap_moves_flat_open_quotes_to_wall_front(self):
+        engine = SimpleMakerStrategy(make_config(optimize_by_orderbook=0))
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=99.8,
+            best_ask=100.2,
+            intensity_value=0.3,
+            volatility_scalar=0.0,
+            replay_bid_ticks=[998, 993],
+            replay_ask_ticks=[1002, 1007],
+        )
+
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.ask_maker),
+            [(100.6, 1.0)],
+        )
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.bid_maker),
+            [(99.4, 1.0)],
+        )
+        state = engine.snapshot_state()
+        self.assertEqual(state["open_liquidity_snap_adjusted"], 2)
+        self.assertEqual(state["open_liquidity_snap_moved_ticks"], 2)
+        self.assertEqual(state["open_liquidity_snap_max_move_ticks"], 1)
+
+    def test_open_liquidity_snap_leaves_wall_front_quotes_unchanged(self):
+        engine = SimpleMakerStrategy(make_config(optimize_by_orderbook=0))
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=99.8,
+            best_ask=100.2,
+            intensity_value=0.3,
+            volatility_scalar=0.0,
+            replay_bid_ticks=[998, 994],
+            replay_ask_ticks=[1002, 1006],
+        )
+
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.ask_maker),
+            [(100.5, 1.0)],
+        )
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.bid_maker),
+            [(99.5, 1.0)],
+        )
+        self.assertEqual(engine.snapshot_state()["open_liquidity_snap_adjusted"], 0)
+
+    def test_open_liquidity_snap_ignores_thin_levels_by_notional_threshold(self):
+        engine = SimpleMakerStrategy(make_config(optimize_by_orderbook=1000))
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=99.8,
+            best_ask=100.2,
+            intensity_value=0.3,
+            volatility_scalar=0.0,
+            replay_bid_ticks=[998, 994, 993],
+            replay_ask_ticks=[1002, 1006, 1007],
+            replay_bid_notional=[10_000.0, 500.0, 2_000.0],
+            replay_ask_notional=[10_000.0, 500.0, 2_000.0],
+        )
+
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.ask_maker),
+            [(100.6, 1.0)],
+        )
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.bid_maker),
+            [(99.4, 1.0)],
+        )
+        state = engine.snapshot_state()
+        self.assertEqual(state["open_liquidity_snap_adjusted"], 2)
+        self.assertEqual(state["open_liquidity_snap_moved_ticks"], 2)
+
+    def test_open_liquidity_snap_cancels_when_only_thin_levels_exist(self):
+        engine = SimpleMakerStrategy(make_config(optimize_by_orderbook=1000))
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=99.8,
+            best_ask=100.2,
+            intensity_value=0.3,
+            volatility_scalar=0.0,
+            replay_bid_ticks=[998, 994],
+            replay_ask_ticks=[1002, 1006],
+            replay_bid_notional=[10_000.0, 500.0],
+            replay_ask_notional=[10_000.0, 500.0],
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+        self.assertEqual(engine.snapshot_state()["open_liquidity_snap_cancelled"], 2)
+
+    def test_open_liquidity_snap_cancels_open_side_when_no_wall_exists(self):
+        engine = SimpleMakerStrategy(make_config(optimize_by_orderbook=0))
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=99.8,
+            best_ask=100.2,
+            intensity_value=0.3,
+            volatility_scalar=0.0,
+            replay_bid_ticks=[998, 997],
+            replay_ask_ticks=[1002, 1003],
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+        self.assertEqual(engine.snapshot_state()["open_liquidity_snap_cancelled"], 2)
+
+    def test_open_liquidity_snap_does_not_move_profit_grid_closes(self):
+        engine = SimpleMakerStrategy(make_config(optimize_by_orderbook=0))
+        set_position(engine, qty=1.0, cost=100.0)
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=100.4,
+            best_ask=100.6,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+            replay_bid_ticks=[1004, 900],
+            replay_ask_ticks=[1006, 1100],
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.ask_maker),
+            [(101.0, 0.334), (102.0, 0.333), (103.0, 0.333)],
+        )
+        self.assertEqual(engine.snapshot_state()["open_liquidity_snap_adjusted"], 0)
+
+    def test_open_liquidity_snap_only_moves_long_underwater_bid_add(self):
+        engine = SimpleMakerStrategy(make_config(optimize_by_orderbook=0))
+        set_position(engine, qty=1.0, cost=100.0)
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=98.9,
+            best_ask=99.1,
+            intensity_value=0.2,
+            volatility_scalar=0.0,
+            replay_bid_ticks=[989, 984],
+            replay_ask_ticks=[991, 995],
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.bid_maker),
+            [(98.5, 1.01)],
+        )
+
+    def test_open_liquidity_snap_only_moves_short_underwater_ask_add(self):
+        engine = SimpleMakerStrategy(make_config(optimize_by_orderbook=0))
+        set_position(engine, qty=-1.0, cost=100.0)
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=100.9,
+            best_ask=101.1,
+            intensity_value=0.2,
+            volatility_scalar=0.0,
+            replay_bid_ticks=[1009, 1005],
+            replay_ask_ticks=[1011, 1016],
+        )
+
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.ask_maker),
+            [(101.5, 0.99)],
+        )
+        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+
     def test_inventory_limit_uses_cost_notional_not_mark_notional(self):
         engine = SimpleMakerStrategy(make_config(max_position_usdt=150.0))
         set_position(engine, qty=1.0, cost=100.0)
@@ -537,6 +746,24 @@ class ProfitGridStrategyTest(unittest.TestCase):
             [(101.0, 0.334), (102.0, 0.333), (103.0, 0.333)],
         )
 
+    def test_long_profit_grid_clips_crossed_close_levels_to_best_ask(self):
+        engine = SimpleMakerStrategy(make_config())
+        set_position(engine, qty=1.0, cost=100.0)
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=101.4,
+            best_ask=101.5,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.ask_maker),
+            [(101.5, 0.334), (102.0, 0.333), (103.0, 0.333)],
+        )
+
     def test_strategy_uses_profit_grid_qty_distribution(self):
         engine = SimpleMakerStrategy(make_config(profit_grid=(100.0, 300.0, 3, "power", 2.0)))
         set_position(engine, qty=1.4, cost=100.0)
@@ -555,7 +782,7 @@ class ProfitGridStrategyTest(unittest.TestCase):
             [(101.0, 0.9), (102.0, 0.4), (103.0, 0.1)],
         )
 
-    def test_phase_change_blocks_long_adds_unless_mid_makes_new_low(self):
+    def test_phase_change_anchors_long_adds_to_best_mid(self):
         engine = SimpleMakerStrategy(make_config(phase_change_position=50.0))
         set_position(engine, qty=1.0, cost=100.0)
         engine._phase_side = 1
@@ -569,7 +796,10 @@ class ProfitGridStrategyTest(unittest.TestCase):
             volatility_scalar=0.0,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.bid_maker),
+            [(99.0, 1.0)],
+        )
 
         engine._on_ticker_event(
             timestamp=2,
@@ -579,10 +809,42 @@ class ProfitGridStrategyTest(unittest.TestCase):
             volatility_scalar=0.0,
         )
 
-        self.assertEqual(len(price_levels(engine, engine.manager.books.bid_maker)), 1)
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.bid_maker),
+            [(98.4, 1.015)],
+        )
         self.assertEqual(engine._phase_best_mid, 98.5)
 
-    def test_phase_change_blocks_short_adds_unless_mid_makes_new_high(self):
+    def test_phase_change_boosts_allowed_long_add_only(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                phase_change_position=50.0,
+                boost_phase_change=2.0,
+                profit_grid=None,
+            )
+        )
+        set_position(engine, qty=1.0, cost=100.0)
+        engine._phase_side = 1
+        engine._phase_best_mid = 99.0
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=98.4,
+            best_ask=98.6,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.ask_maker),
+            [(98.6, 1.015)],
+        )
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.bid_maker),
+            [(98.4, 2.03)],
+        )
+
+    def test_phase_change_anchors_short_adds_to_best_mid(self):
         engine = SimpleMakerStrategy(make_config(phase_change_position=50.0))
         set_position(engine, qty=-1.0, cost=100.0)
         engine._phase_side = -1
@@ -596,7 +858,10 @@ class ProfitGridStrategyTest(unittest.TestCase):
             volatility_scalar=0.0,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.ask_maker),
+            [(101.0, 1.0)],
+        )
 
         engine._on_ticker_event(
             timestamp=2,
@@ -606,7 +871,10 @@ class ProfitGridStrategyTest(unittest.TestCase):
             volatility_scalar=0.0,
         )
 
-        self.assertEqual(len(price_levels(engine, engine.manager.books.ask_maker)), 1)
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.ask_maker),
+            [(102.1, 0.98)],
+        )
         self.assertEqual(engine._phase_best_mid, 102.0)
 
     def test_phase_change_resets_after_flat(self):
@@ -806,6 +1074,62 @@ class ProfitGridStrategyTest(unittest.TestCase):
 
         self.assertIn((999.9, 0.001), price_levels(engine, engine.manager.books.ask_maker))
 
+    def test_active_profit_grid_is_not_reclipped_when_bbo_moves(self):
+        engine = SimpleMakerStrategy(make_config())
+        set_position(engine, qty=1.0, cost=100.0)
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=100.4,
+            best_ask=100.6,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+        before = price_levels(engine, engine.manager.books.ask_maker)
+
+        engine._on_ticker_event(
+            timestamp=2,
+            best_bid=101.4,
+            best_ask=101.5,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), before)
+
+    def test_active_profit_grid_survives_underwater_until_add_fill(self):
+        engine = SimpleMakerStrategy(make_config())
+        set_position(engine, qty=1.0, cost=100.0)
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=100.4,
+            best_ask=100.6,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+        close_grid = price_levels(engine, engine.manager.books.ask_maker)
+
+        engine._on_ticker_event(
+            timestamp=2,
+            best_bid=98.9,
+            best_ask=99.1,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), close_grid)
+        self.assertEqual(len(price_levels(engine, engine.manager.books.bid_maker)), 1)
+
+        engine._on_trade_event(
+            trade_time=3,
+            is_buyer_maker=True,
+            trade_price=98.8,
+            trade_qty=0.1,
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+
     def test_partial_profit_fill_keeps_remaining_grid_when_cost_unchanged(self):
         engine = SimpleMakerStrategy(make_config())
         set_position(engine, qty=1.0, cost=100.0)
@@ -853,6 +1177,24 @@ class ProfitGridStrategyTest(unittest.TestCase):
         self.assertEqual(
             price_levels(engine, engine.manager.books.bid_maker),
             [(99.0, 0.334), (98.0, 0.333), (97.0, 0.333)],
+        )
+
+    def test_short_profit_grid_clips_crossed_close_levels_to_best_bid(self):
+        engine = SimpleMakerStrategy(make_config())
+        set_position(engine, qty=-1.0, cost=100.0)
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=98.5,
+            best_ask=98.6,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.bid_maker),
+            [(98.5, 0.334), (98.0, 0.333), (97.0, 0.333)],
         )
 
 

@@ -5,6 +5,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence
 
+import numpy as np
 import pandas as pd
 
 from core.manager import Manager as ValidatedManager
@@ -13,7 +14,16 @@ from sim.loader import BinanceEventLoader, DateLike
 
 
 MakerLevel = tuple[float, float]
-PendingMakerQuote = tuple[int, list[MakerLevel], list[MakerLevel], float, float, bool]
+PendingMakerQuote = tuple[
+    int,
+    list[MakerLevel],
+    list[MakerLevel],
+    float,
+    float,
+    bool,
+    bool,
+    bool,
+]
 PROFIT_GRID_QTY_DISTRIBUTIONS = {"equal", "power", "exponential"}
 
 
@@ -288,11 +298,13 @@ class SimulationConfig:
     order_amt: float = 0.0
     max_position_usdt: float = 0.0
     phase_change_position: float = 0.0
+    boost_phase_change: float = 1.0
     phase_mode: str = "market"
     max_holding_time: int = 0
     adj_spread_intensity: float = 1.0
     adj_spread_instructor: float = 0.0
     open_passive_only: bool = False
+    optimize_by_orderbook: float = -1.0
     adj_spread_volatility: float = 0.0
     inventory_skew: Optional[tuple[float, float]] = None
     min_order_qty: float = 0.0
@@ -348,6 +360,13 @@ class SimulationConfig:
             raise ValueError("max_position_usdt must be >= 0")
         if self.phase_change_position < 0:
             raise ValueError("phase_change_position must be >= 0")
+        try:
+            boost_phase_change = float(self.boost_phase_change)
+        except (TypeError, ValueError):
+            raise ValueError("boost_phase_change must be a finite number") from None
+        if not math.isfinite(boost_phase_change) or boost_phase_change < 0:
+            raise ValueError("boost_phase_change must be finite and >= 0")
+        object.__setattr__(self, "boost_phase_change", boost_phase_change)
         if self.phase_mode not in ("market", "trade"):
             raise ValueError("phase_mode must be 'market' or 'trade'")
         if self.adj_spread_intensity <= 0:
@@ -356,6 +375,16 @@ class SimulationConfig:
             raise ValueError("adj_spread_instructor must be finite")
         if not isinstance(self.open_passive_only, bool):
             raise ValueError("open_passive_only must be boolean")
+        try:
+            optimize_by_orderbook = float(self.optimize_by_orderbook)
+        except (TypeError, ValueError):
+            raise ValueError("optimize_by_orderbook must be -1, 0, or a notional threshold") from None
+        if (
+            not math.isfinite(optimize_by_orderbook)
+            or (optimize_by_orderbook < 0.0 and abs(optimize_by_orderbook + 1.0) > 1e-12)
+        ):
+            raise ValueError("optimize_by_orderbook must be -1, 0, or a notional threshold")
+        object.__setattr__(self, "optimize_by_orderbook", optimize_by_orderbook)
         if self.adj_spread_volatility < 0:
             raise ValueError("adj_spread_volatility must be >= 0")
         if self.inventory_skew is not None:
@@ -441,6 +470,10 @@ class SimpleMakerStrategy:
         self._active_profit_grid_key: tuple | None = None
         self._phase_best_mid: Optional[float] = None
         self._phase_side: int = 0
+        self._open_liquidity_snap_adjusted: int = 0
+        self._open_liquidity_snap_cancelled: int = 0
+        self._open_liquidity_snap_moved_ticks: int = 0
+        self._open_liquidity_snap_max_move_ticks: int = 0
 
     def snapshot_state(self) -> dict:
         pos = self.manager.position
@@ -463,6 +496,15 @@ class SimpleMakerStrategy:
             "max_holding_was_at_limit": bool(self._max_holding_was_at_limit),
             "phase_best_mid": self._phase_best_mid,
             "phase_side": int(self._phase_side),
+            "active_profit_grid_key": (
+                list(self._active_profit_grid_key)
+                if self._active_profit_grid_key is not None
+                else None
+            ),
+            "open_liquidity_snap_adjusted": int(self._open_liquidity_snap_adjusted),
+            "open_liquidity_snap_cancelled": int(self._open_liquidity_snap_cancelled),
+            "open_liquidity_snap_moved_ticks": int(self._open_liquidity_snap_moved_ticks),
+            "open_liquidity_snap_max_move_ticks": int(self._open_liquidity_snap_max_move_ticks),
             "pending_maker_quotes": [
                 {
                     "active_ts": int(active_ts),
@@ -477,6 +519,8 @@ class SimpleMakerStrategy:
                     "best_ask": float(best_ask),
                     "best_bid": float(best_bid),
                     "close_only": bool(close_only),
+                    "replace_ask": bool(replace_ask),
+                    "replace_bid": bool(replace_bid),
                 }
                 for (
                     active_ts,
@@ -485,6 +529,8 @@ class SimpleMakerStrategy:
                     best_ask,
                     best_bid,
                     close_only,
+                    replace_ask,
+                    replace_bid,
                 ) in self._pending_maker_quotes
             ],
             "books": self.manager.snapshot_ticks(),
@@ -523,8 +569,27 @@ class SimpleMakerStrategy:
             None if phase_best_mid_raw is None else float(phase_best_mid_raw)
         )
         self._phase_side = int(state.get("phase_side", 0))
+        active_profit_grid_key = state.get("active_profit_grid_key")
+        if (
+            isinstance(active_profit_grid_key, (list, tuple))
+            and len(active_profit_grid_key) == 2
+        ):
+            self._active_profit_grid_key = tuple(active_profit_grid_key)
+        else:
+            self._active_profit_grid_key = None
+        self._open_liquidity_snap_adjusted = int(
+            state.get("open_liquidity_snap_adjusted", 0)
+        )
+        self._open_liquidity_snap_cancelled = int(
+            state.get("open_liquidity_snap_cancelled", 0)
+        )
+        self._open_liquidity_snap_moved_ticks = int(
+            state.get("open_liquidity_snap_moved_ticks", 0)
+        )
+        self._open_liquidity_snap_max_move_ticks = int(
+            state.get("open_liquidity_snap_max_move_ticks", 0)
+        )
         self._pending_maker_quotes = deque()
-        self._active_profit_grid_key = None
         pending_quotes = state.get("pending_maker_quotes", [])
         if isinstance(pending_quotes, list):
             for row in pending_quotes:
@@ -553,6 +618,8 @@ class SimpleMakerStrategy:
                             float(row["best_ask"]),
                             float(row["best_bid"]),
                             bool(row.get("close_only", False)),
+                            bool(row.get("replace_ask", True)),
+                            bool(row.get("replace_bid", True)),
                         )
                     )
                 except (TypeError, ValueError, KeyError):
@@ -582,6 +649,7 @@ class SimpleMakerStrategy:
 
     def run_day(self, symbol: str, date: DateLike) -> pd.DataFrame:
         self._records = []
+        self._reset_open_liquidity_snap_stats()
         vol_specs = self._selected_volatility_specs()
         ti_spec = self._selected_intensity_spec()
         instructor_spec = self._selected_instructor_spec()
@@ -612,6 +680,10 @@ class SimpleMakerStrategy:
                     instructor_value=event[4],
                     intensity_value=event[5],
                     volatility_scalar=float(event[6]),
+                    replay_bid_ticks=event[7] if len(event) > 7 else None,
+                    replay_ask_ticks=event[8] if len(event) > 8 else None,
+                    replay_bid_notional=event[9] if len(event) > 9 else None,
+                    replay_ask_notional=event[10] if len(event) > 10 else None,
                 )
         return pd.DataFrame(
             self._records,
@@ -627,6 +699,12 @@ class SimpleMakerStrategy:
                 "traded_volume",
             ],
         )
+
+    def _reset_open_liquidity_snap_stats(self) -> None:
+        self._open_liquidity_snap_adjusted = 0
+        self._open_liquidity_snap_cancelled = 0
+        self._open_liquidity_snap_moved_ticks = 0
+        self._open_liquidity_snap_max_move_ticks = 0
 
     def run_dates(self, symbol: str, dates: Iterable[DateLike]) -> pd.DataFrame:
         frames = [self.run_day(symbol=symbol, date=date) for date in dates]
@@ -658,7 +736,8 @@ class SimpleMakerStrategy:
         if trade_price <= 0.0 or trade_qty <= 0.0:
             return
 
-        prev_abs_pos_qty = abs(float(self.manager.position.qty))
+        prev_pos_qty = float(self.manager.position.qty)
+        prev_abs_pos_qty = abs(prev_pos_qty)
         # is_buyer_maker=True means public sell flow hits passive bids.
         maker_fills = self.manager.match_maker_fills(
             trade_time=trade_time,
@@ -683,7 +762,12 @@ class SimpleMakerStrategy:
         filled_qty = maker_filled_qty + taker_filled_qty
         if filled_qty > 0.0:
             self._traded_volume += float(filled_qty) * float(trade_price)
-        new_abs_pos_qty = abs(float(self.manager.position.qty))
+        new_pos_qty = float(self.manager.position.qty)
+        self._maybe_cancel_active_profit_grid_after_position_change(
+            prev_pos_qty=prev_pos_qty,
+            new_pos_qty=new_pos_qty,
+        )
+        new_abs_pos_qty = abs(new_pos_qty)
         position_reduced = new_abs_pos_qty + self.EPS < prev_abs_pos_qty
         self._update_max_holding_tracking(
             timestamp=int(trade_time),
@@ -710,6 +794,10 @@ class SimpleMakerStrategy:
         intensity_value: Optional[float],
         volatility_scalar: float,
         instructor_value: Optional[float] = None,
+        replay_bid_ticks: object = None,
+        replay_ask_ticks: object = None,
+        replay_bid_notional: object = None,
+        replay_ask_notional: object = None,
     ) -> None:
         rounded_best_bid = self._round_to_precision(float(best_bid), self.sim.price_precision)
         rounded_best_ask = self._round_to_precision(float(best_ask), self.sim.price_precision)
@@ -775,6 +863,15 @@ class SimpleMakerStrategy:
             bid_levels=bid_levels,
             close_only=quote_close_only,
         )
+        ask_levels, bid_levels = self._apply_open_liquidity_snap(
+            ask_levels=ask_levels,
+            bid_levels=bid_levels,
+            close_only=quote_close_only,
+            replay_ask_ticks=replay_ask_ticks,
+            replay_bid_ticks=replay_bid_ticks,
+            replay_ask_notional=replay_ask_notional,
+            replay_bid_notional=replay_bid_notional,
+        )
         if self.cfg.phase_mode == "market" or abs(float(self.manager.position.qty)) <= self.EPS:
             self._update_phase_change_tracking(reference_mid=mid)
         self._update_max_holding_tracking(timestamp=timestamp)
@@ -790,15 +887,23 @@ class SimpleMakerStrategy:
 
         self._clear_taker_books()
         profit_grid_key = (
-            self._profit_grid_quote_key(ask_levels=ask_levels, bid_levels=bid_levels)
+            self._profit_grid_quote_key()
             if quote_close_only
             else None
         )
         if quote_close_only and profit_grid_key == self._active_profit_grid_key:
             self._append_record(timestamp=timestamp, mid=mid)
             return
+        replace_ask = True
+        replace_bid = True
         if quote_close_only:
             self._active_profit_grid_key = profit_grid_key
+        elif self._should_preserve_active_profit_grid_for_open():
+            active_side = self._active_profit_grid_side()
+            if active_side > 0:
+                replace_ask = False
+            elif active_side < 0:
+                replace_bid = False
         else:
             self._active_profit_grid_key = None
         self._pending_maker_quotes.clear()
@@ -809,6 +914,8 @@ class SimpleMakerStrategy:
             best_ask=float(self._latest_best_ask),
             best_bid=float(self._latest_best_bid),
             close_only=quote_close_only,
+            replace_ask=replace_ask,
+            replace_bid=replace_bid,
         )
         self._activate_pending_maker_quotes(current_timestamp=timestamp)
 
@@ -896,17 +1003,6 @@ class SimpleMakerStrategy:
             return False
         return float(pos.gross_cost_notional_usdt) > threshold + self.EPS
 
-    def _phase_open_allowed(self, mid: float, side: int) -> bool:
-        if not self._phase_change_active():
-            return True
-        if self._phase_best_mid is None or self._phase_side != side:
-            return True
-        if side > 0:
-            return float(mid) + self.EPS < float(self._phase_best_mid)
-        if side < 0:
-            return float(mid) > float(self._phase_best_mid) + self.EPS
-        return True
-
     def _apply_phase_change_open_gate(
         self,
         *,
@@ -919,11 +1015,52 @@ class SimpleMakerStrategy:
             return ask_levels, bid_levels
 
         pos_qty = float(self.manager.position.qty)
-        if pos_qty > self.EPS and not self._phase_open_allowed(mid=mid, side=1):
-            return ask_levels, []
-        if pos_qty < -self.EPS and not self._phase_open_allowed(mid=mid, side=-1):
-            return [], bid_levels
+        if pos_qty > self.EPS:
+            bid_levels = self._phase_anchor_open_levels(
+                levels=bid_levels,
+                is_ask=False,
+            )
+            return ask_levels, self._boost_phase_change_open_levels(
+                mid=mid,
+                levels=bid_levels,
+            )
+        if pos_qty < -self.EPS:
+            ask_levels = self._phase_anchor_open_levels(
+                levels=ask_levels,
+                is_ask=True,
+            )
+            return (
+                self._boost_phase_change_open_levels(mid=mid, levels=ask_levels),
+                bid_levels,
+            )
         return ask_levels, bid_levels
+
+    def _phase_anchor_open_levels(
+        self,
+        *,
+        levels: Sequence[MakerLevel],
+        is_ask: bool,
+    ) -> list[MakerLevel]:
+        if not levels or self._phase_best_mid is None:
+            return list(levels)
+        phase_best_mid = float(self._phase_best_mid)
+        if not math.isfinite(phase_best_mid) or phase_best_mid <= 0.0:
+            return list(levels)
+
+        phase_price = (
+            self._price_ceil(phase_best_mid)
+            if is_ask
+            else self._price_floor(phase_best_mid)
+        )
+        adjusted: list[MakerLevel] = []
+        for price, qty in levels:
+            price = (
+                max(float(price), phase_price)
+                if is_ask
+                else min(float(price), phase_price)
+            )
+            adjusted.append((price, float(qty)))
+        return adjusted
 
     @staticmethod
     def _filled_qty_from_fills(fills: Sequence[MakerLevel]) -> float:
@@ -1030,6 +1167,8 @@ class SimpleMakerStrategy:
         best_ask: float,
         best_bid: float,
         close_only: bool = False,
+        replace_ask: bool = True,
+        replace_bid: bool = True,
     ) -> None:
         active_ts = int(base_timestamp) + int(self.sim.latency)
         self._pending_maker_quotes.append(
@@ -1040,6 +1179,8 @@ class SimpleMakerStrategy:
                 float(best_ask),
                 float(best_bid),
                 bool(close_only),
+                bool(replace_ask),
+                bool(replace_bid),
             )
         )
 
@@ -1059,8 +1200,13 @@ class SimpleMakerStrategy:
             best_ask,
             best_bid,
             close_only,
+            replace_ask,
+            replace_bid,
         ) = last_due_quote
-        self._clear_maker_books()
+        if replace_ask:
+            self.manager.books.ask_maker.clear()
+        if replace_bid:
+            self.manager.books.bid_maker.clear()
         self.manager.place_maker_levels(
             ask_levels=ask_levels,
             bid_levels=bid_levels,
@@ -1129,17 +1275,196 @@ class SimpleMakerStrategy:
         bid_levels = [(float(bid_price), float(bid_qty))] if bid_qty > self.EPS else []
         return ask_levels, bid_levels, close_only
 
-    def _profit_grid_quote_key(
+    def _apply_open_liquidity_snap(
         self,
         *,
         ask_levels: Sequence[MakerLevel],
         bid_levels: Sequence[MakerLevel],
-    ) -> tuple:
-        ask_key = tuple(float(price) for price, _ in ask_levels)
-        bid_key = tuple(float(price) for price, _ in bid_levels)
+        close_only: bool,
+        replay_ask_ticks: object,
+        replay_bid_ticks: object,
+        replay_ask_notional: object,
+        replay_bid_notional: object,
+    ) -> tuple[list[MakerLevel], list[MakerLevel]]:
+        notional_threshold = float(self.cfg.optimize_by_orderbook)
+        if notional_threshold < 0.0 or close_only:
+            return list(ask_levels), list(bid_levels)
+
+        pos_qty = float(self.manager.position.qty)
+        snap_ask = pos_qty <= self.EPS
+        snap_bid = pos_qty >= -self.EPS
+
+        adjusted_ask = (
+            self._snap_open_side_levels(
+                levels=ask_levels,
+                is_ask=True,
+                replay_ticks=replay_ask_ticks,
+                replay_notional=replay_ask_notional,
+                notional_threshold=notional_threshold,
+            )
+            if snap_ask
+            else list(ask_levels)
+        )
+        adjusted_bid = (
+            self._snap_open_side_levels(
+                levels=bid_levels,
+                is_ask=False,
+                replay_ticks=replay_bid_ticks,
+                replay_notional=replay_bid_notional,
+                notional_threshold=notional_threshold,
+            )
+            if snap_bid
+            else list(bid_levels)
+        )
+        return adjusted_ask, adjusted_bid
+
+    def _snap_open_side_levels(
+        self,
+        *,
+        levels: Sequence[MakerLevel],
+        is_ask: bool,
+        replay_ticks: object,
+        replay_notional: object,
+        notional_threshold: float,
+    ) -> list[MakerLevel]:
+        if not levels:
+            return []
+        if replay_ticks is None:
+            return list(levels)
+
+        adjusted: list[MakerLevel] = []
+        for price, qty in levels:
+            price = float(price)
+            qty = float(qty)
+            if qty <= self.EPS:
+                continue
+            target_tick = self.manager.converter.to_ticks(price)
+            snapped_tick = self._snap_open_price_tick(
+                target_tick=target_tick,
+                is_ask=is_ask,
+                replay_ticks=replay_ticks,
+                replay_notional=replay_notional,
+                notional_threshold=notional_threshold,
+            )
+            if snapped_tick is None:
+                self._open_liquidity_snap_cancelled += 1
+                continue
+            if snapped_tick != target_tick:
+                moved_ticks = abs(int(snapped_tick) - int(target_tick))
+                self._open_liquidity_snap_adjusted += 1
+                self._open_liquidity_snap_moved_ticks += moved_ticks
+                self._open_liquidity_snap_max_move_ticks = max(
+                    self._open_liquidity_snap_max_move_ticks,
+                    moved_ticks,
+                )
+                price = self._round_to_precision(
+                    self.manager.converter.from_ticks(int(snapped_tick)),
+                    self.sim.price_precision,
+                )
+            adjusted.append((price, qty))
+        return adjusted
+
+    def _snap_open_price_tick(
+        self,
+        *,
+        target_tick: int,
+        is_ask: bool,
+        replay_ticks: object,
+        replay_notional: object,
+        notional_threshold: float,
+    ) -> int | None:
+        ticks = np.asarray(replay_ticks)
+        if ticks.ndim != 1:
+            ticks = ticks.reshape(-1)
+        valid = ticks > 0
+        if notional_threshold > 0.0:
+            if replay_notional is None:
+                return None
+            notionals = np.asarray(replay_notional)
+            if notionals.ndim != 1:
+                notionals = notionals.reshape(-1)
+            if notionals.shape[0] != ticks.shape[0]:
+                return None
+            valid = valid & (notionals > notional_threshold)
+        ticks = ticks[valid]
+        if ticks.size == 0:
+            return None
+        if bool(np.any(ticks == int(target_tick))):
+            return int(target_tick)
+
+        if is_ask:
+            candidates = ticks[ticks > int(target_tick)]
+            if candidates.size == 0:
+                return None
+            snapped = int(candidates[0]) - 1
+            return snapped if snapped > 0 else None
+
+        candidates = ticks[ticks < int(target_tick)]
+        if candidates.size == 0:
+            return None
+        snapped = int(candidates[0]) + 1
+        return snapped if snapped > 0 else None
+
+    def _profit_grid_quote_key(self) -> tuple:
+        pos_qty = float(self.manager.position.qty)
+        if pos_qty > self.EPS:
+            side = 1
+        elif pos_qty < -self.EPS:
+            side = -1
+        else:
+            side = 0
         cost = float(self.manager.position.cost)
-        cost_key = None if math.isnan(cost) else self._round_to_precision(cost, self.sim.price_precision)
-        return ask_key, bid_key, cost_key
+        cost_key = (
+            None
+            if math.isnan(cost)
+            else self._round_to_precision(cost, self.sim.price_precision)
+        )
+        return side, cost_key
+
+    def _active_profit_grid_side(self) -> int:
+        if self._active_profit_grid_key is None:
+            return 0
+        try:
+            return int(self._active_profit_grid_key[0])
+        except (TypeError, ValueError, IndexError):
+            return 0
+
+    def _should_preserve_active_profit_grid_for_open(self) -> bool:
+        active_side = self._active_profit_grid_side()
+        if active_side == 0:
+            return False
+        pos_qty = float(self.manager.position.qty)
+        if active_side > 0:
+            return pos_qty > self.EPS
+        return pos_qty < -self.EPS
+
+    def _maybe_cancel_active_profit_grid_after_position_change(
+        self,
+        *,
+        prev_pos_qty: float,
+        new_pos_qty: float,
+    ) -> None:
+        active_side = self._active_profit_grid_side()
+        if active_side == 0:
+            return
+
+        prev_signed = float(prev_pos_qty) * active_side
+        new_signed = float(new_pos_qty) * active_side
+        if new_signed <= self.EPS:
+            self._active_profit_grid_key = None
+            self._pending_maker_quotes.clear()
+            return
+
+        if prev_signed <= self.EPS or new_signed > prev_signed + self.EPS:
+            self._cancel_active_profit_grid_orders(active_side)
+
+    def _cancel_active_profit_grid_orders(self, active_side: int) -> None:
+        self._active_profit_grid_key = None
+        self._pending_maker_quotes.clear()
+        if active_side > 0:
+            self.manager.books.ask_maker.clear()
+        elif active_side < 0:
+            self.manager.books.bid_maker.clear()
 
     def _profit_grid_enabled(self) -> bool:
         return self.cfg.profit_grid is not None
@@ -1173,7 +1498,7 @@ class SimpleMakerStrategy:
             )
             return [(price, close_qty)] if price > 0.0 else []
 
-        return build_profit_grid_levels(
+        levels = build_profit_grid_levels(
             lower_bps=float(lower_bps),
             upper_bps=float(upper_bps),
             num_grid=int(num_grid),
@@ -1188,6 +1513,33 @@ class SimpleMakerStrategy:
             min_order_notional=float(self.cfg.min_order_notional),
             qty_distribution=self.cfg.profit_grid_qty_distribution,
         )
+        return self._clip_profit_close_levels_to_bbo(
+            levels=levels,
+            is_long=pos_qty > 0.0,
+            best_ask=best_ask,
+            best_bid=best_bid,
+        )
+
+    def _clip_profit_close_levels_to_bbo(
+        self,
+        *,
+        levels: Sequence[MakerLevel],
+        is_long: bool,
+        best_ask: float,
+        best_bid: float,
+    ) -> list[MakerLevel]:
+        clipped: list[MakerLevel] = []
+        for price, qty in levels:
+            price = float(price)
+            qty = float(qty)
+            if qty <= self.EPS:
+                continue
+            if is_long and price < best_ask:
+                price = float(best_ask)
+            elif (not is_long) and price > best_bid:
+                price = float(best_bid)
+            clipped.append((price, qty))
+        return clipped
 
     def _is_past_profit_upper(self, mid: float, pos_qty: float, cost: float) -> bool:
         if self.cfg.profit_grid is None:
@@ -1258,6 +1610,29 @@ class SimpleMakerStrategy:
             return 0.0
         boosted_qty = self._qty_floor(base_open_qty * multiplier)
         return self._lawful_qty_from_qty(mid=mid, qty=boosted_qty)
+
+    def _boost_phase_change_open_levels(
+        self,
+        *,
+        mid: float,
+        levels: Sequence[MakerLevel],
+    ) -> list[MakerLevel]:
+        multiplier = float(self.cfg.boost_phase_change)
+        if not levels:
+            return []
+        if abs(multiplier - 1.0) <= self.EPS:
+            return list(levels)
+
+        boosted: list[MakerLevel] = []
+        for price, qty in levels:
+            boosted_qty = self._boosted_open_qty(
+                mid=mid,
+                base_open_qty=float(qty),
+                multiplier=multiplier,
+            )
+            if boosted_qty > self.EPS:
+                boosted.append((float(price), boosted_qty))
+        return boosted
 
     def _inventory_open_curve_underwater_multiplier(self, mid: float) -> float:
         scale = self.cfg.open_curve_underwater
