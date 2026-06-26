@@ -335,9 +335,22 @@ class ProfitGridConfigTest(unittest.TestCase):
 
         self.assertEqual(cfg.optimize_by_orderbook, 1000.0)
 
+    def test_build_config_parses_min_quote_distance_ticks(self):
+        cfg = _build_simulation_config(
+            raw_config(min_quote_distance_ticks=20)["simulation"]
+        )
+
+        self.assertEqual(cfg.min_quote_distance_ticks, 20)
+
     def test_build_config_rejects_boolean_optimize_by_orderbook(self):
         with self.assertRaises(ValueError):
             _build_simulation_config(raw_config(optimize_by_orderbook=True)["simulation"])
+
+    def test_build_config_rejects_fractional_min_quote_distance_ticks(self):
+        with self.assertRaises(ValueError):
+            _build_simulation_config(
+                raw_config(min_quote_distance_ticks=1.5)["simulation"]
+            )
 
     def test_build_config_allows_bbo_imbalance_zero_lookback(self):
         cfg = _build_simulation_config(
@@ -366,6 +379,16 @@ class ProfitGridConfigTest(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             _build_loader(cfg, simulation=sim)
+
+    def test_loader_skips_orderbook_path_when_optimize_by_orderbook_disabled(self):
+        cfg = raw_config(optimize_by_orderbook=-1)
+        cfg["output_path"] = "/tmp/cache"
+        cfg["input_path"] = "/tmp/input"
+        sim = _build_simulation_config(cfg["simulation"])
+
+        loader = _build_loader(cfg, simulation=sim)
+
+        self.assertIsNone(loader.orderbook_replay_config)
 
 
 class ProfitGridStrategyTest(unittest.TestCase):
@@ -482,6 +505,26 @@ class ProfitGridStrategyTest(unittest.TestCase):
             [(99.5, 1.0)],
         )
 
+    def test_min_quote_distance_ticks_floors_flat_open_quotes(self):
+        engine = SimpleMakerStrategy(make_config(min_quote_distance_ticks=5))
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=99.8,
+            best_ask=100.2,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.ask_maker),
+            [(100.7, 1.0)],
+        )
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.bid_maker),
+            [(99.3, 1.0)],
+        )
+
     def test_instructor_does_not_move_profit_grid_close_levels(self):
         engine = SimpleMakerStrategy(make_config(adj_spread_instructor=-0.01))
         set_position(engine, qty=1.0, cost=100.0)
@@ -499,6 +542,24 @@ class ProfitGridStrategyTest(unittest.TestCase):
         self.assertEqual(
             price_levels(engine, engine.manager.books.ask_maker),
             [(101.0, 0.334), (102.0, 0.333), (103.0, 0.333)],
+        )
+
+    def test_min_quote_distance_ticks_clips_profit_grid_close_levels(self):
+        engine = SimpleMakerStrategy(make_config(min_quote_distance_ticks=20))
+        set_position(engine, qty=1.0, cost=100.0)
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=100.4,
+            best_ask=100.6,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.ask_maker),
+            [(102.6, 0.667), (103.0, 0.333)],
         )
 
     def test_open_liquidity_snap_moves_flat_open_quotes_to_wall_front(self):
@@ -1195,6 +1256,24 @@ class ProfitGridStrategyTest(unittest.TestCase):
         self.assertEqual(
             price_levels(engine, engine.manager.books.bid_maker),
             [(98.5, 0.334), (98.0, 0.333), (97.0, 0.333)],
+        )
+
+    def test_min_quote_distance_ticks_clips_short_profit_grid_close_levels(self):
+        engine = SimpleMakerStrategy(make_config(min_quote_distance_ticks=5))
+        set_position(engine, qty=-1.0, cost=100.0)
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=98.5,
+            best_ask=98.6,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+        self.assertEqual(
+            price_levels(engine, engine.manager.books.bid_maker),
+            [(98.0, 0.667), (97.0, 0.333)],
         )
 
 

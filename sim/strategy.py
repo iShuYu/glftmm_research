@@ -306,6 +306,7 @@ class SimulationConfig:
     open_passive_only: bool = False
     optimize_by_orderbook: float = -1.0
     adj_spread_volatility: float = 0.0
+    min_quote_distance_ticks: int = 0
     inventory_skew: Optional[tuple[float, float]] = None
     min_order_qty: float = 0.0
     min_order_notional: float = 0.0
@@ -387,6 +388,21 @@ class SimulationConfig:
         object.__setattr__(self, "optimize_by_orderbook", optimize_by_orderbook)
         if self.adj_spread_volatility < 0:
             raise ValueError("adj_spread_volatility must be >= 0")
+        try:
+            min_quote_distance_ticks_float = float(self.min_quote_distance_ticks)
+        except (TypeError, ValueError):
+            raise ValueError("min_quote_distance_ticks must be a non-negative integer") from None
+        if (
+            not math.isfinite(min_quote_distance_ticks_float)
+            or min_quote_distance_ticks_float < 0
+            or not min_quote_distance_ticks_float.is_integer()
+        ):
+            raise ValueError("min_quote_distance_ticks must be a non-negative integer")
+        object.__setattr__(
+            self,
+            "min_quote_distance_ticks",
+            int(min_quote_distance_ticks_float),
+        )
         if self.inventory_skew is not None:
             if not isinstance(self.inventory_skew, (tuple, list)) or len(self.inventory_skew) != 2:
                 raise ValueError("inventory_skew must be a (max_tick, skew_power) pair when provided")
@@ -872,6 +888,12 @@ class SimpleMakerStrategy:
             replay_ask_notional=replay_ask_notional,
             replay_bid_notional=replay_bid_notional,
         )
+        ask_levels, bid_levels = self._clip_quote_levels_to_bbo_distance(
+            ask_levels=ask_levels,
+            bid_levels=bid_levels,
+            best_ask=rounded_best_ask,
+            best_bid=rounded_best_bid,
+        )
         if self.cfg.phase_mode == "market" or abs(float(self.manager.position.qty)) <= self.EPS:
             self._update_phase_change_tracking(reference_mid=mid)
         self._update_max_holding_tracking(timestamp=timestamp)
@@ -1263,6 +1285,36 @@ class SimpleMakerStrategy:
         )
         return [], close_levels, True
 
+    def _clip_quote_levels_to_bbo_distance(
+        self,
+        *,
+        ask_levels: Sequence[MakerLevel],
+        bid_levels: Sequence[MakerLevel],
+        best_ask: float,
+        best_bid: float,
+    ) -> tuple[list[MakerLevel], list[MakerLevel]]:
+        min_ticks = int(self.cfg.min_quote_distance_ticks)
+        if min_ticks <= 0:
+            return list(ask_levels), list(bid_levels)
+
+        min_distance = float(min_ticks) * self.sim.tick_size
+        ask_floor = self._price_ceil(float(best_ask) + min_distance)
+        bid_ceiling = self._price_floor(float(best_bid) - min_distance)
+
+        clipped_ask: list[MakerLevel] = []
+        clipped_bid: list[MakerLevel] = []
+        for price, qty in ask_levels:
+            price = max(float(price), ask_floor)
+            qty = float(qty)
+            if price > self.EPS and qty > self.EPS:
+                clipped_ask.append((price, qty))
+        for price, qty in bid_levels:
+            price = min(float(price), bid_ceiling)
+            qty = float(qty)
+            if price > self.EPS and qty > self.EPS:
+                clipped_bid.append((price, qty))
+        return clipped_ask, clipped_bid
+
     def _single_quote_levels(
         self,
         ask_price: float,
@@ -1271,8 +1323,16 @@ class SimpleMakerStrategy:
         bid_qty: float,
         close_only: bool,
     ) -> tuple[list[MakerLevel], list[MakerLevel], bool]:
-        ask_levels = [(float(ask_price), float(ask_qty))] if ask_qty > self.EPS else []
-        bid_levels = [(float(bid_price), float(bid_qty))] if bid_qty > self.EPS else []
+        ask_levels = (
+            [(float(ask_price), float(ask_qty))]
+            if ask_qty > self.EPS and ask_price > self.EPS
+            else []
+        )
+        bid_levels = (
+            [(float(bid_price), float(bid_qty))]
+            if bid_qty > self.EPS and bid_price > self.EPS
+            else []
+        )
         return ask_levels, bid_levels, close_only
 
     def _apply_open_liquidity_snap(
