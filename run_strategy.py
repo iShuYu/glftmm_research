@@ -83,7 +83,7 @@ PARAM_KEY_ALIAS = {
     "open_passive_only": "opo",
     "optimize_by_orderbook": "obo",
     "adj_spread_volatility": "asv",
-    "min_quote_distance_ticks": "mqdt",
+    "min_quote_distance_bps": "mqdb",
     "inventory_skew": "isk",
     "stoploss": "sl",
     "open_curve_underwater": "ocu",
@@ -108,7 +108,7 @@ SIM_OPTIONAL_KEYS = (
     "open_passive_only",
     "optimize_by_orderbook",
     "adj_spread_volatility",
-    "min_quote_distance_ticks",
+    "min_quote_distance_bps",
     "inventory_skew",
     "min_order_qty",
     "min_order_notional",
@@ -342,6 +342,12 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
 
 
 def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
+    if "min_quote_distance_ticks" in raw:
+        raise ValueError(
+            "simulation.min_quote_distance_ticks has been replaced by "
+            "simulation.min_quote_distance_bps"
+        )
+
     name_instructor = raw.get("name_instructor")
     if name_instructor is not None:
         name_instructor = str(name_instructor).strip() or None
@@ -415,7 +421,7 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
             raw.get("optimize_by_orderbook", -1),
         ),
         adj_spread_volatility=float(raw.get("adj_spread_volatility", 0.0)),
-        min_quote_distance_ticks=raw.get("min_quote_distance_ticks", 0),
+        min_quote_distance_bps=raw.get("min_quote_distance_bps", 0.0),
         inventory_skew=inventory_skew,
         min_order_qty=float(raw.get("min_order_qty", 0.0)),
         min_order_notional=float(raw.get("min_order_notional", 0.0)),

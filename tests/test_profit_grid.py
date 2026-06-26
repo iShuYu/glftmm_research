@@ -335,21 +335,27 @@ class ProfitGridConfigTest(unittest.TestCase):
 
         self.assertEqual(cfg.optimize_by_orderbook, 1000.0)
 
-    def test_build_config_parses_min_quote_distance_ticks(self):
+    def test_build_config_parses_min_quote_distance_bps(self):
         cfg = _build_simulation_config(
-            raw_config(min_quote_distance_ticks=20)["simulation"]
+            raw_config(min_quote_distance_bps=20.5)["simulation"]
         )
 
-        self.assertEqual(cfg.min_quote_distance_ticks, 20)
+        self.assertEqual(cfg.min_quote_distance_bps, 20.5)
 
     def test_build_config_rejects_boolean_optimize_by_orderbook(self):
         with self.assertRaises(ValueError):
             _build_simulation_config(raw_config(optimize_by_orderbook=True)["simulation"])
 
-    def test_build_config_rejects_fractional_min_quote_distance_ticks(self):
+    def test_build_config_rejects_negative_min_quote_distance_bps(self):
         with self.assertRaises(ValueError):
             _build_simulation_config(
-                raw_config(min_quote_distance_ticks=1.5)["simulation"]
+                raw_config(min_quote_distance_bps=-0.1)["simulation"]
+            )
+
+    def test_build_config_rejects_legacy_min_quote_distance_ticks(self):
+        with self.assertRaisesRegex(ValueError, "min_quote_distance_bps"):
+            _build_simulation_config(
+                raw_config(min_quote_distance_ticks=20)["simulation"]
             )
 
     def test_build_config_allows_bbo_imbalance_zero_lookback(self):
@@ -505,8 +511,8 @@ class ProfitGridStrategyTest(unittest.TestCase):
             [(99.5, 1.0)],
         )
 
-    def test_min_quote_distance_ticks_floors_flat_open_quotes(self):
-        engine = SimpleMakerStrategy(make_config(min_quote_distance_ticks=5))
+    def test_min_quote_distance_bps_floors_flat_open_quotes_to_ticks(self):
+        engine = SimpleMakerStrategy(make_config(min_quote_distance_bps=59.0))
 
         engine._on_ticker_event(
             timestamp=1,
@@ -544,8 +550,8 @@ class ProfitGridStrategyTest(unittest.TestCase):
             [(101.0, 0.334), (102.0, 0.333), (103.0, 0.333)],
         )
 
-    def test_min_quote_distance_ticks_clips_profit_grid_close_levels(self):
-        engine = SimpleMakerStrategy(make_config(min_quote_distance_ticks=20))
+    def test_min_quote_distance_bps_clips_profit_grid_close_levels(self):
+        engine = SimpleMakerStrategy(make_config(min_quote_distance_bps=200.0))
         set_position(engine, qty=1.0, cost=100.0)
 
         engine._on_ticker_event(
@@ -1258,8 +1264,8 @@ class ProfitGridStrategyTest(unittest.TestCase):
             [(98.5, 0.334), (98.0, 0.333), (97.0, 0.333)],
         )
 
-    def test_min_quote_distance_ticks_clips_short_profit_grid_close_levels(self):
-        engine = SimpleMakerStrategy(make_config(min_quote_distance_ticks=5))
+    def test_min_quote_distance_bps_clips_short_profit_grid_close_levels(self):
+        engine = SimpleMakerStrategy(make_config(min_quote_distance_bps=51.0))
         set_position(engine, qty=-1.0, cost=100.0)
 
         engine._on_ticker_event(

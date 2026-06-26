@@ -306,7 +306,7 @@ class SimulationConfig:
     open_passive_only: bool = False
     optimize_by_orderbook: float = -1.0
     adj_spread_volatility: float = 0.0
-    min_quote_distance_ticks: int = 0
+    min_quote_distance_bps: float = 0.0
     inventory_skew: Optional[tuple[float, float]] = None
     min_order_qty: float = 0.0
     min_order_notional: float = 0.0
@@ -389,19 +389,15 @@ class SimulationConfig:
         if self.adj_spread_volatility < 0:
             raise ValueError("adj_spread_volatility must be >= 0")
         try:
-            min_quote_distance_ticks_float = float(self.min_quote_distance_ticks)
+            min_quote_distance_bps = float(self.min_quote_distance_bps)
         except (TypeError, ValueError):
-            raise ValueError("min_quote_distance_ticks must be a non-negative integer") from None
-        if (
-            not math.isfinite(min_quote_distance_ticks_float)
-            or min_quote_distance_ticks_float < 0
-            or not min_quote_distance_ticks_float.is_integer()
-        ):
-            raise ValueError("min_quote_distance_ticks must be a non-negative integer")
+            raise ValueError("min_quote_distance_bps must be finite and >= 0") from None
+        if not math.isfinite(min_quote_distance_bps) or min_quote_distance_bps < 0:
+            raise ValueError("min_quote_distance_bps must be finite and >= 0")
         object.__setattr__(
             self,
-            "min_quote_distance_ticks",
-            int(min_quote_distance_ticks_float),
+            "min_quote_distance_bps",
+            min_quote_distance_bps,
         )
         if self.inventory_skew is not None:
             if not isinstance(self.inventory_skew, (tuple, list)) or len(self.inventory_skew) != 2:
@@ -1293,27 +1289,36 @@ class SimpleMakerStrategy:
         best_ask: float,
         best_bid: float,
     ) -> tuple[list[MakerLevel], list[MakerLevel]]:
-        min_ticks = int(self.cfg.min_quote_distance_ticks)
-        if min_ticks <= 0:
+        ask_min_ticks = self._min_quote_distance_ticks(reference_price=best_ask)
+        bid_min_ticks = self._min_quote_distance_ticks(reference_price=best_bid)
+        if ask_min_ticks <= 0 and bid_min_ticks <= 0:
             return list(ask_levels), list(bid_levels)
 
-        min_distance = float(min_ticks) * self.sim.tick_size
-        ask_floor = self._price_ceil(float(best_ask) + min_distance)
-        bid_ceiling = self._price_floor(float(best_bid) - min_distance)
+        ask_min_distance = float(ask_min_ticks) * self.sim.tick_size
+        bid_min_distance = float(bid_min_ticks) * self.sim.tick_size
+        ask_floor = self._price_ceil(float(best_ask) + ask_min_distance)
+        bid_ceiling = self._price_floor(float(best_bid) - bid_min_distance)
 
         clipped_ask: list[MakerLevel] = []
         clipped_bid: list[MakerLevel] = []
         for price, qty in ask_levels:
-            price = max(float(price), ask_floor)
+            price = max(float(price), ask_floor) if ask_min_ticks > 0 else float(price)
             qty = float(qty)
             if price > self.EPS and qty > self.EPS:
                 clipped_ask.append((price, qty))
         for price, qty in bid_levels:
-            price = min(float(price), bid_ceiling)
+            price = min(float(price), bid_ceiling) if bid_min_ticks > 0 else float(price)
             qty = float(qty)
             if price > self.EPS and qty > self.EPS:
                 clipped_bid.append((price, qty))
         return clipped_ask, clipped_bid
+
+    def _min_quote_distance_ticks(self, *, reference_price: float) -> int:
+        min_bps = float(self.cfg.min_quote_distance_bps)
+        if min_bps <= 0.0 or reference_price <= 0.0:
+            return 0
+        distance = float(reference_price) * min_bps / 1e4
+        return max(0, math.floor((distance / self.sim.tick_size) + self.EPS))
 
     def _single_quote_levels(
         self,

@@ -108,7 +108,7 @@
     "adj_spread_volatility": [
       0
     ],
-    "min_quote_distance_ticks": [
+    "min_quote_distance_bps": [
       50
     ],
     "inventory_skew": [
