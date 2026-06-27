@@ -9,13 +9,13 @@ from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import numpy as np
 import pandas as pd
 
-if __package__ is None or __package__ == "":
-    sys.path.append(str(Path(__file__).resolve().parents[1]))
-
-from sampler.resample import (  # noqa: E402
+from sampler.resample import (
     DEFAULT_BOOKTICKER_ROOT,
     TICKER_VALUE_COLUMNS,
     atomic_write_parquet,
@@ -438,8 +438,8 @@ def run_one(task: Task) -> str:
         )
 
 
-def config_path(cfg: dict[str, Any], *keys: str, default: Path) -> Path:
-    return config_paths(cfg, *keys, default=default)[0]
+def config_path(cfg: dict[str, Any], key: str, default: Path) -> Path:
+    return config_paths(cfg, key, default=default)[0]
 
 
 def normalize_instructor_lookbacks(indicator: str, raw_lookbacks: Any) -> list[int]:
@@ -529,14 +529,12 @@ def build_tasks(cfg: dict[str, Any]) -> list[Task]:
 
     output_root = config_path(
         cfg,
-        "instructor_cache_root",
         "output_root",
         default=DEFAULT_INSTRUCTOR_ROOT,
     )
     ticker_cache_root = config_path(
         cfg,
         "ticker_cache_root",
-        "sampled_ticker_root",
         default=output_root,
     )
     trade_category = normalize_category(
@@ -547,8 +545,6 @@ def build_tasks(cfg: dict[str, Any]) -> list[Task]:
     trade_roots = config_paths(
         cfg,
         "trade_roots",
-        "trade_root",
-        "trades_root",
         default=trade_root_default,
     )
 
@@ -688,8 +684,6 @@ def build_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
                 config_paths(
                     cfg,
                     "trade_roots",
-                    "trade_root",
-                    "trades_root",
                     default=DEFAULT_TRADE_ROOT,
                 )
             )

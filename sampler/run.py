@@ -7,10 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-if __package__ is None or __package__ == "":
-    sys.path.append(str(Path(__file__).resolve().parents[1]))
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sampler import instructor, intensity, resample, volatility  # noqa: E402
+from sampler import instructor, intensity, resample, volatility
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -69,21 +69,9 @@ def resolve_category_roots(
     input_root: Path,
     backup_root: Path | None,
     category: str,
-    explicit_path_key: str,
-    explicit_backup_path_key: str,
 ) -> tuple[Path, ...]:
-    explicit_primary = cfg.get(explicit_path_key)
-    primary = (
-        input_root / category
-        if explicit_primary in (None, "", [])
-        else Path(explicit_primary)
-    )
-    roots = [primary]
-
-    explicit_backup = cfg.get(explicit_backup_path_key)
-    if explicit_backup not in (None, "", []):
-        roots.append(Path(explicit_backup))
-    elif backup_root is not None:
+    roots = [input_root / category]
+    if backup_root is not None:
         roots.append(backup_root / category)
 
     return unique_paths(roots)
@@ -102,16 +90,12 @@ def resolve_input_paths(cfg: dict[str, Any]) -> InputPaths:
         input_root=input_root,
         backup_root=backup_root,
         category=ticker_category,
-        explicit_path_key="bookticker_path",
-        explicit_backup_path_key="bookticker_backup_path",
     )
     trade_roots = resolve_category_roots(
         cfg=cfg,
         input_root=input_root,
         backup_root=backup_root,
         category=trade_category,
-        explicit_path_key="trade_path",
-        explicit_backup_path_key="trade_backup_path",
     )
     return InputPaths(
         bookticker_roots=bookticker_roots,

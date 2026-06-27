@@ -6,7 +6,6 @@ import itertools
 import json
 import math
 import os
-import re
 from dataclasses import dataclass
 from datetime import datetime
 from multiprocessing import TimeoutError as MpTimeoutError
@@ -16,30 +15,20 @@ from typing import Any
 
 import pandas as pd
 
-try:
-    from glftmm.sim.loader import BinanceEventLoader
-    from glftmm.sim.strategy import (
-        SimulationConfig,
-        SimpleMakerStrategy,
-    )
-except ModuleNotFoundError:
-    from sim.loader import BinanceEventLoader
-    from sim.strategy import (
-        SimulationConfig,
-        SimpleMakerStrategy,
-    )
+from sim.loader import BinanceEventLoader, parse_orderbook_replay_config
+from sim.strategy import (
+    SimulationConfig,
+    SimpleMakerStrategy,
+)
 
 
 DATE_FMT_DASH = "%Y-%m-%d"
 DATE_FMT_COMPACT = "%Y%m%d"
 MAX_DIR_SEGMENT_LEN = 240
 MIN_DAYS_FOR_NEG_STOP = 60
-MIN_DAYS_FOR_LOW_ANNUALIZED_STOP = 60
+MIN_DAYS_FOR_LOW_ANNUALIZED_STOP = 305
 MIN_ANNUALIZED_RETURN_RATIO = 0.2
 MAX_DRAWDOWN_LIMIT_RATIO = 0.2
-_MAX_POSITION_RE = re.compile(
-    r"(?:^|__)mp([0-9peE+\-x]+)(?:$|__)"
-)
 
 SIM_REQUIRED_KEYS = (
     "freq",
@@ -49,10 +38,11 @@ SIM_REQUIRED_KEYS = (
     "mode",
     "taker_fee",
     "maker_fee",
-    "lookback_intensity",
-    "order_amt",
     "max_position_usdt",
 )
+INTENSITY_PARAM_KEYS = ("name_intensity", "lookback_intensity")
+INSTRUCTOR_PARAM_KEYS = ("name_instructor", "lookback_instructor")
+VOLATILITY_PARAM_KEYS = ("name_volatility", "lookback_volatility")
 
 PARAM_KEY_ALIAS = {
     "latency": "lat",
@@ -67,39 +57,55 @@ PARAM_KEY_ALIAS = {
     "lookback_volatility": "vlb",
     "lookback_instructor": "ilb",
     "lookback_intensity": "lbi",
-    "order_amt": "oa",
     "max_position_usdt": "mp",
+    "max_open_inventory_utilization": "moiu",
     "max_holding_time": "mht",
     "freq": "fr",
     "adj_spread_intensity": "asi",
     "adj_spread_instructor": "asir",
     "passive_only": "po",
+    "optimize_by_orderbook": "obo",
     "adj_spread_volatility": "asv",
+    "min_quote_distance_bps": "mqdb",
     "inventory_skew": "isk",
     "stoploss": "sl",
     "open_curve": "oc",
     "close_curve": "cc",
+    "boost_underwater": "bu",
+    "boost_profitzone": "bp",
+    "cooldown_time": "cdt",
+    "strict_mode": "stm",
     "min_order_qty": "moq",
     "min_order_notional": "mon",
+    "simple_mode": "sm",
 }
 
 SIM_OPTIONAL_KEYS = (
     "name_intensity",
     "name_instructor",
     "name_volatility",
+    "lookback_intensity",
     "lookback_instructor",
     "lookback_volatility",
     "max_holding_time",
+    "max_open_inventory_utilization",
     "adj_spread_intensity",
     "adj_spread_instructor",
     "passive_only",
+    "optimize_by_orderbook",
     "adj_spread_volatility",
+    "min_quote_distance_bps",
     "inventory_skew",
     "min_order_qty",
     "min_order_notional",
     "stoploss",
     "open_curve",
     "close_curve",
+    "boost_underwater",
+    "boost_profitzone",
+    "cooldown_time",
+    "strict_mode",
+    "simple_mode",
 )
 SIM_ALLOWED_KEYS = set(SIM_REQUIRED_KEYS) | set(SIM_OPTIONAL_KEYS)
 
@@ -132,6 +138,44 @@ def _normalize_non_negative_scalar(value: Any, key: str) -> float:
     if not math.isfinite(value_float) or value_float < 0.0:
         raise ValueError(f"simulation.{key} must be finite and >= 0")
     return value_float
+
+
+def _normalize_ratio(value: Any, key: str) -> float:
+    if not _is_number(value):
+        raise ValueError(f"simulation.{key} must be a number")
+    value_float = float(value)
+    if not math.isfinite(value_float) or value_float < 0.0 or value_float > 1.0:
+        raise ValueError(f"simulation.{key} must be finite and between 0 and 1")
+    return value_float
+
+
+def _normalize_open_close_pair(value: Any, key: str, *, positive: bool) -> list[float]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"simulation.{key} must be [open, close]")
+    open_value = float(value[0])
+    close_value = float(value[1])
+    if not math.isfinite(open_value) or not math.isfinite(close_value):
+        raise ValueError(f"simulation.{key} open and close must be finite")
+    if positive:
+        if open_value < 0.0 or close_value < 0.0:
+            raise ValueError(f"simulation.{key} open and close must be >= 0")
+    elif open_value < 0.0 or close_value < 0.0:
+        raise ValueError(f"simulation.{key} open and close must be >= 0")
+    return [open_value, close_value]
+
+
+def _normalize_open_close_rows(value: Any, key: str, *, positive: bool) -> list[list[float]]:
+    if (
+        isinstance(value, (list, tuple))
+        and len(value) == 2
+        and all(_is_number(item) for item in value)
+    ):
+        return [_normalize_open_close_pair(value, key, positive=positive)]
+    rows = value if isinstance(value, list) else [value]
+    return [
+        _normalize_open_close_pair(row, key, positive=positive)
+        for row in rows
+    ]
 
 
 def _max_position_total(value: Any) -> float | None:
@@ -197,6 +241,18 @@ def _parse_bool(raw: Any, key: str) -> bool:
     raise ValueError(f"simulation.{key} must be boolean")
 
 
+def _parse_orderbook_optimizer_threshold(raw: Any) -> float:
+    if isinstance(raw, bool):
+        raise ValueError("simulation.optimize_by_orderbook must be -1, 0, or a notional threshold")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError("simulation.optimize_by_orderbook must be -1, 0, or a notional threshold") from None
+    if not math.isfinite(value) or (value < 0.0 and abs(value + 1.0) > 1e-12):
+        raise ValueError("simulation.optimize_by_orderbook must be -1, 0, or a notional threshold")
+    return value
+
+
 def _safe_dir_segment(prefix: str, body: str) -> str:
     segment = f"{prefix}{body}" if body else f"{prefix}none"
     if len(segment) <= MAX_DIR_SEGMENT_LEN:
@@ -218,6 +274,34 @@ def build_param_path_parts(sim_params: dict[str, Any]) -> tuple[str, str]:
     sim_body = _build_param_body(sim_params)
     sim_dir = _safe_dir_segment(prefix="sim__", body=sim_body)
     return sim_dir, "strat__all"
+
+
+def _is_effectively_zero(raw: Any) -> bool:
+    if isinstance(raw, (list, tuple)):
+        return bool(raw) and all(_is_effectively_zero(item) for item in raw)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(value) and abs(value) <= 1e-12
+
+
+def _effective_sim_params(sim_params: dict[str, Any]) -> dict[str, Any]:
+    effective = dict(sim_params)
+    if _is_effectively_zero(effective.get("adj_spread_intensity", [1.0, 1.0])):
+        for key in INTENSITY_PARAM_KEYS:
+            effective.pop(key, None)
+    if _is_effectively_zero(effective.get("adj_spread_instructor", 0.0)):
+        for key in INSTRUCTOR_PARAM_KEYS:
+            effective.pop(key, None)
+    if _is_effectively_zero(effective.get("adj_spread_volatility", [0.0, 0.0])):
+        for key in VOLATILITY_PARAM_KEYS:
+            effective.pop(key, None)
+    return effective
+
+
+def _sim_params_dedupe_key(sim_params: dict[str, Any]) -> str:
+    return json.dumps(sim_params, sort_keys=True, separators=(",", ":"))
 
 
 def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
@@ -247,10 +331,34 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
             for row in sim_map["max_position_usdt"]
         ]
 
+    if "max_open_inventory_utilization" in sim_map:
+        sim_map["max_open_inventory_utilization"] = [
+            _normalize_ratio(row, "max_open_inventory_utilization")
+            for row in sim_map["max_open_inventory_utilization"]
+        ]
+
     if "stoploss" in sim_map:
         sim_map["stoploss"] = [
             _normalize_non_negative_scalar(row, "stoploss")
             for row in sim_map["stoploss"]
+        ]
+
+    if "cooldown_time" in sim_map:
+        sim_map["cooldown_time"] = [
+            int(_normalize_non_negative_scalar(row, "cooldown_time"))
+            for row in sim_map["cooldown_time"]
+        ]
+
+    if "optimize_by_orderbook" in sim_map:
+        sim_map["optimize_by_orderbook"] = [
+            _parse_orderbook_optimizer_threshold(row)
+            for row in sim_map["optimize_by_orderbook"]
+        ]
+
+    if "min_quote_distance_bps" in sim_map:
+        sim_map["min_quote_distance_bps"] = [
+            _normalize_non_negative_scalar(row, "min_quote_distance_bps")
+            for row in sim_map["min_quote_distance_bps"]
         ]
 
     if "open_curve" in sim_map:
@@ -279,6 +387,19 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
             normalized_rows.append([float(row[0]), float(row[1]), float(row[2])])
         sim_map["close_curve"] = normalized_rows
 
+    for key, positive in (
+        ("adj_spread_intensity", True),
+        ("adj_spread_volatility", False),
+        ("boost_underwater", False),
+        ("boost_profitzone", False),
+    ):
+        if key in sim_raw:
+            sim_map[key] = _normalize_open_close_rows(
+                sim_raw[key],
+                key,
+                positive=positive,
+            )
+
     unknown = sorted(set(sim_map) - SIM_ALLOWED_KEYS)
     if unknown:
         raise ValueError(f"unknown simulation keys: {unknown}")
@@ -290,6 +411,24 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
 
 
 def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
+    if "min_quote_distance_ticks" in raw:
+        raise ValueError(
+            "simulation.min_quote_distance_ticks has been replaced by "
+            "simulation.min_quote_distance_bps"
+        )
+
+    adj_spread_intensity = raw.get("adj_spread_intensity", [1.0, 1.0])
+    lookback_intensity_raw = raw.get("lookback_intensity")
+    if lookback_intensity_raw is None:
+        if not _is_effectively_zero(adj_spread_intensity):
+            raise ValueError(
+                "simulation.lookback_intensity is required when "
+                "adj_spread_intensity is non-zero"
+            )
+        lookback_intensity = 100
+    else:
+        lookback_intensity = int(lookback_intensity_raw)
+
     name_instructor = raw.get("name_instructor")
     if name_instructor is not None:
         name_instructor = str(name_instructor).strip() or None
@@ -346,70 +485,59 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
         ),
         lookback_instructor=lookback_instructor,
         name_intensity=str(raw.get("name_intensity", "k")).strip().lower(),
-        lookback_intensity=int(raw["lookback_intensity"]),
+        lookback_intensity=lookback_intensity,
         name_volatility=(
             None if name_volatility is None else str(name_volatility).strip().lower()
         ),
         lookback_volatility=lookback_volatility,
-        order_amt=float(raw["order_amt"]),
         max_position_usdt=_normalize_non_negative_scalar(
             raw["max_position_usdt"],
             "max_position_usdt",
         ),
+        max_open_inventory_utilization=_normalize_ratio(
+            raw.get("max_open_inventory_utilization", 1.0),
+            "max_open_inventory_utilization",
+        ),
         max_holding_time=int(raw.get("max_holding_time", 0)),
-        adj_spread_intensity=float(raw.get("adj_spread_intensity", 1.0)),
+        adj_spread_intensity=adj_spread_intensity,
         adj_spread_instructor=float(raw.get("adj_spread_instructor", 0.0)),
         passive_only=_parse_bool(raw.get("passive_only", False), "passive_only"),
-        adj_spread_volatility=float(raw.get("adj_spread_volatility", 0.0)),
+        optimize_by_orderbook=_parse_orderbook_optimizer_threshold(
+            raw.get("optimize_by_orderbook", -1)
+        ),
+        adj_spread_volatility=raw.get("adj_spread_volatility", [0.0, 0.0]),
+        min_quote_distance_bps=_normalize_non_negative_scalar(
+            raw.get("min_quote_distance_bps", 0.0),
+            "min_quote_distance_bps",
+        ),
         inventory_skew=inventory_skew,
         min_order_qty=float(raw.get("min_order_qty", 0.0)),
         min_order_notional=float(raw.get("min_order_notional", 0.0)),
         stoploss=_normalize_non_negative_scalar(raw.get("stoploss", 0.0), "stoploss"),
         open_curve=open_curve,
         close_curve=close_curve,
+        boost_underwater=raw.get("boost_underwater", [1.0, 1.0]),
+        boost_profitzone=raw.get("boost_profitzone", [1.0, 1.0]),
+        cooldown_time=int(raw.get("cooldown_time", 0)),
+        strict_mode=_parse_bool(raw.get("strict_mode", True), "strict_mode"),
+        simple_mode=_parse_bool(raw.get("simple_mode", True), "simple_mode"),
     )
 
 
-def _path_value(paths: dict[str, Any], *keys: str, required: bool = False) -> str | None:
-    for key in keys:
-        value = paths.get(key)
-        if value not in (None, "", []):
-            return str(value)
+def _path_value(paths: dict[str, Any], key: str, required: bool = False) -> str | None:
+    value = paths.get(key)
+    if value not in (None, "", []):
+        return str(value)
     if required:
-        raise ValueError(f"paths.{keys[0]} is required")
+        raise ValueError(f"paths.{key} is required")
     return None
 
 
 def _config_paths(cfg: dict[str, Any]) -> dict[str, Any]:
-    paths = dict(cfg.get("paths", {}))
-    for key in (
-        "input_path",
-        "input_backup_path",
-        "output_path",
-        "output_dir",
-        "strategy_output_path",
-        "result_path",
-        "ticker_category",
-        "trade_category",
-        "ticker_cache_root",
-        "instructor_cache_root",
-        "intensity_cache_root",
-        "trade_intensity_cache_root",
-        "volatility_cache_root",
-        "trades_root",
-        "trade_root",
-        "trade_roots",
-        "bookticker_roots",
-        "bookticker_root",
-        "bookticker_path",
-        "bookticker_backup_path",
-        "trade_path",
-        "trade_backup_path",
-        "scheme_shift",
-    ):
-        if key in cfg and key not in paths:
-            paths[key] = cfg[key]
-    return paths
+    paths = cfg.get("paths")
+    if not isinstance(paths, dict):
+        raise ValueError("config requires paths object")
+    return dict(paths)
 
 
 def _normalize_category(value: Any, default: str) -> str:
@@ -419,43 +547,12 @@ def _normalize_category(value: Any, default: str) -> str:
     return category
 
 
-def _ensure_path_list(value: Any) -> list[str]:
-    if value in (None, "", []):
-        return []
-    if isinstance(value, (list, tuple)):
-        return [str(item) for item in value if item not in (None, "", [])]
-    return [str(value)]
-
-
-def _scalar_scheme_shift(value: Any) -> int | None:
-    if value in (None, "", []):
-        return None
-    if isinstance(value, (list, tuple)):
-        if len(value) != 1:
-            raise ValueError(
-                "strategy loader requires one scalar scheme_shift; got "
-                f"{list(value)}"
-            )
-        value = value[0]
-    return int(value)
-
-
 def _resolve_category_roots(
     paths: dict[str, Any],
     *,
     category: str,
-    explicit_path_keys: tuple[str, ...],
-    explicit_backup_path_keys: tuple[str, ...] = (),
     require_input_path: bool = True,
 ) -> list[str]:
-    for key in explicit_path_keys:
-        roots = _ensure_path_list(paths.get(key))
-        if roots:
-            backup_roots: list[str] = []
-            for backup_key in explicit_backup_path_keys:
-                backup_roots.extend(_ensure_path_list(paths.get(backup_key)))
-            return [*roots, *backup_roots]
-
     input_root = _path_value(paths, "input_path", required=require_input_path)
     if input_root is None:
         return []
@@ -468,61 +565,45 @@ def _resolve_category_roots(
 
 def _output_dir_from_cfg(cfg: dict[str, Any]) -> str:
     paths = _config_paths(cfg)
-    out_dir = _path_value(
-        paths,
-        "output_dir",
-        "strategy_output_path",
-        "result_path",
-        required=True,
-    )
+    out_dir = _path_value(paths, "output_dir", required=True)
     assert out_dir is not None
     return out_dir
 
 
-def _build_loader(cfg: dict[str, Any], require_volatility_cache: bool = False) -> BinanceEventLoader:
+def _build_loader(
+    cfg: dict[str, Any],
+    simulation: SimulationConfig | None = None,
+    require_volatility_cache: bool = False,
+) -> BinanceEventLoader:
     paths = _config_paths(cfg)
-    sampler_output_root = _path_value(paths, "output_path")
-    ticker_cache_root = _path_value(paths, "ticker_cache_root") or sampler_output_root
-    if not ticker_cache_root:
-        raise ValueError("config requires output_path or paths.ticker_cache_root")
-    intensity_cache_root = _path_value(
-        paths,
-        "intensity_cache_root",
-        "trade_intensity_cache_root",
-    ) or sampler_output_root
-    if not intensity_cache_root:
-        raise ValueError("config requires output_path or paths.intensity_cache_root")
-    volatility_cache_root = _path_value(paths, "volatility_cache_root") or sampler_output_root
-    if require_volatility_cache and not volatility_cache_root:
-        raise ValueError(
-            "config requires output_path or paths.volatility_cache_root when simulation.name_volatility is set"
-        )
-    instructor_cache_root = _path_value(paths, "instructor_cache_root") or sampler_output_root
+    sampler_output_root = _path_value(paths, "output_path", required=True)
+    assert sampler_output_root is not None
     trade_category = _normalize_category(paths.get("trade_category"), "TRADE")
-    ticker_category = _normalize_category(paths.get("ticker_category"), "BOOKTICKER")
     trade_roots = _resolve_category_roots(
         paths,
         category=trade_category,
-        explicit_path_keys=("trade_roots", "trades_root", "trade_root", "trade_path"),
-        explicit_backup_path_keys=("trade_backup_path",),
     )
-    bookticker_roots = _resolve_category_roots(
-        paths,
-        category=ticker_category,
-        explicit_path_keys=("bookticker_roots", "bookticker_root", "bookticker_path"),
-        explicit_backup_path_keys=("bookticker_backup_path",),
-        require_input_path=False,
-    )
+    orderbook_replay_config = None
+    if simulation is not None and float(simulation.optimize_by_orderbook) >= 0.0:
+        orderbook_replay_config = parse_orderbook_replay_config(cfg)
+        if abs(float(orderbook_replay_config.tick_size) - float(simulation.tick_size)) > 1e-12:
+            raise ValueError(
+                "orderbook_replay.tick_size must match simulation tick size "
+                f"({orderbook_replay_config.tick_size} != {simulation.tick_size})"
+            )
+        replay_interval_ms = int(orderbook_replay_config.sample_interval_ms)
+        sim_freq_ms = int(simulation.freq)
+        if replay_interval_ms > sim_freq_ms or sim_freq_ms % replay_interval_ms != 0:
+            raise ValueError(
+                "orderbook_replay.sample_interval_ms must divide simulation.freq "
+                f"and be no larger than it ({replay_interval_ms} vs {sim_freq_ms})"
+            )
     return BinanceEventLoader(
         trade_roots=trade_roots,
-        bookticker_root=bookticker_roots[0] if bookticker_roots else None,
-        ticker_cache_root=ticker_cache_root,
-        instructor_cache_root=instructor_cache_root,
-        trade_intensity_cache_root=intensity_cache_root,
-        volatility_cache_root=volatility_cache_root,
+        cache_root=sampler_output_root,
         trade_category=trade_category,
-        ticker_category=ticker_category,
-        scheme_shift=_scalar_scheme_shift(paths.get("scheme_shift")),
+        scheme_shift=int(paths.get("scheme_shift", 0)),
+        orderbook_replay_config=orderbook_replay_config,
     )
 
 
@@ -564,43 +645,17 @@ def _day_completed(out_dir: str, day: str) -> bool:
 
 
 def _state_total_pnl(state: dict[str, Any]) -> float | None:
-    total_raw = state.get("total_pnl")
-    if total_raw is not None:
-        try:
-            total = float(total_raw)
-            if math.isfinite(total):
-                return total
-        except (TypeError, ValueError):
-            pass
-
-    pos = state.get("position")
-    if not isinstance(pos, dict):
-        return None
     try:
-        realized = float(pos.get("realized_pnl", 0.0))
-        unrealized = float(pos.get("unrealized_pnl", 0.0))
-    except (TypeError, ValueError):
+        total = float(state["total_pnl"])
+    except (KeyError, TypeError, ValueError):
         return None
-    total = realized + unrealized
     return total if math.isfinite(total) else None
 
 
 def _state_realized_pnl(state: dict[str, Any]) -> float | None:
-    realized_raw = state.get("realized_pnl")
-    if realized_raw is not None:
-        try:
-            realized = float(realized_raw)
-            if math.isfinite(realized):
-                return realized
-        except (TypeError, ValueError):
-            pass
-
-    pos = state.get("position")
-    if not isinstance(pos, dict):
-        return None
     try:
-        realized = float(pos.get("realized_pnl", 0.0))
-    except (TypeError, ValueError):
+        realized = float(state["realized_pnl"])
+    except (KeyError, TypeError, ValueError):
         return None
     return realized if math.isfinite(realized) else None
 
@@ -636,34 +691,10 @@ def _state_cost_notional_usdt(state: dict[str, Any]) -> float | None:
     pos = state.get("position")
     if not isinstance(pos, dict):
         return None
-    cost_notional_raw = pos.get("cost_notional_usdt")
-    if cost_notional_raw is not None:
-        try:
-            cost_notional = float(cost_notional_raw)
-            if math.isfinite(cost_notional):
-                return cost_notional
-        except (TypeError, ValueError):
-            pass
-
     try:
-        qty = float(pos.get("qty", 0.0))
-        cost_raw = pos.get("cost")
-        cost = float(cost_raw) if cost_raw is not None else math.nan
-    except (TypeError, ValueError):
+        cost_notional = float(pos["cost_notional_usdt"])
+    except (KeyError, TypeError, ValueError):
         return None
-    if not math.isfinite(qty):
-        return None
-    if abs(qty) <= 0.0:
-        return 0.0
-    if math.isfinite(cost):
-        return qty * cost
-
-    try:
-        mark_notional = float(pos.get("mark_notional_usdt"))
-        unrealized = float(pos.get("unrealized_pnl", 0.0))
-    except (TypeError, ValueError):
-        return None
-    cost_notional = mark_notional - unrealized
     return cost_notional if math.isfinite(cost_notional) else None
 
 
@@ -726,21 +757,6 @@ def _should_stop_by_max_drawdown(
     return bool(drawdown_ratio is not None and drawdown_ratio <= (-drawdown_limit_ratio))
 
 
-def _parse_max_position_usdt_from_path(path: str) -> float | None:
-    for part in reversed(os.path.normpath(path).split(os.sep)):
-        match = _MAX_POSITION_RE.search(part.lower())
-        if match is None:
-            continue
-        token = match.group(1).replace("p", ".")
-        try:
-            value = sum(float(item) for item in token.split("x") if item)
-        except ValueError:
-            return None
-        if math.isfinite(value) and value > 0.0:
-            return value
-    return None
-
-
 def _annotate_state_for_stops(
     state: dict[str, Any],
     *,
@@ -795,67 +811,6 @@ def _annotate_state_for_stops(
         <= (-max_drawdown_limit_ratio)
     )
     return state
-
-
-def _backfill_state_dir(
-    state_dir: str,
-    *,
-    min_days_for_neg_stop: int = MIN_DAYS_FOR_NEG_STOP,
-    min_days_for_low_annualized_stop: int = MIN_DAYS_FOR_LOW_ANNUALIZED_STOP,
-    min_annualized_return_ratio: float = MIN_ANNUALIZED_RETURN_RATIO,
-    max_drawdown_limit_ratio: float = MAX_DRAWDOWN_LIMIT_RATIO,
-) -> dict[str, int]:
-    if not os.path.isdir(state_dir):
-        return {"dirs": 0, "files": 0, "updated": 0}
-
-    files = sorted(name for name in os.listdir(state_dir) if name.endswith(".json"))
-    prev_max_pnl_ever: float | None = None
-    max_position_usdt = _parse_max_position_usdt_from_path(state_dir)
-    updated = 0
-    for name in files:
-        path = os.path.join(state_dir, name)
-        with open(path, "r", encoding="utf-8") as f:
-            state = json.load(f)
-        before = json.dumps(state, sort_keys=True, separators=(",", ":"))
-        _annotate_state_for_stops(
-            state,
-            prev_max_pnl_ever=prev_max_pnl_ever,
-            max_position_usdt=max_position_usdt,
-            min_days_for_neg_stop=min_days_for_neg_stop,
-            min_days_for_low_annualized_stop=min_days_for_low_annualized_stop,
-            min_annualized_return_ratio=min_annualized_return_ratio,
-            max_drawdown_limit_ratio=max_drawdown_limit_ratio,
-        )
-        after = json.dumps(state, sort_keys=True, separators=(",", ":"))
-        max_pnl_ever = _state_max_pnl_ever(state)
-        if max_pnl_ever is not None:
-            prev_max_pnl_ever = max_pnl_ever
-        if after != before:
-            _atomic_write_json(state, path)
-            updated += 1
-
-    return {"dirs": 1, "files": len(files), "updated": updated}
-
-
-def _backfill_state_root(
-    output_root: str,
-    *,
-    min_days_for_neg_stop: int = MIN_DAYS_FOR_NEG_STOP,
-    max_drawdown_limit_ratio: float = MAX_DRAWDOWN_LIMIT_RATIO,
-) -> dict[str, int]:
-    summary = {"dirs": 0, "files": 0, "updated": 0}
-    for root, _, _ in os.walk(output_root):
-        if os.path.basename(root) != "_state":
-            continue
-        result = _backfill_state_dir(
-            root,
-            min_days_for_neg_stop=min_days_for_neg_stop,
-            max_drawdown_limit_ratio=max_drawdown_limit_ratio,
-        )
-        summary["dirs"] += result["dirs"]
-        summary["files"] += result["files"]
-        summary["updated"] += result["updated"]
-    return summary
 
 
 def _metrics_from_state(state: dict[str, Any]) -> dict[str, float]:
@@ -930,16 +885,6 @@ def _run_daily_incremental(
     if (not overwrite) and resume_idx > 0:
         if prev_state is None:
             raise FileNotFoundError(f"[{symbol}] missing resume state: {prev_day}")
-        if (
-            _state_max_pnl_ever(prev_state) is None
-            or _state_max_position_usdt(prev_state) is None
-            or "stop_due_to_max_drawdown" not in prev_state
-            or "stop_due_to_low_annualized_return" not in prev_state
-        ):
-            _backfill_state_dir(os.path.join(out_dir, "_state"))
-            prev_state = _load_state(out_dir=out_dir, day=prev_day)
-            if prev_state is None:
-                raise FileNotFoundError(f"[{symbol}] missing resume state after backfill: {prev_day}")
         if _should_stop_by_dayn_pnl(prev_state):
             total_pnl = _state_total_pnl(prev_state)
             print(
@@ -1049,8 +994,14 @@ def _build_tasks(cfg: dict[str, Any]) -> list[Task]:
     tasks: list[Task] = []
     for symbol in symbols:
         combos = itertools.product(*sim_lists) if sim_lists else [()]
+        seen_params: set[str] = set()
         for combo in combos:
             sim_params = {k: combo[i] for i, k in enumerate(sim_keys)}
+            sim_params = _effective_sim_params(sim_params)
+            dedupe_key = _sim_params_dedupe_key(sim_params)
+            if dedupe_key in seen_params:
+                continue
+            seen_params.add(dedupe_key)
             tasks.append(
                 Task(
                     symbol=str(symbol),
@@ -1069,6 +1020,7 @@ def _run_strategy_task(task: Task) -> dict[str, Any]:
     simulation = _build_simulation_config(task.sim_params)
     loader = _build_loader(
         cfg=cfg,
+        simulation=simulation,
         require_volatility_cache=simulation.name_volatility is not None,
     )
 
@@ -1183,24 +1135,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument(
-        "--backfill-state-max-pnl-ever",
-        action="store_true",
-        help="scan output_dir recursively and backfill total_pnl/max_pnl_ever plus stop flags into saved state files",
-    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     cfg["__debug_mode__"] = bool(args.debug)
-    if args.backfill_state_max_pnl_ever:
-        output_root = _output_dir_from_cfg(cfg)
-        summary = _backfill_state_root(output_root)
-        print(
-            "state backfill done: "
-            f"dirs={summary['dirs']} files={summary['files']} "
-            f"updated={summary['updated']} root={output_root}"
-        )
-        raise SystemExit(0)
     run_all(cfg)
 
 

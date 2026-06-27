@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import datetime as dt
-import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Literal, TypeAlias
 
+import numpy as np
 import pandas as pd
 
 from sampler.instructor import instructor_output_path
@@ -26,6 +27,10 @@ AlphaTuple: TypeAlias = tuple[
     float | None,
     float | None,
     float,
+    Any,
+    Any,
+    Any,
+    Any,
 ]
 MergedEventTuple: TypeAlias = TradeTuple | AlphaTuple
 
@@ -41,10 +46,35 @@ TICKER_COLUMNS = (
     "best_bid_price",
     "best_ask_price",
 )
-PROJECT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "sampler" / "config.json"
 DEFAULT_CACHE_ROOT = Path("/data/users/kang/backtest/glftmm/cached")
 DEFAULT_DATA_ROOT = Path("/data/users/data-helper/PROCESSED/TARDIS/BINANCE/UFUTURES")
 DEFAULT_BACKUP_DATA_ROOT = Path("/home/kang/data_helper/PROCESSED/DATA_RECORDER/BINANCE/UFUTURES")
+DEFAULT_ORDERBOOK_REPLAY_ROOT = Path("/home/kang/data/wallmaker/cached")
+
+
+@dataclass(frozen=True)
+class OrderBookReplayConfig:
+    root: Path
+    replay_levels: int = 1000
+    sample_interval_ms: int = 1000
+    tick_size: float = 0.1
+    depth_price_min: float = 20_000.0
+    depth_price_max: float = 200_000.0
+    raw_quantity_max: float = 10_000.0
+
+
+@dataclass(frozen=True)
+class OrderBookReplayFrame:
+    timestamps: np.ndarray
+    bid_ticks: np.ndarray
+    ask_ticks: np.ndarray
+    bid_notional: np.ndarray
+    ask_notional: np.ndarray
+
+
+_ORDERBOOK_REPLAY_CACHE: dict[tuple[object, ...], OrderBookReplayFrame] = {}
+_ORDERBOOK_REPLAY_CACHE_ORDER: list[tuple[object, ...]] = []
+_ORDERBOOK_REPLAY_CACHE_MAX_DAYS = 1
 
 
 def normalize_date(value: DateLike) -> str:
@@ -63,72 +93,77 @@ def normalize_date(value: DateLike) -> str:
     return dt.date.fromisoformat(text).isoformat()
 
 
-def _load_project_config() -> dict[str, Any]:
-    try:
-        with open(PROJECT_CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-    except FileNotFoundError:
-        return {}
-    if not isinstance(cfg, dict):
-        return {}
+def _path_safe_value(value: object) -> str:
+    if isinstance(value, bool):
+        text = "true" if value else "false"
+    elif isinstance(value, float):
+        text = f"{value:.12g}"
+    else:
+        text = str(value)
+    return text.replace("-", "m").replace("+", "").replace(".", "p")
+
+
+def parse_orderbook_replay_config(raw: dict[str, Any] | None) -> OrderBookReplayConfig:
+    if raw is None:
+        raise ValueError("orderbook_path config is required when optimize_by_orderbook is enabled")
+    if not isinstance(raw, dict):
+        raise ValueError("orderbook config must be an object")
+
+    replay_raw = raw.get("orderbook_replay", {})
+    if replay_raw is None:
+        replay_raw = {}
+    if not isinstance(replay_raw, dict):
+        raise ValueError("orderbook_replay config must be an object")
+
+    root_raw = raw.get("orderbook_path")
+    if root_raw in (None, "", []):
+        root_raw = replay_raw.get("root") or replay_raw.get("output_path") or replay_raw.get("cache_root")
+    if root_raw in (None, "", []):
+        raise ValueError("orderbook_path config is required when optimize_by_orderbook is enabled")
+
+    cfg = OrderBookReplayConfig(
+        root=Path(root_raw),
+        replay_levels=int(replay_raw.get("replay_levels", 1000)),
+        sample_interval_ms=int(replay_raw.get("sample_interval_ms", 1000)),
+        tick_size=float(replay_raw.get("tick_size", 0.1)),
+        depth_price_min=float(replay_raw.get("depth_price_min", 20_000.0)),
+        depth_price_max=float(replay_raw.get("depth_price_max", 200_000.0)),
+        raw_quantity_max=float(replay_raw.get("raw_quantity_max", 10_000.0)),
+    )
+    validate_orderbook_replay_config(cfg)
     return cfg
 
 
-def _configured_cache_root() -> Path:
-    cfg = _load_project_config()
-    value = cfg.get("output_path")
-    if value not in (None, "", []):
-        return Path(value)
-    return DEFAULT_CACHE_ROOT
+def validate_orderbook_replay_config(cfg: OrderBookReplayConfig) -> None:
+    if cfg.replay_levels < 1:
+        raise ValueError("orderbook_replay.replay_levels must be >= 1")
+    if cfg.sample_interval_ms < 1:
+        raise ValueError("orderbook_replay.sample_interval_ms must be >= 1")
+    if cfg.tick_size <= 0.0:
+        raise ValueError("orderbook_replay.tick_size must be > 0")
+    if cfg.depth_price_max <= cfg.depth_price_min:
+        raise ValueError("orderbook_replay.depth_price_max must be > depth_price_min")
+    if cfg.raw_quantity_max <= 0.0:
+        raise ValueError("orderbook_replay.raw_quantity_max must be > 0")
 
 
-def _configured_scheme_shift() -> int:
-    cfg = _load_project_config()
-    value = cfg.get("scheme_shift", 0)
-    if value in (None, "", []):
-        return 0
-    if isinstance(value, (list, tuple)):
-        if len(value) != 1:
-            raise ValueError(
-                "sampler config has multiple scheme_shift values; pass one scalar "
-                "scheme_shift to BinanceEventLoader"
-            )
-        value = value[0]
-    return int(value)
-
-
-def _configured_trade_roots(trade_category: str) -> tuple[Path, ...]:
-    cfg = _load_project_config()
-    roots: list[Path] = []
-
-    explicit_trade_path = cfg.get("trade_path")
-    if explicit_trade_path not in (None, "", []):
-        roots.append(Path(explicit_trade_path))
-    else:
-        input_path = cfg.get("input_path")
-        if input_path not in (None, "", []):
-            roots.append(Path(input_path) / trade_category)
-
-    explicit_backup_path = cfg.get("trade_backup_path")
-    if explicit_backup_path not in (None, "", []):
-        roots.append(Path(explicit_backup_path))
-    else:
-        input_backup_path = cfg.get("input_backup_path")
-        if input_backup_path not in (None, "", []):
-            roots.append(Path(input_backup_path) / trade_category)
-
-    if not roots:
-        roots = [DEFAULT_DATA_ROOT / trade_category, DEFAULT_BACKUP_DATA_ROOT / trade_category]
-
-    unique: list[Path] = []
-    seen: set[str] = set()
-    for root in roots:
-        key = str(root)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(root)
-    return tuple(unique)
+def orderbook_replay_path(
+    root: Path,
+    symbol: str,
+    date_str: str,
+    cfg: OrderBookReplayConfig,
+) -> Path:
+    path = root / "ORDERBOOK_REPLAY" / "depth_update" / symbol
+    for name in (
+        "replay_levels",
+        "sample_interval_ms",
+        "tick_size",
+        "depth_price_min",
+        "depth_price_max",
+        "raw_quantity_max",
+    ):
+        path = path / f"{name}-{_path_safe_value(getattr(cfg, name))}"
+    return path / f"{date_str}.parquet"
 
 
 class BinanceEventLoader:
@@ -145,81 +180,35 @@ class BinanceEventLoader:
         cache_root: str | Path | None = None,
         input_path: str | Path | None = None,
         input_backup_path: str | Path | None = None,
-        trades_root: str | Path | None = None,
-        bookticker_root: str | Path | None = None,
-        ticker_cache_root: str | Path | None = None,
-        instructor_cache_root: str | Path | None = None,
-        trade_intensity_cache_root: str | Path | None = None,
-        intensity_cache_root: str | Path | None = None,
-        volatility_cache_root: str | Path | None = None,
         trade_roots: Iterable[str | Path] | None = None,
         trade_category: str | None = None,
-        ticker_category: str | None = None,
-        scheme_shift: int | None = None,
+        scheme_shift: int = 0,
+        orderbook_replay_config: OrderBookReplayConfig | dict[str, Any] | None = None,
     ) -> None:
-        project_cfg = _load_project_config()
-        category = str(
-            trade_category
-            or project_cfg.get("trade_category")
-            or "TRADE"
-        ).strip().upper()
+        category = str(trade_category or "TRADE").strip().upper()
         if not category:
             raise ValueError("trade_category must not be empty")
-        ticker_category_norm = str(
-            ticker_category
-            or project_cfg.get("ticker_category")
-            or "BOOKTICKER"
-        ).strip().upper()
-        if not ticker_category_norm:
-            raise ValueError("ticker_category must not be empty")
 
-        default_cache_root = Path(cache_root) if cache_root is not None else _configured_cache_root()
+        default_cache_root = Path(cache_root) if cache_root is not None else DEFAULT_CACHE_ROOT
         self.cache_root = default_cache_root
-        if bookticker_root is not None:
-            self.bookticker_root = Path(bookticker_root)
-        elif input_path is not None:
-            self.bookticker_root = Path(input_path) / ticker_category_norm
-        else:
-            self.bookticker_root = None
-        self.ticker_cache_root = (
-            Path(ticker_cache_root) if ticker_cache_root is not None else default_cache_root
-        )
-        self.instructor_cache_root = (
-            Path(instructor_cache_root)
-            if instructor_cache_root is not None
-            else default_cache_root
-        )
-        resolved_intensity_root = (
-            trade_intensity_cache_root
-            if trade_intensity_cache_root is not None
-            else intensity_cache_root
-        )
-        self.trade_intensity_cache_root = (
-            Path(resolved_intensity_root)
-            if resolved_intensity_root is not None
-            else default_cache_root
-        )
-        self.volatility_cache_root = (
-            Path(volatility_cache_root)
-            if volatility_cache_root is not None
-            else default_cache_root
-        )
-        self.scheme_shift = (
-            _configured_scheme_shift() if scheme_shift is None else int(scheme_shift)
-        )
+        self.scheme_shift = int(scheme_shift)
         self.trade_category = category
         if trade_roots is not None:
             roots = tuple(Path(path) for path in trade_roots)
-        elif trades_root is not None:
-            roots = (Path(trades_root),)
         elif input_path is not None:
             root_list = [Path(input_path) / category]
             if input_backup_path not in (None, "", []):
                 root_list.append(Path(input_backup_path) / category)
             roots = tuple(root_list)
         else:
-            roots = _configured_trade_roots(category)
+            roots = (DEFAULT_DATA_ROOT / category, DEFAULT_BACKUP_DATA_ROOT / category)
         self.trade_roots = roots
+        if isinstance(orderbook_replay_config, OrderBookReplayConfig):
+            self.orderbook_replay_config = orderbook_replay_config
+        elif orderbook_replay_config is None:
+            self.orderbook_replay_config = None
+        else:
+            self.orderbook_replay_config = parse_orderbook_replay_config(orderbook_replay_config)
 
     def iter_merged_alpha_trade_tuples(
         self,
@@ -244,8 +233,17 @@ class BinanceEventLoader:
             volatility_specs=volatility_specs,
             instructor_spec=instructor_spec,
         )
+        replay = self._read_orderbook_replay_frame(symbol=symbol, date=date_str)
+        if replay is not None:
+            alpha_ts = alpha["timestamp"].to_numpy(dtype="int64", copy=False)
+            replay = self._align_orderbook_replay_frame(
+                symbol=symbol,
+                date=date_str,
+                alpha_timestamps=alpha_ts,
+                replay=replay,
+            )
         trades = self._read_trade_frame(symbol=symbol, date=date_str)
-        yield from self._merge_sorted(alpha=alpha, trades=trades)
+        yield from self._merge_sorted(alpha=alpha, trades=trades, replay=replay)
 
     def _read_alpha_frame(
         self,
@@ -312,7 +310,7 @@ class BinanceEventLoader:
 
     def _read_sampled_ticker(self, symbol: str, date: str, freq_ms: int) -> pd.DataFrame:
         path = sampled_ticker_path(
-            root=self.ticker_cache_root,
+            root=self.cache_root,
             symbol=symbol,
             freq_ms=freq_ms,
             date_str=date,
@@ -336,7 +334,7 @@ class BinanceEventLoader:
     ) -> pd.DataFrame:
         name, lookback = self._parse_spec(spec=spec, default_name="trade_imbalance")
         path = instructor_output_path(
-            root=self.instructor_cache_root,
+            root=self.cache_root,
             symbol=symbol,
             indicator=name,
             freq_ms=freq_ms,
@@ -361,7 +359,7 @@ class BinanceEventLoader:
     ) -> pd.DataFrame:
         name, lookback = self._parse_spec(spec=spec, default_name="k")
         path = intensity_output_path(
-            root=self.trade_intensity_cache_root,
+            root=self.cache_root,
             symbol=symbol,
             indicator=name,
             freq_ms=freq_ms,
@@ -386,7 +384,7 @@ class BinanceEventLoader:
     ) -> pd.DataFrame:
         name, lookback = self._parse_spec(spec=spec, default_name="sigma")
         path = volatility_output_path(
-            root=self.volatility_cache_root,
+            root=self.cache_root,
             symbol=symbol,
             indicator=name,
             freq_ms=freq_ms,
@@ -437,6 +435,107 @@ class BinanceEventLoader:
             ignore_index=True,
         )
 
+    def _read_orderbook_replay_frame(
+        self,
+        symbol: str,
+        date: str,
+    ) -> OrderBookReplayFrame | None:
+        cfg = self.orderbook_replay_config
+        if cfg is None:
+            return None
+
+        key = (
+            str(cfg.root),
+            symbol,
+            date,
+            cfg.replay_levels,
+            cfg.sample_interval_ms,
+            cfg.tick_size,
+            cfg.depth_price_min,
+            cfg.depth_price_max,
+            cfg.raw_quantity_max,
+        )
+        cached = _ORDERBOOK_REPLAY_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+        path = orderbook_replay_path(root=cfg.root, symbol=symbol, date_str=date, cfg=cfg)
+        if not path.exists():
+            raise FileNotFoundError(f"missing orderbook replay snapshot: {path}")
+
+        columns = ["timestamp"]
+        for side in ("bid", "ask"):
+            for idx in range(cfg.replay_levels):
+                columns.append(f"{side}_price_{idx}")
+                columns.append(f"{side}_qty_{idx}")
+        frame = pd.read_parquet(path, columns=columns)
+        missing = set(columns) - set(frame.columns)
+        if missing:
+            raise ValueError(f"orderbook replay frame missing columns: {sorted(missing)}")
+
+        timestamps = frame["timestamp"].astype("int64").to_numpy(copy=True)
+
+        def read_side(side: str) -> tuple[np.ndarray, np.ndarray]:
+            price_cols = [f"{side}_price_{idx}" for idx in range(cfg.replay_levels)]
+            qty_cols = [f"{side}_qty_{idx}" for idx in range(cfg.replay_levels)]
+            prices = frame.loc[:, price_cols].to_numpy(dtype="float64", copy=False)
+            qtys = frame.loc[:, qty_cols].to_numpy(dtype="float64", copy=False)
+            valid = np.isfinite(prices) & np.isfinite(qtys) & (prices > 0.0) & (qtys > 0.0)
+            raw_ticks = np.rint(prices / cfg.tick_size)
+            ticks = np.where(valid, raw_ticks, -1).astype(np.int32, copy=False)
+            notional = np.where(valid, prices * qtys, 0.0).astype(np.float32, copy=False)
+            return np.ascontiguousarray(ticks), np.ascontiguousarray(notional)
+
+        bid_ticks, bid_notional = read_side("bid")
+        ask_ticks, ask_notional = read_side("ask")
+
+        replay = OrderBookReplayFrame(
+            timestamps=timestamps,
+            bid_ticks=bid_ticks,
+            ask_ticks=ask_ticks,
+            bid_notional=bid_notional,
+            ask_notional=ask_notional,
+        )
+        _ORDERBOOK_REPLAY_CACHE[key] = replay
+        _ORDERBOOK_REPLAY_CACHE_ORDER.append(key)
+        while len(_ORDERBOOK_REPLAY_CACHE_ORDER) > _ORDERBOOK_REPLAY_CACHE_MAX_DAYS:
+            old_key = _ORDERBOOK_REPLAY_CACHE_ORDER.pop(0)
+            if old_key != key:
+                _ORDERBOOK_REPLAY_CACHE.pop(old_key, None)
+        return replay
+
+    @staticmethod
+    def _align_orderbook_replay_frame(
+        *,
+        symbol: str,
+        date: str,
+        alpha_timestamps: np.ndarray,
+        replay: OrderBookReplayFrame,
+    ) -> OrderBookReplayFrame:
+        if len(alpha_timestamps) == len(replay.timestamps) and np.array_equal(
+            alpha_timestamps,
+            replay.timestamps,
+        ):
+            return replay
+
+        indices = np.searchsorted(replay.timestamps, alpha_timestamps)
+        if (
+            indices.shape[0] != alpha_timestamps.shape[0]
+            or np.any(indices >= len(replay.timestamps))
+            or not np.array_equal(replay.timestamps[indices], alpha_timestamps)
+        ):
+            raise ValueError(
+                "orderbook replay timestamp grid does not match sampled ticker "
+                f"for {symbol} {date}"
+            )
+        return OrderBookReplayFrame(
+            timestamps=np.array(alpha_timestamps, dtype=np.int64, copy=True),
+            bid_ticks=np.ascontiguousarray(replay.bid_ticks[indices]),
+            ask_ticks=np.ascontiguousarray(replay.ask_ticks[indices]),
+            bid_notional=np.ascontiguousarray(replay.bid_notional[indices]),
+            ask_notional=np.ascontiguousarray(replay.ask_notional[indices]),
+        )
+
     @staticmethod
     def _parse_spec(spec: dict[str, int | str], default_name: str) -> tuple[str, int]:
         name = str(spec.get("name", default_name)).strip().lower()
@@ -451,7 +550,11 @@ class BinanceEventLoader:
         return name, lookback
 
     @staticmethod
-    def _merge_sorted(alpha: pd.DataFrame, trades: pd.DataFrame) -> Iterator[MergedEventTuple]:
+    def _merge_sorted(
+        alpha: pd.DataFrame,
+        trades: pd.DataFrame,
+        replay: OrderBookReplayFrame | None = None,
+    ) -> Iterator[MergedEventTuple]:
         alpha_iter = iter(
             alpha.loc[
                 :,
@@ -473,6 +576,7 @@ class BinanceEventLoader:
         )
 
         alpha_row = next(alpha_iter, None)
+        alpha_idx = 0
         trade_row = next(trade_iter, None)
 
         while alpha_row is not None or trade_row is not None:
@@ -495,6 +599,10 @@ class BinanceEventLoader:
             instructor = float(alpha_row[3]) if math.isfinite(float(alpha_row[3])) else 0.0
             intensity = float(alpha_row[4]) if math.isfinite(float(alpha_row[4])) else 0.0
             volatility = float(alpha_row[5]) if math.isfinite(float(alpha_row[5])) else 0.0
+            bid_replay_ticks = None if replay is None else replay.bid_ticks[alpha_idx]
+            ask_replay_ticks = None if replay is None else replay.ask_ticks[alpha_idx]
+            bid_replay_notional = None if replay is None else replay.bid_notional[alpha_idx]
+            ask_replay_notional = None if replay is None else replay.ask_notional[alpha_idx]
             yield (
                 "ticker",
                 int(alpha_row[0]),
@@ -503,8 +611,10 @@ class BinanceEventLoader:
                 instructor,
                 intensity,
                 volatility,
+                bid_replay_ticks,
+                ask_replay_ticks,
+                bid_replay_notional,
+                ask_replay_notional,
             )
             alpha_row = next(alpha_iter, None)
-
-
-MarketDataLoader = BinanceEventLoader
+            alpha_idx += 1

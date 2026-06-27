@@ -255,10 +255,7 @@ class SamplerInstructorTest(unittest.TestCase):
             ).to_parquet(volatility_path, index=False)
 
             loader = BinanceEventLoader(
-                ticker_cache_root=root,
-                instructor_cache_root=root,
-                trade_intensity_cache_root=root,
-                volatility_cache_root=root,
+                cache_root=root,
                 scheme_shift=0,
             )
             alpha = loader._read_alpha_frame(
@@ -322,9 +319,7 @@ class SamplerInstructorTest(unittest.TestCase):
             ).to_parquet(intensity_path, index=False)
 
             loader = BinanceEventLoader(
-                ticker_cache_root=root,
-                trade_intensity_cache_root=root,
-                volatility_cache_root=root,
+                cache_root=root,
                 scheme_shift=scheme_shift,
             )
             alpha = loader._read_alpha_frame(

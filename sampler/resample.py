@@ -114,17 +114,12 @@ def ensure_paths(value: Any) -> tuple[Path, ...]:
     return tuple(paths)
 
 
-def config_paths(cfg: dict[str, Any], *keys: str, default: Path) -> tuple[Path, ...]:
+def config_paths(cfg: dict[str, Any], key: str, default: Path) -> tuple[Path, ...]:
     paths_cfg = cfg.get("paths", {})
-    for key in keys:
-        if key in paths_cfg:
-            roots = ensure_paths(paths_cfg[key])
-            if roots:
-                return roots
-        if key in cfg:
-            roots = ensure_paths(cfg[key])
-            if roots:
-                return roots
+    if key in paths_cfg:
+        roots = ensure_paths(paths_cfg[key])
+        if roots:
+            return roots
     return (default,)
 
 
@@ -767,8 +762,8 @@ def run_one(task: Task) -> str:
         )
 
 
-def _config_path(cfg: dict[str, Any], *keys: str, default: Path) -> Path:
-    return config_paths(cfg, *keys, default=default)[0]
+def _config_path(cfg: dict[str, Any], key: str, default: Path) -> Path:
+    return config_paths(cfg, key, default=default)[0]
 
 
 def build_tasks(cfg: dict[str, Any]) -> list[Task]:
@@ -798,13 +793,10 @@ def build_tasks(cfg: dict[str, Any]) -> list[Task]:
     bookticker_roots = config_paths(
         cfg,
         "bookticker_roots",
-        "bookticker_root",
-        "input_root",
         default=DEFAULT_BOOKTICKER_ROOT,
     )
     output_root = _config_path(
         cfg,
-        "ticker_cache_root",
         "output_root",
         default=DEFAULT_OUTPUT_ROOT,
     )
@@ -929,8 +921,6 @@ def build_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
                 config_paths(
                     cfg,
                     "bookticker_roots",
-                    "bookticker_root",
-                    "input_root",
                     default=DEFAULT_BOOKTICKER_ROOT,
                 )
             )

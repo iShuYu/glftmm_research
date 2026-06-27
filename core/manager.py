@@ -414,6 +414,82 @@ class Manager:
                 qty_steps=qty_steps,
             )
 
+    def _place_one_side_steps(
+        self,
+        is_ask: bool,
+        price_ticks: int | None,
+        qty_steps: int,
+        best_ask_ticks: int,
+        best_bid_ticks: int,
+        is_taker: bool,
+        close_only: bool,
+        replace: bool,
+    ) -> None:
+        if price_ticks is None or qty_steps <= 0:
+            if replace:
+                self.books.clear_side(is_ask)
+            return
+
+        qty_steps = int(qty_steps)
+        if close_only:
+            if is_ask and self.position_steps > 0:
+                qty_steps = min(qty_steps, self.position_steps)
+            elif (not is_ask) and self.position_steps < 0:
+                qty_steps = min(qty_steps, -self.position_steps)
+            else:
+                qty_steps = 0
+
+        if replace:
+            self.books.clear_side(is_ask)
+        if qty_steps <= 0:
+            return
+
+        is_aggressive = self.validator.is_aggressive_price(
+            is_ask,
+            int(price_ticks),
+            best_ask_ticks,
+            best_bid_ticks,
+        )
+        self.books.replace_order(
+            is_ask=is_ask,
+            is_taker=is_taker or is_aggressive,
+            price_ticks=int(price_ticks),
+            qty_steps=qty_steps,
+        )
+
+    def place_limit_order_steps(
+        self,
+        ask_price_ticks: int | None,
+        ask_qty_steps: int,
+        bid_price_ticks: int | None,
+        bid_qty_steps: int,
+        best_ask_ticks: int,
+        best_bid_ticks: int,
+        is_taker: bool = False,
+        close_only: bool = False,
+        replace: bool = True,
+    ) -> None:
+        self._place_one_side_steps(
+            is_ask=True,
+            price_ticks=ask_price_ticks,
+            qty_steps=ask_qty_steps,
+            best_ask_ticks=best_ask_ticks,
+            best_bid_ticks=best_bid_ticks,
+            is_taker=is_taker,
+            close_only=close_only,
+            replace=replace,
+        )
+        self._place_one_side_steps(
+            is_ask=False,
+            price_ticks=bid_price_ticks,
+            qty_steps=bid_qty_steps,
+            best_ask_ticks=best_ask_ticks,
+            best_bid_ticks=best_bid_ticks,
+            is_taker=is_taker,
+            close_only=close_only,
+            replace=replace,
+        )
+
     def place_maker(
         self,
         ask_price: float | None,
@@ -431,6 +507,27 @@ class Manager:
             bid_qty,
             best_ask,
             best_bid,
+            is_taker=False,
+            close_only=close_only,
+        )
+
+    def place_maker_steps(
+        self,
+        ask_price_ticks: int | None,
+        ask_qty_steps: int,
+        bid_price_ticks: int | None,
+        bid_qty_steps: int,
+        best_ask_ticks: int,
+        best_bid_ticks: int,
+        close_only: bool = False,
+    ) -> None:
+        self.place_limit_order_steps(
+            ask_price_ticks=ask_price_ticks,
+            ask_qty_steps=ask_qty_steps,
+            bid_price_ticks=bid_price_ticks,
+            bid_qty_steps=bid_qty_steps,
+            best_ask_ticks=best_ask_ticks,
+            best_bid_ticks=best_bid_ticks,
             is_taker=False,
             close_only=close_only,
         )
