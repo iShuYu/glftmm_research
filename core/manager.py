@@ -241,6 +241,10 @@ class Manager:
         if self.position_steps == 0:
             self.position.qty = 0.0
 
+    @staticmethod
+    def _is_ask_side(side: OrderSide | str) -> bool:
+        return OrderSide(side) == OrderSide.SELL
+
     def _emit_fill(
         self,
         trade_time: int,
@@ -490,6 +494,55 @@ class Manager:
             replace=replace,
         )
 
+    def place_limit_order_steps_side(
+        self,
+        side: OrderSide | str,
+        price_ticks: int | None,
+        qty_steps: int,
+        best_ask_ticks: int,
+        best_bid_ticks: int,
+        is_taker: bool = False,
+        close_only: bool = False,
+        replace: bool = True,
+    ) -> None:
+        self._place_one_side_steps(
+            is_ask=self._is_ask_side(side),
+            price_ticks=price_ticks,
+            qty_steps=qty_steps,
+            best_ask_ticks=best_ask_ticks,
+            best_bid_ticks=best_bid_ticks,
+            is_taker=is_taker,
+            close_only=close_only,
+            replace=replace,
+        )
+
+    def place_limit_levels_side(
+        self,
+        side: OrderSide | str,
+        levels: Sequence[tuple[float, float]],
+        best_ask: float,
+        best_bid: float,
+        is_taker: bool = False,
+        close_only: bool = False,
+        replace: bool = True,
+    ) -> None:
+        is_ask = self._is_ask_side(side)
+        best_ask_ticks = self.converter.to_ticks(best_ask)
+        best_bid_ticks = self.converter.to_ticks(best_bid)
+        if replace:
+            self.books.clear_side(is_ask)
+        for price, qty in levels:
+            self._place_one_side(
+                is_ask=is_ask,
+                price=price,
+                qty=qty,
+                best_ask_ticks=best_ask_ticks,
+                best_bid_ticks=best_bid_ticks,
+                is_taker=is_taker,
+                close_only=close_only,
+                replace=False,
+            )
+
     def place_maker(
         self,
         ask_price: float | None,
@@ -532,6 +585,25 @@ class Manager:
             close_only=close_only,
         )
 
+    def place_maker_steps_side(
+        self,
+        side: OrderSide | str,
+        price_ticks: int | None,
+        qty_steps: int,
+        best_ask_ticks: int,
+        best_bid_ticks: int,
+        close_only: bool = False,
+    ) -> None:
+        self.place_limit_order_steps_side(
+            side=side,
+            price_ticks=price_ticks,
+            qty_steps=qty_steps,
+            best_ask_ticks=best_ask_ticks,
+            best_bid_ticks=best_bid_ticks,
+            is_taker=False,
+            close_only=close_only,
+        )
+
     def place_maker_levels(
         self,
         ask_levels: Sequence[tuple[float, float]],
@@ -543,6 +615,23 @@ class Manager:
         self.place_limit_levels(
             ask_levels=ask_levels,
             bid_levels=bid_levels,
+            best_ask=best_ask,
+            best_bid=best_bid,
+            is_taker=False,
+            close_only=close_only,
+        )
+
+    def place_maker_levels_side(
+        self,
+        side: OrderSide | str,
+        levels: Sequence[tuple[float, float]],
+        best_ask: float,
+        best_bid: float,
+        close_only: bool = False,
+    ) -> None:
+        self.place_limit_levels_side(
+            side=side,
+            levels=levels,
             best_ask=best_ask,
             best_bid=best_bid,
             is_taker=False,

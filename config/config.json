@@ -3,28 +3,19 @@
     "BTCUSDT"
   ],
   "date_start": "2025-01-02",
-  "date_end": "2026-06-01",
+  "date_end": "2025-12-31",
+  "daily_parallel": true,
   "paths": {
     "input_path": "/data/users/data-helper/PROCESSED/TARDIS/BINANCE/UFUTURES",
     "input_backup_path": "/home/kang/data_helper/PROCESSED/DATA_RECORDER/BINANCE/UFUTURES",
-    "output_path": "/data/users/kang/backtest/glftmm/cached",
-    "output_dir": "/data/users/kang/backtest/glftmm/result",
+    "output_dir": "/data/users/kang/backtest/glftmm_tick/result",
     "trade_category": "TRADE",
-    "scheme_shift": 0
-  },
-  "orderbook_path": "/home/kang/data/wallmaker/cached",
-  "orderbook_replay": {
-    "replay_levels": 1000,
-    "sample_interval_ms": 1000,
-    "tick_size": 0.1,
-    "depth_price_min": 20000.0,
-    "depth_price_max": 200000.0,
-    "raw_quantity_max": 10000.0
+    "ticker_category": "BOOKTICKER"
   },
   "simulation": {
     "mode": [
-      1,
-      0
+      0,
+      1
     ],
     "latency": [
       2
@@ -44,27 +35,6 @@
     "min_order_notional": [
       100.0
     ],
-    "freq": [
-      1000
-    ],
-    "name_intensity": [
-      "k"
-    ],
-    "name_volatility": [
-      "sigma"
-    ],
-    "name_instructor": [
-      "bbo_imbalance"
-    ],
-    "lookback_volatility": [
-      300
-    ],
-    "lookback_instructor": [
-      0
-    ],
-    "lookback_intensity": [
-      300
-    ],
     "max_holding_time": [
       -1
     ],
@@ -79,71 +49,45 @@
     ],
     "adj_spread_intensity": [
       [
-        2.0,
-        2.0
-      ],
-      [
-        2.5,
-        2.5
-      ]
-    ],
-    "adj_spread_volatility": [
-      [
-        0,
-        0
+        1.0,
+        1.0
       ]
     ],
     "min_quote_distance_bps": [
-      0,
-      0.1,
-      0.5
-    ],
-    "adj_spread_instructor": [
-      0
+      0.1
     ],
     "passive_only": [
       true
     ],
-    "optimize_by_orderbook": [
-      -1
-    ],
     "inventory_skew": [
       [
-        100,
+        0,
         1
-      ],
-      [
-        50,
-        1
-      ],
-      [
-        100,
-        2
       ]
     ],
     "open_curve": [
       [
-        5,
-        5,
+        1,
+        1,
         1
       ]
     ],
     "close_curve": [
       [
-        5,
-        5,
+        1,
+        1,
         1
       ]
     ],
     "boost_underwater": [
       [
         1,
-        0.2
+        1
       ]
     ],
     "boost_profitzone": [
       [
-        0,
+        1,
         1
       ]
     ],
@@ -165,6 +109,6 @@
     "summary_csv": "strategy_summary.csv"
   },
   "parallel": {
-    "num_workers": 36
+    "num_workers": 32
   }
 }

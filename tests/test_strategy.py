@@ -1,57 +1,50 @@
 import unittest
 
-import numpy as np
+import pandas as pd
 
 from core.position import Position
-from sim.loader import BinanceEventLoader, OrderBookReplayFrame
-from sim.report import _limit_plot_frame, _normalize_report_columns, load_report_frame
-from sim.strategy import (
-    get_minimum_size,
-    SimpleMakerStrategy,
-    SimulationConfig,
-)
 from run_strategy import (
-    _build_tasks,
     _build_simulation_config,
+    _build_tasks,
     _normalize_sim_param_map,
-    _state_cost_notional_usdt,
-    _state_total_pnl,
+    build_param_path_parts,
 )
+from sim.loader import BinanceEventLoader, build_confirmed_aggtrade_events
+from sim.report import (
+    _compute_daily_pnl_from_total,
+    _parse_daily_parallel_from_folder,
+    _stitch_daily_parallel_frame,
+    _stitch_daily_parallel_series,
+)
+from sim.strategy import SimpleMakerStrategy, SimulationConfig, get_minimum_size
 
 
 def make_config(**overrides):
     values = {
-        "freq": 1000,
         "latency": 0,
         "price_precision": 1,
         "qty_precision": 3,
         "mode": 1,
         "taker_fee": 0.00025,
         "maker_fee": -0.00003,
-        "name_intensity": "k",
-        "lookback_intensity": 300,
-        "name_volatility": "sigma",
-        "lookback_volatility": 300,
         "max_position_usdt": 100000.0,
         "max_open_inventory_utilization": 1.0,
         "max_holding_time": -1,
         "adj_spread_intensity": (1.0, 1.0),
-        "adj_spread_instructor": 0.0,
         "passive_only": False,
-        "optimize_by_orderbook": -1,
-        "adj_spread_volatility": (0.0, 0.0),
         "min_quote_distance_bps": 0.0,
         "inventory_skew": (0.0, 1.0),
         "min_order_qty": 0.0,
         "min_order_notional": 0.0,
         "stoploss": 0.0,
-        "open_curve": (1000.0, 1000.0, 1.0),
-        "close_curve": (1000.0, 1000.0, 1.0),
+        "open_curve": None,
+        "close_curve": None,
         "boost_underwater": (1.0, 1.0),
         "boost_profitzone": (1.0, 1.0),
         "cooldown_time": 0,
         "strict_mode": True,
         "simple_mode": True,
+        "daily_parallel": False,
     }
     values.update(overrides)
     return SimulationConfig(**values)
@@ -59,25 +52,17 @@ def make_config(**overrides):
 
 def raw_config(**overrides):
     values = {
-        "freq": 1000,
         "latency": 0,
         "price_precision": 1,
         "qty_precision": 3,
         "mode": 1,
         "taker_fee": 0.00025,
         "maker_fee": -0.00003,
-        "name_intensity": "k",
-        "lookback_intensity": 300,
-        "name_volatility": "sigma",
-        "lookback_volatility": 300,
         "max_position_usdt": 100000.0,
         "max_open_inventory_utilization": 1.0,
         "max_holding_time": -1,
         "adj_spread_intensity": [1.0, 1.0],
-        "adj_spread_instructor": 0.0,
         "passive_only": False,
-        "optimize_by_orderbook": -1,
-        "adj_spread_volatility": [0.0, 0.0],
         "min_quote_distance_bps": 0.0,
         "min_order_qty": 0.0,
         "min_order_notional": 0.0,
@@ -104,69 +89,75 @@ def raw_task_config(**overrides):
     return cfg
 
 
-def set_position(engine, qty, cost):
-    engine.manager.position.qty = qty
-    engine.manager.position.cost = cost
-    engine.manager._sync_position_steps()
-
-
-def price_levels(engine, book):
-    return [
-        (
-            round(engine.manager.converter.from_ticks(price), engine.sim.price_precision),
-            round(engine.manager.converter.from_steps(qty), engine.sim.qty_precision),
-        )
-        for price, qty in book.snapshot()
-    ]
-
-
 class StaticEventLoader:
     def __init__(self, events):
         self.events = list(events)
         self.calls = []
 
-    def iter_merged_alpha_trade_tuples(self, **kwargs):
+    def iter_merged_trade_intensity_tuples(self, **kwargs):
         self.calls.append(kwargs)
         yield from self.events
 
 
-class LoaderReplayAlignmentTest(unittest.TestCase):
-    def test_orderbook_replay_alignment_allows_finer_grid(self):
-        replay = OrderBookReplayFrame(
-            timestamps=np.array([1000, 2000, 3000, 4000, 5000], dtype=np.int64),
-            bid_ticks=np.array([[1], [2], [3], [4], [5]], dtype=np.int32),
-            ask_ticks=np.array([[11], [12], [13], [14], [15]], dtype=np.int32),
-            bid_notional=np.array([[100.0], [200.0], [300.0], [400.0], [500.0]], dtype=np.float32),
-            ask_notional=np.array([[110.0], [120.0], [130.0], [140.0], [150.0]], dtype=np.float32),
+class AggTradeIntensityLoaderTest(unittest.TestCase):
+    def test_confirmed_aggtrade_uses_next_opposite_side_trade_as_timestamp(self):
+        trades = pd.DataFrame(
+            {
+                "timestamp": [1, 2, 3, 4],
+                "is_buyer_maker": [False, False, True, True],
+                "price": [100.0, 102.0, 101.0, 99.0],
+                "volume": [1.0, 2.0, 3.0, 4.0],
+            }
         )
 
-        aligned = BinanceEventLoader._align_orderbook_replay_frame(
-            symbol="BTCUSDT",
-            date="2025-01-01",
-            alpha_timestamps=np.array([2000, 4000], dtype=np.int64),
-            replay=replay,
+        events = build_confirmed_aggtrade_events(trades, force_close_timestamp=9)
+
+        self.assertEqual(events["timestamp"].tolist(), [3, 9])
+        self.assertEqual(events["is_buyer_maker"].tolist(), [False, True])
+        self.assertEqual(events["impact"].tolist(), [2.0, 2.0])
+        self.assertEqual(events["volume"].tolist(), [3.0, 7.0])
+        self.assertEqual(events["forced_close"].tolist(), [False, True])
+
+    def test_merge_events_emits_trade_before_bbo_before_aggtrade(self):
+        trades = pd.DataFrame(
+            {
+                "timestamp": [1000],
+                "is_buyer_maker": [False],
+                "price": [100.0],
+                "volume": [1.0],
+            }
+        )
+        bookticker = pd.DataFrame(
+            {
+                "timestamp": [1000],
+                "best_bid_price": [99.0],
+                "best_ask_price": [101.0],
+                "best_bid_qty": [2.0],
+                "best_ask_qty": [3.0],
+            }
+        )
+        aggtrades = pd.DataFrame(
+            {
+                "timestamp": [1000],
+                "is_buyer_maker": [False],
+                "impact": [1.5],
+                "intensity": [1.5],
+                "volume": [1.0],
+                "first_price": [100.0],
+                "last_price": [101.5],
+                "forced_close": [False],
+            }
         )
 
-        self.assertEqual(aligned.timestamps.tolist(), [2000, 4000])
-        self.assertEqual(aligned.bid_ticks.tolist(), [[2], [4]])
-        self.assertEqual(aligned.ask_notional.tolist(), [[120.0], [140.0]])
-
-    def test_orderbook_replay_alignment_requires_exact_timestamps(self):
-        replay = OrderBookReplayFrame(
-            timestamps=np.array([1000, 3000], dtype=np.int64),
-            bid_ticks=np.array([[1], [3]], dtype=np.int32),
-            ask_ticks=np.array([[11], [13]], dtype=np.int32),
-            bid_notional=np.array([[100.0], [300.0]], dtype=np.float32),
-            ask_notional=np.array([[110.0], [130.0]], dtype=np.float32),
-        )
-
-        with self.assertRaisesRegex(ValueError, "timestamp grid"):
-            BinanceEventLoader._align_orderbook_replay_frame(
-                symbol="BTCUSDT",
-                date="2025-01-01",
-                alpha_timestamps=np.array([2000], dtype=np.int64),
-                replay=replay,
+        events = list(
+            BinanceEventLoader._merge_events(
+                trades=trades,
+                bookticker=bookticker,
+                aggtrades=aggtrades,
             )
+        )
+
+        self.assertEqual([event[0] for event in events], ["trade", "bookticker", "aggtrade"])
 
 
 class PositionNotionalTest(unittest.TestCase):
@@ -180,11 +171,6 @@ class PositionNotionalTest(unittest.TestCase):
         self.assertEqual(pos.gross_cost_notional_usdt, 200.0)
         self.assertEqual(pos.unrealized_pnl, 20.0)
 
-        pos.mark(80.0)
-        self.assertEqual(pos.mark_notional_usdt, 160.0)
-        self.assertEqual(pos.cost_notional_usdt, 200.0)
-        self.assertEqual(pos.unrealized_pnl, -40.0)
-
     def test_short_notional_preserves_sign(self):
         pos = Position()
         pos.execute(qty=-2.0, price=100.0)
@@ -197,180 +183,49 @@ class PositionNotionalTest(unittest.TestCase):
 
 
 class StrategyConfigTest(unittest.TestCase):
-    def test_build_config_accepts_single_max_position_and_stoploss(self):
-        cfg = _build_simulation_config(
-            raw_config(
-                max_position_usdt=250.0,
-                stoploss=25.0,
-            )["simulation"]
-        )
+    def test_build_config_has_no_removed_axes(self):
+        cfg = _build_simulation_config(raw_config(adj_spread_intensity=[2.0, 0.5])["simulation"])
 
-        self.assertEqual(cfg.max_position_usdt, 250.0)
-        self.assertEqual(cfg.total_max_position_usdt, 250.0)
-        self.assertEqual(cfg.stoploss, 25.0)
+        self.assertFalse(hasattr(cfg, "fr" + "eq"))
+        self.assertFalse(hasattr(cfg, "name_" + "intensity"))
+        self.assertFalse(hasattr(cfg, "lookback_" + "intensity"))
+        self.assertFalse(hasattr(cfg, "name_" + "instr" + "uctor"))
+        self.assertFalse(hasattr(cfg, "name_" + "vola" + "tility"))
+        self.assertEqual(cfg.adj_spread_intensity, (2.0, 0.5))
 
-    def test_rejects_lot_shaped_max_position_and_stoploss(self):
-        with self.assertRaisesRegex(ValueError, "max_position_usdt must be a number"):
-            _build_simulation_config(
-                raw_config(
-                    max_position_usdt=[250.0, 750.0],
-                    stoploss=25.0,
-                )["simulation"]
-            )
+    def test_normalize_rejects_removed_simulation_keys(self):
+        removed = {
+            "fr" + "eq": 1000,
+            "name_" + "intensity": "k",
+            "lookback_" + "intensity": 300,
+            "name_" + "instr" + "uctor": "bbo_imbalance",
+            "lookback_" + "instr" + "uctor": 0,
+            "adj_spread_" + "instr" + "uctor": 0.0,
+            "name_" + "vola" + "tility": "sigma",
+            "lookback_" + "vola" + "tility": 300,
+            "adj_spread_" + "vola" + "tility": [0.0, 0.0],
+            "optimize_by_" + "orderbook": -1,
+            "event_driven_" + "quotes": True,
+        }
+        for key, value in removed.items():
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError, "unknown simulation keys"):
+                    _normalize_sim_param_map(raw_config(**{key: value}))
 
-        with self.assertRaisesRegex(ValueError, "stoploss must be a number"):
-            _build_simulation_config(
-                raw_config(
-                    max_position_usdt=250.0,
-                    stoploss=[25.0, 75.0],
-                )["simulation"]
-            )
-
-    def test_normalizes_max_position_and_stoploss_as_parameter_grids(self):
-        sim_map = _normalize_sim_param_map(
-            raw_config(
-                max_position_usdt=[250.0, 750.0],
-                max_open_inventory_utilization=[0.5, 0.8],
-                stoploss=[25.0, 75.0],
-                cooldown_time=[20_000, 30_000],
-            )
-        )
-
-        self.assertEqual(sim_map["max_position_usdt"], [250.0, 750.0])
-        self.assertEqual(sim_map["max_open_inventory_utilization"], [0.5, 0.8])
-        self.assertEqual(sim_map["stoploss"], [25.0, 75.0])
-        self.assertEqual(sim_map["cooldown_time"], [20_000, 30_000])
-
-    def test_build_config_parses_max_open_inventory_utilization(self):
-        cfg = _build_simulation_config(
-            raw_config(max_open_inventory_utilization=0.75)["simulation"]
-        )
-
-        self.assertEqual(cfg.max_open_inventory_utilization, 0.75)
-
-    def test_build_config_parses_close_curve(self):
-        cfg = _build_simulation_config(
-            raw_config(close_curve=[0.0, 2.0, 1.0])["simulation"]
-        )
-
-        self.assertEqual(cfg.close_curve, (0.0, 2.0, 1.0))
-
-    def test_build_config_parses_open_close_spread_adjustments(self):
-        cfg = _build_simulation_config(
-            raw_config(
-                adj_spread_intensity=[3.0, 1.0],
-                adj_spread_volatility=[0.5, 0.0],
-            )["simulation"]
-        )
-
-        self.assertEqual(cfg.adj_spread_intensity, (3.0, 1.0))
-        self.assertEqual(cfg.adj_spread_volatility, (0.5, 0.0))
-
-    def test_build_config_parses_underwater_and_profitzone_boosts(self):
-        cfg = _build_simulation_config(
-            raw_config(
-                boost_underwater=[2.0, 0.5],
-                boost_profitzone=[0.25, 3.0],
-            )["simulation"]
-        )
-
-        self.assertEqual(cfg.boost_underwater, (2.0, 0.5))
-        self.assertEqual(cfg.boost_profitzone, (0.25, 3.0))
-
-    def test_build_config_parses_simple_mode(self):
-        cfg = _build_simulation_config(raw_config(simple_mode=False)["simulation"])
-
-        self.assertFalse(cfg.simple_mode)
-
-    def test_build_config_parses_strict_mode(self):
-        cfg = _build_simulation_config(raw_config(strict_mode=False)["simulation"])
-
-        self.assertFalse(cfg.strict_mode)
-
-    def test_build_config_parses_optimize_by_orderbook(self):
-        cfg = _build_simulation_config(
-            raw_config(optimize_by_orderbook=1000)["simulation"]
-        )
-
-        self.assertEqual(cfg.optimize_by_orderbook, 1000.0)
-
-    def test_build_config_parses_min_quote_distance_bps(self):
-        cfg = _build_simulation_config(
-            raw_config(min_quote_distance_bps=20.5)["simulation"]
-        )
-
-        self.assertEqual(cfg.min_quote_distance_bps, 20.5)
-
-    def test_build_config_rejects_boolean_optimize_by_orderbook(self):
-        with self.assertRaisesRegex(ValueError, "optimize_by_orderbook"):
-            _build_simulation_config(
-                raw_config(optimize_by_orderbook=True)["simulation"]
-            )
-
-    def test_build_config_rejects_negative_min_quote_distance_bps(self):
-        with self.assertRaisesRegex(ValueError, "min_quote_distance_bps"):
-            _build_simulation_config(
-                raw_config(min_quote_distance_bps=-0.1)["simulation"]
-            )
-
-    def test_build_config_rejects_legacy_min_quote_distance_ticks(self):
-        with self.assertRaisesRegex(ValueError, "min_quote_distance_bps"):
-            _build_simulation_config(
-                raw_config(min_quote_distance_ticks=20)["simulation"]
-            )
-
-    def test_normalizes_close_curve_rows(self):
-        sim_map = _normalize_sim_param_map(
-            raw_config(close_curve=[[0.0, 1.0, 0.0], [0.0, 2.0, 1.0]])
-        )
-
-        self.assertEqual(
-            sim_map["close_curve"],
-            [[0.0, 1.0, 0.0], [0.0, 2.0, 1.0]],
-        )
-
-    def test_normalizes_open_close_spread_adjustment_rows(self):
+    def test_normalizes_open_close_spread_and_boost_rows(self):
         sim_map = _normalize_sim_param_map(
             raw_config(
                 adj_spread_intensity=[[3.0, 1.0], [4.0, 1.5]],
-                adj_spread_volatility=[[0.5, 0.0], [1.0, 0.25]],
-            )
-        )
-
-        self.assertEqual(
-            sim_map["adj_spread_intensity"],
-            [[3.0, 1.0], [4.0, 1.5]],
-        )
-        self.assertEqual(
-            sim_map["adj_spread_volatility"],
-            [[0.5, 0.0], [1.0, 0.25]],
-        )
-
-    def test_normalizes_underwater_and_profitzone_boost_rows(self):
-        sim_map = _normalize_sim_param_map(
-            raw_config(
                 boost_underwater=[[2.0, 0.5], [3.0, 0.25]],
                 boost_profitzone=[[0.5, 2.0], [0.25, 3.0]],
             )
         )
 
-        self.assertEqual(
-            sim_map["boost_underwater"],
-            [[2.0, 0.5], [3.0, 0.25]],
-        )
-        self.assertEqual(
-            sim_map["boost_profitzone"],
-            [[0.5, 2.0], [0.25, 3.0]],
-        )
+        self.assertEqual(sim_map["adj_spread_intensity"], [[3.0, 1.0], [4.0, 1.5]])
+        self.assertEqual(sim_map["boost_underwater"], [[2.0, 0.5], [3.0, 0.25]])
+        self.assertEqual(sim_map["boost_profitzone"], [[0.5, 2.0], [0.25, 3.0]])
 
-    def test_normalizes_optimize_by_orderbook_rows(self):
-        sim_map = _normalize_sim_param_map(
-            raw_config(optimize_by_orderbook=[-1, 0, 1000])
-        )
-
-        self.assertEqual(sim_map["optimize_by_orderbook"], [-1.0, 0.0, 1000.0])
-
-    def test_build_tasks_crosses_max_position_and_stoploss_grids(self):
+    def test_build_tasks_crosses_remaining_parameter_grids(self):
         tasks = _build_tasks(
             raw_task_config(
                 mode=[0, 1],
@@ -380,1199 +235,341 @@ class StrategyConfigTest(unittest.TestCase):
         )
 
         self.assertEqual(len(tasks), 8)
-        pairs = {
-            (
-                task.sim_params["max_position_usdt"],
-                task.sim_params["stoploss"],
-            )
-            for task in tasks
-        }
-        self.assertEqual(
-            pairs,
-            {
-                (250.0, 50.0),
-                (250.0, 100.0),
-                (500.0, 50.0),
-                (500.0, 100.0),
-            },
-        )
         self.assertEqual([task.sim_params["mode"] for task in tasks].count(0), 4)
         self.assertEqual([task.sim_params["mode"] for task in tasks].count(1), 4)
 
-    def test_build_config_parses_instructor_alpha_adjustment(self):
-        cfg = _build_simulation_config(
-            raw_config(
-                name_instructor="trade_imbalance",
-                lookback_instructor=5,
-                adj_spread_instructor=-1e-5,
-                passive_only=True,
-            )["simulation"]
-        )
-
-        self.assertEqual(cfg.name_instructor, "trade_imbalance")
-        self.assertEqual(cfg.lookback_instructor, 5)
-        self.assertEqual(cfg.adj_spread_instructor, -1e-5)
-        self.assertTrue(cfg.passive_only)
-
-    def test_build_config_allows_bbo_imbalance_zero_lookback(self):
-        cfg = _build_simulation_config(
-            raw_config(
-                name_instructor="bbo_imbalance",
-                lookback_instructor=0,
-            )["simulation"]
-        )
-
-        self.assertEqual(cfg.name_instructor, "bbo_imbalance")
-        self.assertEqual(cfg.lookback_instructor, 0)
-
-    def test_zero_spread_adjustments_prune_inactive_task_axes(self):
-        cfg = raw_config(
-            name_intensity="k",
-            lookback_intensity=[100, 300],
-            name_instructor="trade_imbalance",
-            lookback_instructor=[1, 5],
-            name_volatility="sigma",
-            lookback_volatility=[300, 600],
-            adj_spread_intensity=[0.0, 0.0],
-            adj_spread_instructor=0.0,
-            adj_spread_volatility=[0.0, 0.0],
-        )
-        cfg["symbols"] = ["BTCUSDT"]
-        cfg["date_start"] = "2025-01-02"
-        cfg["date_end"] = "2025-01-02"
+    def test_daily_parallel_fans_out_tasks_by_day(self):
+        cfg = raw_task_config(mode=[0, 1])
+        cfg["date_end"] = "2025-01-03"
+        cfg["daily_parallel"] = True
 
         tasks = _build_tasks(cfg)
 
-        self.assertEqual(len(tasks), 1)
-        self.assertNotIn("name_intensity", tasks[0].sim_params)
-        self.assertNotIn("lookback_intensity", tasks[0].sim_params)
-        self.assertNotIn("name_instructor", tasks[0].sim_params)
-        self.assertNotIn("lookback_instructor", tasks[0].sim_params)
-        self.assertNotIn("name_volatility", tasks[0].sim_params)
-        self.assertNotIn("lookback_volatility", tasks[0].sim_params)
+        self.assertEqual(len(tasks), 6)
+        self.assertTrue(all(len(task.dates) == 1 for task in tasks))
+        self.assertEqual(
+            sorted((task.sim_params["mode"], task.dates[0]) for task in tasks),
+            [
+                (0, "2025-01-01"),
+                (0, "2025-01-02"),
+                (0, "2025-01-03"),
+                (1, "2025-01-01"),
+                (1, "2025-01-02"),
+                (1, "2025-01-03"),
+            ],
+        )
 
-    def test_zero_spread_adjustments_skip_feature_specs(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                name_instructor="trade_imbalance",
-                lookback_instructor=1,
-                name_volatility="sigma",
-                lookback_volatility=300,
-                adj_spread_intensity=[0.0, 0.0],
-                adj_spread_instructor=0.0,
-                adj_spread_volatility=[0.0, 0.0],
+    def test_non_daily_parallel_keeps_dates_in_one_task(self):
+        cfg = raw_task_config(mode=[0, 1])
+        cfg["date_end"] = "2025-01-03"
+
+        tasks = _build_tasks(cfg)
+
+        self.assertEqual(len(tasks), 2)
+        self.assertTrue(
+            all(
+                task.dates == ["2025-01-01", "2025-01-02", "2025-01-03"]
+                for task in tasks
             )
         )
 
-        self.assertIsNone(engine._selected_intensity_spec())
-        self.assertIsNone(engine._selected_instructor_spec())
-        self.assertEqual(engine._selected_volatility_specs(), [])
-
-    def test_zero_instructor_adjustment_does_not_request_instructor_file(self):
-        loader = StaticEventLoader([])
-        engine = SimpleMakerStrategy(
-            make_config(
-                name_instructor="bbo_imbalance",
-                lookback_instructor=0,
-                name_volatility="sigma",
-                lookback_volatility=300,
-                adj_spread_intensity=[2.0, 1.0],
-                adj_spread_instructor=0.0,
-                adj_spread_volatility=[0.0, 0.0],
-            ),
-            loader=loader,
+    def test_daily_parallel_path_uses_parseable_token(self):
+        sim_dir, _strat_dir = build_param_path_parts(
+            {"mode": 0, "daily_parallel": True}
         )
 
-        engine.run_day(symbol="BTCUSDT", date="2025-01-02")
+        self.assertIn("dp1", sim_dir)
+        self.assertTrue(
+            _parse_daily_parallel_from_folder(f"/tmp/BTCUSDT/{sim_dir}/strat__all")
+        )
+        self.assertTrue(
+            _parse_daily_parallel_from_folder(
+                "/tmp/BTCUSDT/sim__daily_paralleltrue__md0/strat__all"
+            )
+        )
+        self.assertFalse(
+            _parse_daily_parallel_from_folder("/tmp/BTCUSDT/sim__md0/strat__all")
+        )
 
-        self.assertEqual(len(loader.calls), 1)
-        self.assertIsNotNone(loader.calls[0]["trade_intensity_spec"])
-        self.assertIsNone(loader.calls[0]["instructor_spec"])
-        self.assertEqual(loader.calls[0]["volatility_specs"], [])
+
+class ReportDailyParallelTest(unittest.TestCase):
+    def test_stitches_independent_daily_pnl_frames(self):
+        df = pd.DataFrame(
+            {
+                "datetime": pd.to_datetime(
+                    [
+                        "2025-01-01 00:00:00",
+                        "2025-01-01 23:59:00",
+                        "2025-01-02 00:00:00",
+                        "2025-01-02 23:59:00",
+                    ]
+                ),
+                "total_pnl": [0.0, 10.0, 0.0, 5.0],
+                "realized_pnl": [0.0, 8.0, 0.0, 4.0],
+                "unrealized_pnl": [0.0, 2.0, 0.0, 1.0],
+                "traded_volume": [0.0, 100.0, 0.0, 20.0],
+            }
+        )
+
+        stitched = _stitch_daily_parallel_frame(df)
+
+        self.assertEqual(stitched["total_pnl"].tolist(), [0.0, 10.0, 10.0, 15.0])
+        self.assertEqual(stitched["realized_pnl"].tolist(), [0.0, 8.0, 8.0, 12.0])
+        self.assertEqual(stitched["traded_volume"].tolist(), [0.0, 100.0, 100.0, 120.0])
+        self.assertEqual(stitched["unrealized_pnl"].tolist(), [0.0, 2.0, 0.0, 1.0])
+
+    def test_stitches_daily_state_series_and_keeps_first_daily_pnl(self):
+        totals = pd.Series([10.0, 5.0], index=["20250101", "20250102"])
+        volumes = pd.Series([100.0, 20.0], index=["20250101", "20250102"])
+
+        stitched_total, stitched_volume = _stitch_daily_parallel_series(totals, volumes)
+
+        self.assertEqual(stitched_total.tolist(), [10.0, 15.0])
+        self.assertEqual(stitched_volume.tolist(), [100.0, 120.0])
+        self.assertEqual(_compute_daily_pnl_from_total(stitched_total).tolist(), [10.0, 5.0])
 
 
 class StrategyQuoteTest(unittest.TestCase):
     def test_get_minimum_size_rounds_up_to_qty_precision(self):
         self.assertEqual(
-            get_minimum_size(mid=30_000.0, qty_precision=3, min_order_notional=100.0),
+            get_minimum_size(mid=30000.0, qty_precision=3, min_order_notional=100.0),
             0.004,
         )
         self.assertEqual(
             get_minimum_size(mid=100.0, qty_precision=3, min_order_notional=0.0),
             0.001,
         )
-        self.assertEqual(
-            get_minimum_size(
-                mid=100.0,
-                qty_precision=3,
-                min_order_notional=0.0,
-                min_order_qty=0.01,
+
+    def test_quote_distance_is_pure_intensity(self):
+        engine = SimpleMakerStrategy(make_config(adj_spread_intensity=(2.0, 0.5)))
+
+        self.assertEqual(engine._quote_distance(intensity_base=3.0, close=False), 6.0)
+        self.assertEqual(engine._quote_distance(intensity_base=3.0, close=True), 1.5)
+
+    def test_run_day_places_only_aggtrade_side_quote(self):
+        loader = StaticEventLoader(
+            [
+                ("bookticker", 1000, 100.0, 101.0, 1.0, 1.0),
+                ("aggtrade", 1000, False, 2.0, 2.0, 1.0, 101.0, 103.0),
+            ]
+        )
+        engine = SimpleMakerStrategy(
+            make_config(
+                adj_spread_intensity=(1.0, 1.0),
+                min_order_notional=10.0,
+                inventory_skew=None,
             ),
-            0.01,
+            loader=loader,
         )
 
-    def test_instructor_shifts_open_quotes_in_mid_price_units(self):
-        engine = SimpleMakerStrategy(make_config(adj_spread_instructor=0.002))
+        day = engine.run_day(symbol="BTCUSDT", date="2025-01-01")
+        books = engine.manager.snapshot_ticks()
 
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.8,
-            best_ask=100.2,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-            instructor_value=0.5,
+        self.assertEqual(loader.calls, [{"symbol": "BTCUSDT", "date": "2025-01-01"}])
+        self.assertEqual(len(day), 1)
+        self.assertEqual(engine.snapshot_state()["latest_buy_intensity"], 2.0)
+        self.assertEqual(engine.snapshot_state()["latest_sell_intensity"], 0.0)
+        self.assertEqual(books["ask_maker"][0][0], 1030)
+        self.assertGreater(books["ask_maker"][0][1], 0)
+        self.assertEqual(books["bid_maker"], [])
+
+    def test_zero_intensity_aggtrade_does_not_place_quotes(self):
+        loader = StaticEventLoader(
+            [
+                ("bookticker", 1000, 100.0, 101.0, 1.0, 1.0),
+                ("aggtrade", 1000, False, 0.0, 0.0, 1.0, 101.0, 101.0),
+            ]
         )
-
-        self.assertEqual(
-            price_levels(engine, engine.manager.books.ask_maker),
-            [(100.3, 1.0)],
-        )
-        self.assertEqual(
-            price_levels(engine, engine.manager.books.bid_maker),
-            [(99.9, 1.0)],
-        )
-
-    def test_passive_only_clips_alpha_shift_crossing_ask(self):
-        engine = SimpleMakerStrategy(
-            make_config(adj_spread_instructor=-0.002, passive_only=True)
-        )
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.8,
-            best_ask=100.2,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-            instructor_value=0.5,
-        )
-
-        self.assertEqual(
-            price_levels(engine, engine.manager.books.ask_maker),
-            [(100.2, 1.0)],
-        )
-        self.assertEqual(
-            price_levels(engine, engine.manager.books.bid_maker),
-            [(99.7, 1.0)],
-        )
-
-    def test_passive_only_clips_alpha_shift_crossing_bid(self):
-        engine = SimpleMakerStrategy(
-            make_config(adj_spread_instructor=0.002, passive_only=True)
-        )
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.8,
-            best_ask=100.2,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-            instructor_value=0.5,
-        )
-
-        self.assertEqual(
-            price_levels(engine, engine.manager.books.ask_maker),
-            [(100.3, 1.0)],
-        )
-        self.assertEqual(
-            price_levels(engine, engine.manager.books.bid_maker),
-            [(99.8, 1.0)],
-        )
-
-    def test_passive_only_ignores_tightening_alpha_without_clipping_distance(self):
-        engine = SimpleMakerStrategy(
-            make_config(adj_spread_instructor=0.002, passive_only=True)
-        )
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.8,
-            best_ask=100.2,
-            intensity_value=0.2,
-            volatility_scalar=0.0,
-            instructor_value=0.5,
-        )
-
-        self.assertEqual(
-            price_levels(engine, engine.manager.books.ask_maker),
-            [(100.5, 1.0)],
-        )
-        self.assertEqual(
-            price_levels(engine, engine.manager.books.bid_maker),
-            [(99.6, 1.0)],
-        )
-
-    def test_passive_only_ignores_tightening_ask_alpha_without_clipping_distance(self):
-        engine = SimpleMakerStrategy(
-            make_config(adj_spread_instructor=-0.002, passive_only=True)
-        )
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.8,
-            best_ask=100.2,
-            intensity_value=0.2,
-            volatility_scalar=0.0,
-            instructor_value=0.5,
-        )
-
-        self.assertEqual(
-            price_levels(engine, engine.manager.books.ask_maker),
-            [(100.4, 1.0)],
-        )
-        self.assertEqual(
-            price_levels(engine, engine.manager.books.bid_maker),
-            [(99.5, 1.0)],
-        )
-
-    def test_instructor_shifts_close_quotes_in_mid_price_units(self):
-        engine = SimpleMakerStrategy(make_config(adj_spread_instructor=0.002))
-        set_position(engine, qty=1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=100.4,
-            best_ask=100.6,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-            instructor_value=0.5,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
-        self.assertEqual(
-            price_levels(engine, engine.manager.books.ask_maker),
-            [(100.8, 1.0)],
-        )
-
-    def test_passive_only_clips_close_ask_tightening_alpha(self):
-        engine = SimpleMakerStrategy(
-            make_config(adj_spread_instructor=-0.002, passive_only=True)
-        )
-        set_position(engine, qty=1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=100.4,
-            best_ask=100.6,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-            instructor_value=0.5,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.6, 1.0)])
-
-    def test_passive_only_clips_close_bid_tightening_alpha(self):
-        engine = SimpleMakerStrategy(
-            make_config(adj_spread_instructor=0.004, passive_only=True)
-        )
-        set_position(engine, qty=-1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.4,
-            best_ask=99.6,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-            instructor_value=0.5,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.4, 1.0)])
-
-    def test_inventory_limit_uses_cost_notional_not_mark_notional(self):
-        engine = SimpleMakerStrategy(make_config(max_position_usdt=150.0))
-        set_position(engine, qty=1.0, cost=100.0)
-
-        ask_qty, bid_qty = engine._apply_inventory_limit(mid=200.0, ask_qty=1.0, bid_qty=1.0)
-        self.assertEqual((ask_qty, bid_qty), (1.0, 1.0))
-
-        engine = SimpleMakerStrategy(make_config(max_position_usdt=150.0))
-        set_position(engine, qty=1.0, cost=200.0)
-
-        ask_qty, bid_qty = engine._apply_inventory_limit(mid=100.0, ask_qty=1.0, bid_qty=1.0)
-        self.assertEqual((ask_qty, bid_qty), (1.0, 0.0))
-
-    def test_short_inventory_limit_uses_signed_cost_notional(self):
-        engine = SimpleMakerStrategy(make_config(max_position_usdt=150.0))
-        set_position(engine, qty=-1.0, cost=200.0)
-
-        ask_qty, bid_qty = engine._apply_inventory_limit(mid=100.0, ask_qty=1.0, bid_qty=1.0)
-        self.assertEqual((ask_qty, bid_qty), (0.0, 1.0))
-
-    def test_max_open_inventory_utilization_blocks_long_adds(self):
         engine = SimpleMakerStrategy(
             make_config(
-                max_position_usdt=100.0,
-                max_open_inventory_utilization=0.5,
-            )
-        )
-        set_position(engine, qty=1.0, cost=50.0)
-
-        ask_qty, bid_qty = engine._apply_inventory_limit(mid=100.0, ask_qty=1.0, bid_qty=1.0)
-
-        self.assertEqual((ask_qty, bid_qty), (1.0, 0.0))
-
-    def test_max_open_inventory_utilization_blocks_short_adds(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                max_position_usdt=100.0,
-                max_open_inventory_utilization=0.5,
-            )
-        )
-        set_position(engine, qty=-1.0, cost=50.0)
-
-        ask_qty, bid_qty = engine._apply_inventory_limit(mid=100.0, ask_qty=1.0, bid_qty=1.0)
-
-        self.assertEqual((ask_qty, bid_qty), (0.0, 1.0))
-
-    def test_inventory_skew_uses_cost_notional_not_mark_notional(self):
-        engine = SimpleMakerStrategy(
-            make_config(max_position_usdt=100.0, inventory_skew=(10.0, 1.0))
-        )
-        set_position(engine, qty=1.0, cost=50.0)
-
-        self.assertEqual(engine._inventory_skew_price_shift(mid=100.0), -0.5)
-
-    def test_open_curve_units_use_gross_cost_notional_and_floor(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                max_position_usdt=100.0,
-                open_curve=(0.0, 2.0, 1.0),
-            )
-        )
-        set_position(engine, qty=1.0, cost=25.0)
-
-        self.assertEqual(engine._inventory_open_curve_units(mid=100.0), 1)
-
-    def test_open_curve_units_can_floor_to_zero(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                max_position_usdt=100.0,
-                open_curve=(0.25, 2.0, 1.0),
-            )
-        )
-        set_position(engine, qty=1.0, cost=100.0)
-
-        self.assertEqual(engine._inventory_open_curve_units(mid=100.0), 0)
-
-    def test_open_curve_qty_is_integer_min_bet_multiple(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                min_order_notional=100.0,
-                open_curve=(1.0, 3.0, 1.0),
-            )
-        )
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.9,
-            best_ask=100.1,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(
-            price_levels(engine, engine.manager.books.ask_maker),
-            [(100.1, 3.0)],
-        )
-        self.assertEqual(
-            price_levels(engine, engine.manager.books.bid_maker),
-            [(99.9, 3.006)],
-        )
-
-    def test_simple_mode_can_be_disabled_for_legacy_level_path(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                simple_mode=False,
-                min_order_notional=100.0,
-                open_curve=(1.0, 3.0, 1.0),
-            )
-        )
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.9,
-            best_ask=100.1,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(
-            price_levels(engine, engine.manager.books.ask_maker),
-            [(100.1, 3.0)],
-        )
-        self.assertEqual(
-            price_levels(engine, engine.manager.books.bid_maker),
-            [(99.9, 3.0)],
-        )
-
-    def test_open_liquidity_snap_moves_flat_open_quotes_to_wall_front(self):
-        engine = SimpleMakerStrategy(make_config(optimize_by_orderbook=0))
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.8,
-            best_ask=100.2,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-            replay_bid_ticks=[995],
-            replay_ask_ticks=[1005],
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.4, 1.0)])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.6, 1.0)])
-        state = engine.snapshot_state()
-        self.assertEqual(state["open_liquidity_snap_adjusted"], 2)
-        self.assertEqual(state["open_liquidity_snap_moved_ticks"], 4)
-        self.assertEqual(state["open_liquidity_snap_max_move_ticks"], 2)
-
-    def test_open_liquidity_snap_ignores_thin_levels_by_notional_threshold(self):
-        engine = SimpleMakerStrategy(make_config(optimize_by_orderbook=1000))
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.8,
-            best_ask=100.2,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-            replay_bid_ticks=[995, 992],
-            replay_ask_ticks=[1005, 1008],
-            replay_bid_notional=[500.0, 2000.0],
-            replay_ask_notional=[500.0, 2000.0],
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.7, 1.0)])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.3, 1.0)])
-
-    def test_open_liquidity_snap_cancels_when_only_thin_levels_exist(self):
-        engine = SimpleMakerStrategy(make_config(optimize_by_orderbook=1000))
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.8,
-            best_ask=100.2,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-            replay_bid_ticks=[995],
-            replay_ask_ticks=[1005],
-            replay_bid_notional=[500.0],
-            replay_ask_notional=[500.0],
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
-        self.assertEqual(engine.snapshot_state()["open_liquidity_snap_cancelled"], 2)
-
-    def test_open_liquidity_snap_only_moves_long_underwater_bid_add(self):
-        engine = SimpleMakerStrategy(
-            make_config(optimize_by_orderbook=0, strict_mode=False)
-        )
-        set_position(engine, qty=1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=98.9,
-            best_ask=99.1,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-            replay_bid_ticks=[985],
-            replay_ask_ticks=[1005],
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(99.1, 1.0)])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(98.6, 1.0)])
-        self.assertEqual(engine.snapshot_state()["open_liquidity_snap_adjusted"], 1)
-
-    def test_open_liquidity_snap_does_not_move_close_only_quote(self):
-        engine = SimpleMakerStrategy(make_config(optimize_by_orderbook=0))
-        set_position(engine, qty=1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=100.4,
-            best_ask=100.6,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-            replay_bid_ticks=[995],
-            replay_ask_ticks=[1010],
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.6, 1.0)])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
-        self.assertEqual(engine.snapshot_state()["open_liquidity_snap_adjusted"], 0)
-
-    def test_close_curve_units_use_gross_cost_notional_and_floor(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                max_position_usdt=100.0,
-                min_order_notional=100.0,
-                close_curve=(0.0, 2.0, 1.0),
-            )
-        )
-        set_position(engine, qty=1.0, cost=25.0)
-
-        self.assertEqual(engine._inventory_close_curve_units(mid=100.0), 0)
-
-    def test_close_curve_units_can_floor_to_zero(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                max_position_usdt=100.0,
-                close_curve=(0.25, 2.0, 1.0),
-            )
-        )
-
-        self.assertEqual(engine._inventory_close_curve_units(mid=100.0), 0)
-
-    def test_close_curve_qty_does_not_cap_to_position_qty(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                max_position_usdt=100.0,
-                min_order_notional=100.0,
-                close_curve=(0.0, 2.0, 1.0),
-            )
-        )
-        set_position(engine, qty=1.0, cost=100.0)
-
-        self.assertEqual(engine._curve_close_qty(mid=100.0, pos_qty=1.0), 2.0)
-
-    def test_stoploss_is_absolute_usdt(self):
-        engine = SimpleMakerStrategy(make_config(max_position_usdt=100.0, stoploss=25.0))
-        set_position(engine, qty=1.0, cost=100.0)
-
-        self.assertFalse(engine._should_activate_stoploss(mid=75.1))
-        self.assertTrue(engine._should_activate_stoploss(mid=75.0))
-
-    def test_long_under_cost_only_places_open_bid(self):
-        engine = SimpleMakerStrategy(make_config())
-        set_position(engine, qty=1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=98.9,
-            best_ask=99.1,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
-        self.assertEqual(len(price_levels(engine, engine.manager.books.bid_maker)), 1)
-
-    def test_long_underwater_uses_underwater_open_boost(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                min_order_notional=100.0,
-                open_curve=(1.0, 1.0, 1.0),
-                boost_underwater=(2.0, 1.0),
-                boost_profitzone=(1.0, 1.0),
-            )
-        )
-        set_position(engine, qty=1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=98.9,
-            best_ask=99.1,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(98.9, 2.024)])
-
-    def test_cooldown_time_mutes_open_until_elapsed(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                cooldown_time=30_000,
-                min_order_notional=100.0,
-                open_curve=(1.0, 1.0, 1.0),
-            )
-        )
-        set_position(engine, qty=1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1000,
-            best_bid=98.9,
-            best_ask=99.1,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(98.9, 1.012)])
-
-        engine._on_trade_event(
-            trade_time=1050,
-            is_buyer_maker=True,
-            trade_price=98.8,
-            trade_qty=1.012,
-        )
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
-
-        engine._on_ticker_event(
-            timestamp=30_999,
-            best_bid=98.9,
-            best_ask=99.1,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
-
-        engine._on_ticker_event(
-            timestamp=31_050,
-            best_bid=98.9,
-            best_ask=99.1,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-        self.assertEqual(len(price_levels(engine, engine.manager.books.bid_maker)), 1)
-
-    def test_long_above_cost_places_glftmm_close_ask_only(self):
-        engine = SimpleMakerStrategy(make_config())
-        set_position(engine, qty=1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=100.4,
-            best_ask=100.6,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.6, 1.0)])
-
-    def test_long_profitzone_uses_profitzone_close_boost(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                min_order_notional=100.0,
-                close_curve=(1.0, 1.0, 1.0),
-                boost_underwater=(1.0, 1.0),
-                boost_profitzone=(1.0, 2.0),
-            )
-        )
-        set_position(engine, qty=5.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=100.4,
-            best_ask=100.6,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.6, 1.99)])
-
-    def test_long_above_cost_close_curve_floors_fractional_units(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                max_position_usdt=400.0,
-                close_curve=(0.0, 1.0, 1.0),
-            )
-        )
-        set_position(engine, qty=1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=100.4,
-            best_ask=100.6,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
-
-    def test_close_curve_qty_is_integer_min_bet_multiple(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                max_position_usdt=100.0,
-                min_order_notional=100.0,
-                close_curve=(0.0, 3.0, 1.0),
-            )
-        )
-        set_position(engine, qty=1.0, cost=100.0)
-
-        self.assertEqual(engine._curve_close_qty(mid=100.0, pos_qty=1.0), 3.0)
-
-    def test_close_curve_places_position_cap_after_integer_min_bet_sizing(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                max_position_usdt=100.0,
-                min_order_notional=100.0,
-                close_curve=(0.0, 3.0, 1.0),
-            )
-        )
-        set_position(engine, qty=1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=100.4,
-            best_ask=100.6,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.6, 1.0)])
-
-    def test_close_curve_allows_full_close_when_position_below_min_bet(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                min_order_notional=100.0,
-                close_curve=(0.0, 0.0, 1.0),
-            )
-        )
-        set_position(engine, qty=0.05, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=100.4,
-            best_ask=100.6,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.6, 0.05)])
-
-    def test_long_close_quote_uses_intensity_and_volatility_distance(self):
-        engine = SimpleMakerStrategy(make_config(adj_spread_volatility=2.0))
-        set_position(engine, qty=1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=100.4,
-            best_ask=100.6,
-            intensity_value=0.2,
-            volatility_scalar=0.1,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(101.0, 1.0)])
-
-    def test_non_strict_long_underwater_places_close_ask_and_open_bid(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                strict_mode=False,
-                min_order_notional=100.0,
-                open_curve=(1.0, 1.0, 1.0),
-                close_curve=(1.0, 20.0, 1.0),
-            )
-        )
-        set_position(engine, qty=1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=98.9,
-            best_ask=99.1,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(99.1, 1.0)])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(98.9, 1.012)])
-
-    def test_non_strict_short_above_cost_places_open_ask_and_close_bid(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                strict_mode=False,
-                min_order_notional=100.0,
-                open_curve=(1.0, 1.0, 1.0),
-                close_curve=(1.0, 20.0, 1.0),
-            )
-        )
-        set_position(engine, qty=-1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=100.4,
-            best_ask=100.6,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.6, 0.995)])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(100.4, 0.997)])
-
-    def test_flat_open_quote_uses_open_spread_adjustments(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                adj_spread_intensity=(3.0, 1.0),
-                adj_spread_volatility=(2.0, 0.0),
-            )
-        )
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=100.4,
-            best_ask=100.6,
-            intensity_value=0.2,
-            volatility_scalar=0.1,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(101.4, 1.0)])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.6, 1.0)])
-
-    def test_min_quote_distance_bps_floors_simple_open_quotes_to_ticks(self):
-        engine = SimpleMakerStrategy(make_config(min_quote_distance_bps=59.0))
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.8,
-            best_ask=100.2,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.7, 1.0)])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.3, 1.0)])
-
-    def test_min_quote_distance_bps_floors_level_open_quotes_to_ticks(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                simple_mode=False,
-                min_quote_distance_bps=59.0,
-            )
-        )
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.8,
-            best_ask=100.2,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.7, 1.0)])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.3, 1.0)])
-
-    def test_long_close_quote_uses_close_spread_adjustments(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                adj_spread_intensity=(3.0, 1.0),
-                adj_spread_volatility=(2.0, 0.0),
-            )
-        )
-        set_position(engine, qty=1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=100.4,
-            best_ask=100.6,
-            intensity_value=0.2,
-            volatility_scalar=0.1,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.8, 1.0)])
-
-    def test_min_quote_distance_bps_clips_simple_close_quote(self):
-        engine = SimpleMakerStrategy(make_config(min_quote_distance_bps=200.0))
-        set_position(engine, qty=1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=100.4,
-            best_ask=100.6,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(102.6, 1.0)])
-
-    def test_long_far_above_cost_still_uses_glftmm_close_ask(self):
-        engine = SimpleMakerStrategy(make_config())
-        set_position(engine, qty=1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=103.4,
-            best_ask=103.5,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(103.5, 1.0)])
-
-    def test_short_min_step_residual_closes_in_profit_zone(self):
-        engine = SimpleMakerStrategy(make_config())
-        set_position(engine, qty=-0.0009999999999817438, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.7,
-            best_ask=99.8,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.7, 0.001)])
-
-    def test_reach_and_release_closes_min_step_residual(self):
-        engine = SimpleMakerStrategy(make_config())
-        set_position(engine, qty=0.0009999999999817438, cost=100.0)
-        engine._latest_best_bid = 99.9
-        engine._latest_best_ask = 100.0
-
-        placed = engine._place_reach_and_release_taker(mid=99.95)
-
-        self.assertTrue(placed)
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_taker), [(99.9, 0.001)])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_taker), [])
-
-    def test_reach_and_release_ignores_close_curve(self):
-        engine = SimpleMakerStrategy(
-            make_config(close_curve=(0.0, 0.0, 1.0))
-        )
-        set_position(engine, qty=1.0, cost=100.0)
-        engine._latest_best_bid = 99.9
-        engine._latest_best_ask = 100.0
-
-        placed = engine._place_reach_and_release_taker(mid=99.95)
-
-        self.assertTrue(placed)
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_taker), [(99.9, 1.0)])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_taker), [])
-
-    def test_unchanged_close_quote_is_recomputed_each_ticker(self):
-        engine = SimpleMakerStrategy(make_config())
-        set_position(engine, qty=1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=100.4,
-            best_ask=100.6,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-        engine.manager.books.ask_maker.merge([(9999, 1)])
-        engine._on_ticker_event(
-            timestamp=2,
-            best_bid=100.4,
-            best_ask=100.6,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.6, 1.0)])
-
-    def test_partial_profit_fill_requotes_remaining_close_qty(self):
-        engine = SimpleMakerStrategy(make_config())
-        set_position(engine, qty=1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=100.4,
-            best_ask=100.6,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-        filled_qty = engine.manager.match_maker(
-            trade_time=2,
-            trade_side=True,
-            trade_price=100.7,
-            trade_qty=0.334,
-            fee_rate=engine.sim.maker_fee,
-        )
-        self.assertAlmostEqual(filled_qty, 0.334)
-        before = price_levels(engine, engine.manager.books.ask_maker)
-
-        engine._on_ticker_event(
-            timestamp=3,
-            best_bid=100.4,
-            best_ask=100.6,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), before)
-
-    def test_short_below_cost_places_glftmm_close_bid_only(self):
-        engine = SimpleMakerStrategy(make_config())
-        set_position(engine, qty=-1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.4,
-            best_ask=99.6,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.4, 1.0)])
-
-    def test_short_close_quote_uses_intensity_and_volatility_distance(self):
-        engine = SimpleMakerStrategy(make_config(adj_spread_volatility=2.0))
-        set_position(engine, qty=-1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.4,
-            best_ask=99.6,
-            intensity_value=0.2,
-            volatility_scalar=0.1,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.0, 1.0)])
-
-    def test_single_strategy_snapshot_has_no_lot_state(self):
-        engine = SimpleMakerStrategy(make_config())
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.9,
-            best_ask=100.1,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        state = engine.snapshot_state()
-        self.assertNotIn("lots", state)
-        self.assertNotIn("max_position_lots", state)
-        self.assertNotIn("stoploss_lots", state)
-        self.assertFalse(hasattr(engine, "_lot_strategies"))
-        self.assertLessEqual(len(engine.manager.books.ask_maker.snapshot()), 1)
-        self.assertLessEqual(len(engine.manager.books.bid_maker.snapshot()), 1)
-
-    def test_requotes_replace_single_level_per_side(self):
-        engine = SimpleMakerStrategy(make_config())
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.9,
-            best_ask=100.1,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-        first_ask = price_levels(engine, engine.manager.books.ask_maker)
-        first_bid = price_levels(engine, engine.manager.books.bid_maker)
-
-        engine._on_ticker_event(
-            timestamp=2,
-            best_bid=99.9,
-            best_ask=100.1,
-            intensity_value=0.2,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(len(price_levels(engine, engine.manager.books.ask_maker)), 1)
-        self.assertEqual(len(price_levels(engine, engine.manager.books.bid_maker)), 1)
-        self.assertNotEqual(price_levels(engine, engine.manager.books.ask_maker), first_ask)
-        self.assertNotEqual(price_levels(engine, engine.manager.books.bid_maker), first_bid)
-
-    def test_rejects_multi_position_config_at_strategy_boundary(self):
-        with self.assertRaisesRegex(ValueError, "max_position_usdt must be a single number"):
-            SimpleMakerStrategy(
-                make_config(max_position_usdt=[150.0, 300.0], stoploss=0.0),
-            )
-
-    def test_flat_strategy_run_uses_one_position_book(self):
-        engine = SimpleMakerStrategy(
-            make_config(max_position_usdt=150.0, stoploss=0.0),
-            loader=StaticEventLoader(
-                [
-                    ("ticker", 1, 99.9, 100.1, 0.0, 0.0, 0.0),
-                    ("trade", 2, True, 99.8, 1.0),
-                    ("ticker", 3, 89.9, 90.1, 0.0, 0.0, 0.0),
-                    ("trade", 4, True, 89.8, 2.0),
-                    ("ticker", 5, 89.9, 90.1, 0.0, 0.0, 0.0),
-                    ("trade", 6, True, 89.8, 1.0),
-                    ("ticker", 7, 89.9, 90.1, 0.0, 0.0, 0.0),
-                ]
+                adj_spread_intensity=(1.0, 1.0),
+                min_order_notional=10.0,
+                inventory_skew=None,
             ),
+            loader=loader,
         )
 
-        df = engine.run_day(symbol="BTCUSDT", date="2025-01-01")
-        state = engine.snapshot_state()
+        day = engine.run_day(symbol="BTCUSDT", date="2025-01-01")
+        books = engine.manager.snapshot_ticks()
 
-        self.assertEqual(state["max_position_usdt"], 150.0)
-        self.assertGreaterEqual(state["position"]["gross_cost_notional_usdt"], 150.0)
-        self.assertEqual(float(df.iloc[1]["position"]), 1.0)
-        self.assertAlmostEqual(float(df.iloc[-1]["position"]), state["position"]["qty"])
+        self.assertEqual(len(day), 0)
+        self.assertEqual(engine.snapshot_state()["latest_buy_intensity"], 0.0)
+        self.assertEqual(engine.snapshot_state()["latest_sell_intensity"], 0.0)
+        self.assertEqual(books["ask_maker"], [])
+        self.assertEqual(books["bid_maker"], [])
 
-
-class ReportNotionalTest(unittest.TestCase):
-    def test_report_normalization_adds_datetime_for_current_columns(self):
-        import pandas as pd
-
-        df = pd.DataFrame(
-            {
-                "timestamp": [1, 2],
-                "total_pnl": [20.0, 20.0],
-                "realized_pnl": [0.0, 0.0],
-                "unrealized_pnl": [20.0, 20.0],
-                "traded_volume": [100.0, 200.0],
-                "price": [110.0, 90.0],
-                "position": [2.0, -2.0],
-                "mark_notional_usdt": [220.0, -180.0],
-                "cost_notional_usdt": [200.0, -200.0],
-                "gross_cost_notional_usdt": [200.0, 200.0],
-            }
+    def test_zero_intensity_aggtrade_keeps_existing_quotes_unchanged(self):
+        loader = StaticEventLoader(
+            [
+                ("bookticker", 1000, 100.0, 101.0, 1.0, 1.0),
+                ("aggtrade", 1000, False, 2.0, 2.0, 1.0, 101.0, 103.0),
+                ("bookticker", 1001, 100.5, 101.5, 1.0, 1.0),
+                ("aggtrade", 1001, False, 0.0, 0.0, 1.0, 101.5, 101.5),
+            ]
         )
-
-        out = _normalize_report_columns(df)
-
-        self.assertIn("datetime", out.columns)
-        self.assertEqual(list(out["mark_notional_usdt"]), [220.0, -180.0])
-        self.assertEqual(list(out["cost_notional_usdt"]), [200.0, -200.0])
-        self.assertEqual(list(out["gross_cost_notional_usdt"]), [200.0, 200.0])
-
-    def test_load_report_frame_samples_before_plotting_across_files(self):
-        import tempfile
-        from pathlib import Path
-
-        import pandas as pd
-
-        def make_frame(start: int, stop: int) -> pd.DataFrame:
-            timestamps = list(range(start, stop))
-            return pd.DataFrame(
-                {
-                    "timestamp": timestamps,
-                    "total_pnl": [float(value) for value in timestamps],
-                    "realized_pnl": [0.0 for _ in timestamps],
-                    "unrealized_pnl": [float(value) for value in timestamps],
-                    "traded_volume": [float(value * 10) for value in timestamps],
-                    "price": [100.0 for _ in timestamps],
-                    "mark_notional_usdt": [0.0 for _ in timestamps],
-                    "cost_notional_usdt": [0.0 for _ in timestamps],
-                    "gross_cost_notional_usdt": [0.0 for _ in timestamps],
-                    "position": [0.0 for _ in timestamps],
-                }
-            )
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            folder = Path(tmp_dir)
-            make_frame(0, 5).to_parquet(folder / "2025-01-01.parquet", index=False)
-            make_frame(5, 10).to_parquet(folder / "2025-01-02.parquet", index=False)
-
-            out = load_report_frame(folder, every=3)
-
-        self.assertEqual(list(out["timestamp"]), [0, 3, 4, 5, 6, 9])
-        self.assertIn("datetime", out.columns)
-
-    def test_limit_plot_frame_keeps_boundaries_within_point_cap(self):
-        import pandas as pd
-
-        df = pd.DataFrame({"timestamp": list(range(11)), "total_pnl": list(range(11))})
-
-        out = _limit_plot_frame(df, max_points=4)
-
-        self.assertLessEqual(len(out), 4)
-        self.assertEqual(int(out["timestamp"].iloc[0]), 0)
-        self.assertEqual(int(out["timestamp"].iloc[-1]), 10)
-
-    def test_state_cost_notional_requires_current_state_field(self):
-        self.assertEqual(
-            _state_cost_notional_usdt(
-                {"position": {"qty": 2.0, "cost": 100.0, "cost_notional_usdt": 201.0}}
+        engine = SimpleMakerStrategy(
+            make_config(
+                adj_spread_intensity=(1.0, 1.0),
+                min_order_notional=10.0,
+                inventory_skew=None,
             ),
-            201.0,
+            loader=loader,
         )
-        self.assertIsNone(_state_cost_notional_usdt({"position": {"qty": -2.0, "cost": 100.0}}))
+
+        day = engine.run_day(symbol="BTCUSDT", date="2025-01-01")
+        books = engine.manager.snapshot_ticks()
+
+        self.assertEqual(len(day), 1)
+        self.assertEqual(engine.snapshot_state()["latest_buy_intensity"], 0.0)
+        self.assertEqual(books["ask_maker"][0][0], 1030)
+        self.assertEqual(books["bid_maker"], [])
+
+    def test_sell_aggtrade_affects_bid_not_ask(self):
+        loader = StaticEventLoader(
+            [
+                ("bookticker", 1000, 100.0, 101.0, 1.0, 1.0),
+                ("aggtrade", 1000, True, 2.0, 2.0, 1.0, 100.0, 98.0),
+            ]
+        )
+        engine = SimpleMakerStrategy(
+            make_config(
+                adj_spread_intensity=(1.0, 1.0),
+                min_order_notional=10.0,
+                inventory_skew=None,
+            ),
+            loader=loader,
+        )
+
+        day = engine.run_day(symbol="BTCUSDT", date="2025-01-01")
+        books = engine.manager.snapshot_ticks()
+
+        self.assertEqual(len(day), 1)
+        self.assertEqual(engine.snapshot_state()["latest_sell_intensity"], 2.0)
+        self.assertEqual(engine.snapshot_state()["latest_buy_intensity"], 0.0)
+        self.assertEqual(books["ask_maker"], [])
+        self.assertEqual(books["bid_maker"][0][0], 980)
+
+    def test_buy_and_sell_intensity_update_independently(self):
+        loader = StaticEventLoader(
+            [
+                ("bookticker", 1000, 100.0, 101.0, 1.0, 1.0),
+                ("aggtrade", 1000, False, 2.0, 2.0, 1.0, 101.0, 103.0),
+                ("bookticker", 1001, 100.0, 102.0, 1.0, 1.0),
+                ("aggtrade", 1001, True, 3.0, 3.0, 1.0, 100.0, 97.0),
+            ]
+        )
+        engine = SimpleMakerStrategy(
+            make_config(
+                adj_spread_intensity=(1.0, 1.0),
+                min_order_notional=10.0,
+                inventory_skew=None,
+            ),
+            loader=loader,
+        )
+
+        day = engine.run_day(symbol="BTCUSDT", date="2025-01-01")
+        books = engine.manager.snapshot_ticks()
+
+        self.assertEqual(len(day), 2)
+        self.assertEqual(engine.snapshot_state()["latest_buy_intensity"], 2.0)
+        self.assertEqual(engine.snapshot_state()["latest_sell_intensity"], 3.0)
+        self.assertEqual(books["ask_maker"][0][0], 1030)
+        self.assertEqual(books["bid_maker"][0][0], 970)
+
+    def test_latency_activates_due_quotes_on_both_sides(self):
+        loader = StaticEventLoader(
+            [
+                ("bookticker", 1000, 100.0, 101.0, 1.0, 1.0),
+                ("aggtrade", 1000, False, 2.0, 2.0, 1.0, 101.0, 103.0),
+                ("aggtrade", 1000, True, 3.0, 3.0, 1.0, 100.0, 97.0),
+                ("bookticker", 1010, 100.0, 101.0, 1.0, 1.0),
+            ]
+        )
+        engine = SimpleMakerStrategy(
+            make_config(
+                latency=10,
+                adj_spread_intensity=(1.0, 1.0),
+                min_order_notional=10.0,
+                inventory_skew=None,
+            ),
+            loader=loader,
+        )
+
+        engine.run_day(symbol="BTCUSDT", date="2025-01-01")
+        books = engine.manager.snapshot_ticks()
+
+        self.assertEqual(books["ask_maker"][0][0], 1030)
+        self.assertEqual(books["bid_maker"][0][0], 970)
+
+    def test_daily_parallel_stoploss_flattens_then_stops_trading_until_day_end(self):
+        loader = StaticEventLoader(
+            [
+                ("bookticker", 1000, 98.0, 99.0, 1.0, 1.0),
+                ("aggtrade", 1000, False, 1.0, 1.0, 1.0, 99.0, 98.0),
+                ("trade", 1001, True, 98.0, 1.0),
+                ("bookticker", 1002, 100.0, 101.0, 1.0, 1.0),
+                ("aggtrade", 1002, False, 2.0, 2.0, 1.0, 101.0, 103.0),
+            ]
+        )
+        position = Position()
+        position.execute(1.0, 100.0)
+        engine = SimpleMakerStrategy(
+            make_config(
+                mode=0,
+                stoploss=1.0,
+                daily_parallel=True,
+                min_order_notional=10.0,
+                inventory_skew=None,
+            ),
+            loader=loader,
+            position=position,
+        )
+
+        day = engine.run_day(symbol="BTCUSDT", date="2025-01-01")
+        state = engine.snapshot_state()
+        books = engine.manager.snapshot_ticks()
+
+        self.assertEqual(day["timestamp"].tolist(), [1000, 1002])
+        self.assertTrue(state["daily_stop_trading"])
+        self.assertEqual(state["daily_stop_date"], "2025-01-01")
+        self.assertAlmostEqual(state["position"]["qty"], 0.0)
+        self.assertEqual(books["ask_maker"], [])
+        self.assertEqual(books["bid_maker"], [])
+        self.assertEqual(books["ask_taker"], [])
+        self.assertEqual(books["bid_taker"], [])
+
+    def test_non_daily_parallel_stoploss_can_quote_again_after_flattening(self):
+        loader = StaticEventLoader(
+            [
+                ("bookticker", 1000, 98.0, 99.0, 1.0, 1.0),
+                ("aggtrade", 1000, False, 1.0, 1.0, 1.0, 99.0, 98.0),
+                ("trade", 1001, True, 98.0, 1.0),
+                ("bookticker", 1002, 100.0, 101.0, 1.0, 1.0),
+                ("aggtrade", 1002, False, 2.0, 2.0, 1.0, 101.0, 103.0),
+            ]
+        )
+        position = Position()
+        position.execute(1.0, 100.0)
+        engine = SimpleMakerStrategy(
+            make_config(
+                mode=0,
+                stoploss=1.0,
+                daily_parallel=False,
+                min_order_notional=10.0,
+                inventory_skew=None,
+            ),
+            loader=loader,
+            position=position,
+        )
+
+        engine.run_day(symbol="BTCUSDT", date="2025-01-01")
+        state = engine.snapshot_state()
+        books = engine.manager.snapshot_ticks()
+
+        self.assertFalse(state["daily_stop_trading"])
+        self.assertAlmostEqual(state["position"]["qty"], 0.0)
+        self.assertGreater(len(books["ask_maker"]), 0)
+        self.assertEqual(books["bid_maker"], [])
 
 
 if __name__ == "__main__":

@@ -55,6 +55,39 @@ class ManagerSingleLevelPlacementTest(unittest.TestCase):
                 best_bid=99.0,
             )
 
+    def test_maker_steps_side_replaces_only_selected_side(self):
+        manager = Manager(symbol_rules=SymbolRules())
+        manager.place_maker_steps(
+            ask_price_ticks=105,
+            ask_qty_steps=2,
+            bid_price_ticks=95,
+            bid_qty_steps=3,
+            best_ask_ticks=101,
+            best_bid_ticks=99,
+        )
+
+        manager.place_maker_steps_side(
+            side="buy",
+            price_ticks=94,
+            qty_steps=4,
+            best_ask_ticks=101,
+            best_bid_ticks=99,
+        )
+
+        self.assertEqual(manager.books.ask_maker.snapshot(), [(105, 2)])
+        self.assertEqual(manager.books.bid_maker.snapshot(), [(94, 4)])
+
+        manager.place_maker_steps_side(
+            side="sell",
+            price_ticks=None,
+            qty_steps=0,
+            best_ask_ticks=101,
+            best_bid_ticks=99,
+        )
+
+        self.assertEqual(manager.books.ask_maker.snapshot(), [])
+        self.assertEqual(manager.books.bid_maker.snapshot(), [(94, 4)])
+
 
 if __name__ == "__main__":
     unittest.main()

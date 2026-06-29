@@ -14,6 +14,9 @@ import pandas as pd
 
 _DATE_KEY_RE = re.compile(r"\d{4}-?\d{2}-?\d{2}")
 _MAX_POSITION_RE = re.compile(r"(?:^|__)mp([0-9]+(?:p[0-9]+)?(?:e[+-]?[0-9]+)?)(?:$|__)")
+_DAILY_PARALLEL_TRUE_RE = re.compile(
+    r"(?:^|__)(?:dp|daily_?parallel)_?(?:1|true)(?:$|__)"
+)
 _PNL_REPORT_COLUMNS = (
     "timestamp",
     "datetime",
@@ -303,6 +306,53 @@ def _parse_max_position_from_folder(folder: str | Path) -> float:
     raise ValueError(f"cannot parse max_position from folder path: {folder}")
 
 
+def _parse_daily_parallel_from_folder(folder: str | Path) -> bool:
+    for part in Path(folder).parts:
+        token = part.lower().replace("-", "_")
+        if _DAILY_PARALLEL_TRUE_RE.search(token):
+            return True
+    return False
+
+
+def _daily_turnover_from_cumulative(daily_volume_cum: pd.Series) -> pd.Series:
+    if daily_volume_cum.empty:
+        return pd.Series(dtype="float64")
+    return daily_volume_cum.diff().fillna(daily_volume_cum.iloc[0]).astype("float64")
+
+
+def _stitch_daily_parallel_series(
+    daily_total: pd.Series,
+    daily_volume_cum: pd.Series,
+) -> tuple[pd.Series, pd.Series]:
+    stitched_total = daily_total.astype("float64").cumsum()
+    stitched_volume = daily_volume_cum.astype("float64").cumsum()
+    return stitched_total, stitched_volume
+
+
+def _stitch_daily_parallel_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "datetime" not in df.columns:
+        return df
+
+    out = df.copy()
+    report_dates = pd.to_datetime(out["datetime"]).dt.floor("D")
+    stitch_columns = [
+        column
+        for column in ("total_pnl", "realized_pnl", "traded_volume")
+        if column in out.columns
+    ]
+    offsets = {column: 0.0 for column in stitch_columns}
+    for _day, index in out.groupby(report_dates, sort=True).groups.items():
+        for column in stitch_columns:
+            values = out.loc[index, column].astype("float64")
+            if values.empty:
+                continue
+            base = float(values.iloc[0])
+            stitched = offsets[column] + (values - base)
+            out.loc[index, column] = stitched
+            offsets[column] = float(stitched.iloc[-1])
+    return out
+
+
 def _compute_daily_total(df: pd.DataFrame) -> pd.Series:
     if "total_pnl" not in df.columns or "datetime" not in df.columns or df.empty:
         return pd.Series(dtype="float64")
@@ -318,7 +368,7 @@ def _compute_daily_total(df: pd.DataFrame) -> pd.Series:
 def _compute_daily_pnl_from_total(daily_total: pd.Series) -> pd.Series:
     if daily_total.empty:
         return pd.Series(dtype="float64")
-    return daily_total.diff().dropna().astype("float64")
+    return daily_total.diff().fillna(daily_total.iloc[0]).astype("float64")
 
 
 def _compute_sharpe_from_daily_pnl(daily_pnl: pd.Series) -> float:
@@ -523,6 +573,7 @@ def report(
         i, folder = item
         label = labels[i] if labels is not None else str(i)
         pnl_scale = _parse_max_position_from_folder(folder) if normalize else 1.0
+        daily_parallel = _parse_daily_parallel_from_folder(folder)
 
         try:
             df = load_report_frame(
@@ -535,6 +586,8 @@ def report(
             )
         except FileNotFoundError:
             return None
+        if daily_parallel:
+            df = _stitch_daily_parallel_frame(df)
 
         try:
             daily_total, daily_volume_cum = _compute_daily_series_from_states(
@@ -543,7 +596,12 @@ def report(
                 end=end,
                 exclude_date=exclude_date,
             )
-            daily_turnover_series = daily_volume_cum.diff().dropna().astype("float64")
+            if daily_parallel:
+                daily_total, daily_volume_cum = _stitch_daily_parallel_series(
+                    daily_total=daily_total,
+                    daily_volume_cum=daily_volume_cum,
+                )
+            daily_turnover_series = _daily_turnover_from_cumulative(daily_volume_cum)
             final_pnl = float(daily_total.iloc[-1]) if not daily_total.empty else float("nan")
             last_vol = float(daily_volume_cum.iloc[-1]) if not daily_volume_cum.empty else 0.0
             if last_vol > 0 and np.isfinite(last_vol) and np.isfinite(final_pnl):
@@ -590,6 +648,7 @@ def report(
             append_metrics(summary)
     else:
         for folder in folder_list:
+            daily_parallel = _parse_daily_parallel_from_folder(folder)
             try:
                 daily_total, daily_volume_cum = _compute_daily_series_from_states(
                     folder,
@@ -600,7 +659,12 @@ def report(
             except (FileNotFoundError, ValueError):
                 continue
 
-            daily_turnover_series = daily_volume_cum.diff().dropna().astype("float64")
+            if daily_parallel:
+                daily_total, daily_volume_cum = _stitch_daily_parallel_series(
+                    daily_total=daily_total,
+                    daily_volume_cum=daily_volume_cum,
+                )
+            daily_turnover_series = _daily_turnover_from_cumulative(daily_volume_cum)
             final_pnl = float(daily_total.iloc[-1]) if not daily_total.empty else float("nan")
 
             last_vol = float(daily_volume_cum.iloc[-1]) if not daily_volume_cum.empty else 0.0

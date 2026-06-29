@@ -7,7 +7,7 @@ import json
 import math
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from multiprocessing import TimeoutError as MpTimeoutError
 from multiprocessing import get_context
 from time import perf_counter
@@ -15,7 +15,7 @@ from typing import Any
 
 import pandas as pd
 
-from sim.loader import BinanceEventLoader, parse_orderbook_replay_config
+from sim.loader import BinanceEventLoader
 from sim.strategy import (
     SimulationConfig,
     SimpleMakerStrategy,
@@ -31,7 +31,6 @@ MIN_ANNUALIZED_RETURN_RATIO = 0.2
 MAX_DRAWDOWN_LIMIT_RATIO = 0.2
 
 SIM_REQUIRED_KEYS = (
-    "freq",
     "latency",
     "price_precision",
     "qty_precision",
@@ -40,9 +39,6 @@ SIM_REQUIRED_KEYS = (
     "maker_fee",
     "max_position_usdt",
 )
-INTENSITY_PARAM_KEYS = ("name_intensity", "lookback_intensity")
-INSTRUCTOR_PARAM_KEYS = ("name_instructor", "lookback_instructor")
-VOLATILITY_PARAM_KEYS = ("name_volatility", "lookback_volatility")
 
 PARAM_KEY_ALIAS = {
     "latency": "lat",
@@ -51,21 +47,11 @@ PARAM_KEY_ALIAS = {
     "mode": "md",
     "taker_fee": "tf",
     "maker_fee": "mf",
-    "name_volatility": "vn",
-    "name_instructor": "ir",
-    "name_intensity": "in",
-    "lookback_volatility": "vlb",
-    "lookback_instructor": "ilb",
-    "lookback_intensity": "lbi",
     "max_position_usdt": "mp",
     "max_open_inventory_utilization": "moiu",
     "max_holding_time": "mht",
-    "freq": "fr",
     "adj_spread_intensity": "asi",
-    "adj_spread_instructor": "asir",
     "passive_only": "po",
-    "optimize_by_orderbook": "obo",
-    "adj_spread_volatility": "asv",
     "min_quote_distance_bps": "mqdb",
     "inventory_skew": "isk",
     "stoploss": "sl",
@@ -78,22 +64,14 @@ PARAM_KEY_ALIAS = {
     "min_order_qty": "moq",
     "min_order_notional": "mon",
     "simple_mode": "sm",
+    "daily_parallel": "dp",
 }
 
 SIM_OPTIONAL_KEYS = (
-    "name_intensity",
-    "name_instructor",
-    "name_volatility",
-    "lookback_intensity",
-    "lookback_instructor",
-    "lookback_volatility",
     "max_holding_time",
     "max_open_inventory_utilization",
     "adj_spread_intensity",
-    "adj_spread_instructor",
     "passive_only",
-    "optimize_by_orderbook",
-    "adj_spread_volatility",
     "min_quote_distance_bps",
     "inventory_skew",
     "min_order_qty",
@@ -196,15 +174,16 @@ def parse_date_input(s: str) -> datetime:
 
 
 def generate_dates(start: str, end: str) -> list[str]:
-    start_dt = parse_date_input(start)
-    end_dt = parse_date_input(end)
+    start_dt = parse_date_input(start).date()
+    end_dt = parse_date_input(end).date()
     if end_dt < start_dt:
         raise ValueError(f"date_end must be >= date_start, got {end} < {start}")
-    return (
-        pd.date_range(start=start_dt, end=end_dt, freq="D")
-        .strftime(DATE_FMT_DASH)
-        .tolist()
-    )
+    dates: list[str] = []
+    current = start_dt
+    while current <= end_dt:
+        dates.append(current.strftime(DATE_FMT_DASH))
+        current += timedelta(days=1)
+    return dates
 
 
 def _short_param_key(key: str) -> str:
@@ -241,16 +220,14 @@ def _parse_bool(raw: Any, key: str) -> bool:
     raise ValueError(f"simulation.{key} must be boolean")
 
 
-def _parse_orderbook_optimizer_threshold(raw: Any) -> float:
-    if isinstance(raw, bool):
-        raise ValueError("simulation.optimize_by_orderbook must be -1, 0, or a notional threshold")
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        raise ValueError("simulation.optimize_by_orderbook must be -1, 0, or a notional threshold") from None
-    if not math.isfinite(value) or (value < 0.0 and abs(value + 1.0) > 1e-12):
-        raise ValueError("simulation.optimize_by_orderbook must be -1, 0, or a notional threshold")
-    return value
+def _daily_parallel_enabled(cfg: dict[str, Any]) -> bool:
+    raw = cfg.get("daily_parallel")
+    output_cfg = cfg.get("output")
+    if raw is None and isinstance(output_cfg, dict):
+        raw = output_cfg.get("daily_parallel")
+    if raw is None:
+        return False
+    return _parse_bool(raw, "daily_parallel")
 
 
 def _safe_dir_segment(prefix: str, body: str) -> str:
@@ -276,28 +253,8 @@ def build_param_path_parts(sim_params: dict[str, Any]) -> tuple[str, str]:
     return sim_dir, "strat__all"
 
 
-def _is_effectively_zero(raw: Any) -> bool:
-    if isinstance(raw, (list, tuple)):
-        return bool(raw) and all(_is_effectively_zero(item) for item in raw)
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return False
-    return math.isfinite(value) and abs(value) <= 1e-12
-
-
 def _effective_sim_params(sim_params: dict[str, Any]) -> dict[str, Any]:
-    effective = dict(sim_params)
-    if _is_effectively_zero(effective.get("adj_spread_intensity", [1.0, 1.0])):
-        for key in INTENSITY_PARAM_KEYS:
-            effective.pop(key, None)
-    if _is_effectively_zero(effective.get("adj_spread_instructor", 0.0)):
-        for key in INSTRUCTOR_PARAM_KEYS:
-            effective.pop(key, None)
-    if _is_effectively_zero(effective.get("adj_spread_volatility", [0.0, 0.0])):
-        for key in VOLATILITY_PARAM_KEYS:
-            effective.pop(key, None)
-    return effective
+    return dict(sim_params)
 
 
 def _sim_params_dedupe_key(sim_params: dict[str, Any]) -> str:
@@ -349,12 +306,6 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
             for row in sim_map["cooldown_time"]
         ]
 
-    if "optimize_by_orderbook" in sim_map:
-        sim_map["optimize_by_orderbook"] = [
-            _parse_orderbook_optimizer_threshold(row)
-            for row in sim_map["optimize_by_orderbook"]
-        ]
-
     if "min_quote_distance_bps" in sim_map:
         sim_map["min_quote_distance_bps"] = [
             _normalize_non_negative_scalar(row, "min_quote_distance_bps")
@@ -389,7 +340,6 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
 
     for key, positive in (
         ("adj_spread_intensity", True),
-        ("adj_spread_volatility", False),
         ("boost_underwater", False),
         ("boost_profitzone", False),
     ):
@@ -418,34 +368,6 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
         )
 
     adj_spread_intensity = raw.get("adj_spread_intensity", [1.0, 1.0])
-    lookback_intensity_raw = raw.get("lookback_intensity")
-    if lookback_intensity_raw is None:
-        if not _is_effectively_zero(adj_spread_intensity):
-            raise ValueError(
-                "simulation.lookback_intensity is required when "
-                "adj_spread_intensity is non-zero"
-            )
-        lookback_intensity = 100
-    else:
-        lookback_intensity = int(lookback_intensity_raw)
-
-    name_instructor = raw.get("name_instructor")
-    if name_instructor is not None:
-        name_instructor = str(name_instructor).strip() or None
-    lookback_instructor = raw.get("lookback_instructor")
-    if lookback_instructor is not None:
-        lookback_instructor = int(lookback_instructor)
-    if name_instructor is not None and lookback_instructor is None:
-        raise ValueError("simulation.lookback_instructor is required when name_instructor is set")
-
-    name_volatility = raw.get("name_volatility")
-    if name_volatility is not None:
-        name_volatility = str(name_volatility).strip() or None
-    lookback_volatility = raw.get("lookback_volatility")
-    if lookback_volatility is not None:
-        lookback_volatility = int(lookback_volatility)
-    if name_volatility is not None and lookback_volatility is None:
-        raise ValueError("simulation.lookback_volatility is required when name_volatility is set")
 
     inventory_skew_raw = raw.get("inventory_skew")
     inventory_skew: tuple[float, float] | None = None
@@ -473,23 +395,12 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
         close_curve = tuple(float(v) for v in close_curve_raw)
 
     return SimulationConfig(
-        freq=int(raw["freq"]),
         latency=int(raw["latency"]),
         price_precision=int(raw["price_precision"]),
         qty_precision=int(raw["qty_precision"]),
         mode=int(raw["mode"]),
         taker_fee=float(raw["taker_fee"]),
         maker_fee=float(raw["maker_fee"]),
-        name_instructor=(
-            None if name_instructor is None else str(name_instructor).strip().lower()
-        ),
-        lookback_instructor=lookback_instructor,
-        name_intensity=str(raw.get("name_intensity", "k")).strip().lower(),
-        lookback_intensity=lookback_intensity,
-        name_volatility=(
-            None if name_volatility is None else str(name_volatility).strip().lower()
-        ),
-        lookback_volatility=lookback_volatility,
         max_position_usdt=_normalize_non_negative_scalar(
             raw["max_position_usdt"],
             "max_position_usdt",
@@ -500,12 +411,7 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
         ),
         max_holding_time=int(raw.get("max_holding_time", 0)),
         adj_spread_intensity=adj_spread_intensity,
-        adj_spread_instructor=float(raw.get("adj_spread_instructor", 0.0)),
         passive_only=_parse_bool(raw.get("passive_only", False), "passive_only"),
-        optimize_by_orderbook=_parse_orderbook_optimizer_threshold(
-            raw.get("optimize_by_orderbook", -1)
-        ),
-        adj_spread_volatility=raw.get("adj_spread_volatility", [0.0, 0.0]),
         min_quote_distance_bps=_normalize_non_negative_scalar(
             raw.get("min_quote_distance_bps", 0.0),
             "min_quote_distance_bps",
@@ -521,6 +427,7 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
         cooldown_time=int(raw.get("cooldown_time", 0)),
         strict_mode=_parse_bool(raw.get("strict_mode", True), "strict_mode"),
         simple_mode=_parse_bool(raw.get("simple_mode", True), "simple_mode"),
+        daily_parallel=_parse_bool(raw.get("daily_parallel", False), "daily_parallel"),
     )
 
 
@@ -570,40 +477,23 @@ def _output_dir_from_cfg(cfg: dict[str, Any]) -> str:
     return out_dir
 
 
-def _build_loader(
-    cfg: dict[str, Any],
-    simulation: SimulationConfig | None = None,
-    require_volatility_cache: bool = False,
-) -> BinanceEventLoader:
+def _build_loader(cfg: dict[str, Any]) -> BinanceEventLoader:
     paths = _config_paths(cfg)
-    sampler_output_root = _path_value(paths, "output_path", required=True)
-    assert sampler_output_root is not None
     trade_category = _normalize_category(paths.get("trade_category"), "TRADE")
+    ticker_category = _normalize_category(paths.get("ticker_category"), "BOOKTICKER")
+    bookticker_roots = _resolve_category_roots(
+        paths,
+        category=ticker_category,
+    )
     trade_roots = _resolve_category_roots(
         paths,
         category=trade_category,
     )
-    orderbook_replay_config = None
-    if simulation is not None and float(simulation.optimize_by_orderbook) >= 0.0:
-        orderbook_replay_config = parse_orderbook_replay_config(cfg)
-        if abs(float(orderbook_replay_config.tick_size) - float(simulation.tick_size)) > 1e-12:
-            raise ValueError(
-                "orderbook_replay.tick_size must match simulation tick size "
-                f"({orderbook_replay_config.tick_size} != {simulation.tick_size})"
-            )
-        replay_interval_ms = int(orderbook_replay_config.sample_interval_ms)
-        sim_freq_ms = int(simulation.freq)
-        if replay_interval_ms > sim_freq_ms or sim_freq_ms % replay_interval_ms != 0:
-            raise ValueError(
-                "orderbook_replay.sample_interval_ms must divide simulation.freq "
-                f"and be no larger than it ({replay_interval_ms} vs {sim_freq_ms})"
-            )
     return BinanceEventLoader(
+        bookticker_roots=bookticker_roots,
+        ticker_category=ticker_category,
         trade_roots=trade_roots,
-        cache_root=sampler_output_root,
         trade_category=trade_category,
-        scheme_shift=int(paths.get("scheme_shift", 0)),
-        orderbook_replay_config=orderbook_replay_config,
     )
 
 
@@ -987,6 +877,7 @@ def _build_tasks(cfg: dict[str, Any]) -> list[Task]:
         raise ValueError("symbols must be a non-empty list")
 
     dates = generate_dates(cfg["date_start"], cfg["date_end"])
+    daily_parallel = _daily_parallel_enabled(cfg)
     sim_map = _normalize_sim_param_map(cfg)
 
     sim_keys = sorted(sim_map.keys())
@@ -1002,14 +893,16 @@ def _build_tasks(cfg: dict[str, Any]) -> list[Task]:
             if dedupe_key in seen_params:
                 continue
             seen_params.add(dedupe_key)
-            tasks.append(
-                Task(
-                    symbol=str(symbol),
-                    dates=dates,
-                    sim_params=sim_params,
-                    cfg=cfg,
+            task_date_groups = ([day] for day in dates) if daily_parallel else (dates,)
+            for task_dates in task_date_groups:
+                tasks.append(
+                    Task(
+                        symbol=str(symbol),
+                        dates=list(task_dates),
+                        sim_params=sim_params,
+                        cfg=cfg,
+                    )
                 )
-            )
     return tasks
 
 
@@ -1017,14 +910,16 @@ def _run_strategy_task(task: Task) -> dict[str, Any]:
     cfg = task.cfg
     out_root = _output_dir_from_cfg(cfg)
 
-    simulation = _build_simulation_config(task.sim_params)
-    loader = _build_loader(
-        cfg=cfg,
-        simulation=simulation,
-        require_volatility_cache=simulation.name_volatility is not None,
-    )
+    path_params = dict(task.sim_params)
+    daily_parallel = _daily_parallel_enabled(cfg)
+    sim_config_params = dict(task.sim_params)
+    sim_config_params["daily_parallel"] = daily_parallel
+    simulation = _build_simulation_config(sim_config_params)
+    loader = _build_loader(cfg=cfg)
 
-    sim_dir, strat_dir = build_param_path_parts(task.sim_params)
+    if daily_parallel:
+        path_params["daily_parallel"] = True
+    sim_dir, strat_dir = build_param_path_parts(path_params)
     out_dir = os.path.join(out_root, task.symbol, sim_dir, strat_dir)
 
     output_cfg = cfg.get("output", {})
@@ -1040,6 +935,9 @@ def _run_strategy_task(task: Task) -> dict[str, Any]:
 
     row = {
         "symbol": task.symbol,
+        "date_start": task.dates[0],
+        "date_end": task.dates[-1],
+        "daily_parallel": daily_parallel,
         "sim_dir": sim_dir,
         "strat_dir": strat_dir,
         "output_dir": out_dir,

@@ -2,37 +2,42 @@ from __future__ import annotations
 
 import datetime as dt
 import math
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Literal, TypeAlias
 
 import numpy as np
 import pandas as pd
 
-from sampler.instructor import instructor_output_path
-from sampler.intensity import intensity_output_path
-from sampler.resample import normalize_scheme_shift
-from sampler.resample import output_path as sampled_ticker_path
-from sampler.resample import resolve_existing_input_path
-from sampler.volatility import volatility_output_path
-
 
 DateLike: TypeAlias = str | dt.date | dt.datetime | pd.Timestamp
 TradeTuple: TypeAlias = tuple[Literal["trade"], int, bool, float, float]
-AlphaTuple: TypeAlias = tuple[
-    Literal["ticker"],
+BookTickerTuple: TypeAlias = tuple[
+    Literal["bookticker"],
     int,
     float,
     float,
-    float | None,
-    float | None,
     float,
-    Any,
-    Any,
-    Any,
-    Any,
+    float,
 ]
-MergedEventTuple: TypeAlias = TradeTuple | AlphaTuple
+AggTradeTuple: TypeAlias = tuple[
+    Literal["aggtrade"],
+    int,
+    bool,
+    float,
+    float,
+    float,
+    float,
+    float,
+]
+MergedEventTuple: TypeAlias = TradeTuple | BookTickerTuple | AggTradeTuple
+
+MS_IN_SECOND = 1000
+MS_IN_DAY = 24 * 60 * 60 * MS_IN_SECOND
+
+DEFAULT_DATA_ROOT = Path("/data/users/data-helper/PROCESSED/TARDIS/BINANCE/UFUTURES")
+DEFAULT_BACKUP_DATA_ROOT = Path(
+    "/home/kang/data_helper/PROCESSED/DATA_RECORDER/BINANCE/UFUTURES"
+)
 
 RAW_TRADE_TIME_COLUMN = "exchange_timestamp"
 RAW_TRADE_COLUMNS = (
@@ -41,40 +46,30 @@ RAW_TRADE_COLUMNS = (
     "volume",
     "is_buyer_maker",
 )
-TICKER_COLUMNS = (
+RAW_TICKER_COLUMNS = (
+    "exchange_timestamp",
+    "price_bid",
+    "price_ask",
+    "volume_bid",
+    "volume_ask",
+)
+BBO_COLUMNS = (
     "timestamp",
     "best_bid_price",
     "best_ask_price",
+    "best_bid_qty",
+    "best_ask_qty",
 )
-DEFAULT_CACHE_ROOT = Path("/data/users/kang/backtest/glftmm/cached")
-DEFAULT_DATA_ROOT = Path("/data/users/data-helper/PROCESSED/TARDIS/BINANCE/UFUTURES")
-DEFAULT_BACKUP_DATA_ROOT = Path("/home/kang/data_helper/PROCESSED/DATA_RECORDER/BINANCE/UFUTURES")
-DEFAULT_ORDERBOOK_REPLAY_ROOT = Path("/home/kang/data/wallmaker/cached")
-
-
-@dataclass(frozen=True)
-class OrderBookReplayConfig:
-    root: Path
-    replay_levels: int = 1000
-    sample_interval_ms: int = 1000
-    tick_size: float = 0.1
-    depth_price_min: float = 20_000.0
-    depth_price_max: float = 200_000.0
-    raw_quantity_max: float = 10_000.0
-
-
-@dataclass(frozen=True)
-class OrderBookReplayFrame:
-    timestamps: np.ndarray
-    bid_ticks: np.ndarray
-    ask_ticks: np.ndarray
-    bid_notional: np.ndarray
-    ask_notional: np.ndarray
-
-
-_ORDERBOOK_REPLAY_CACHE: dict[tuple[object, ...], OrderBookReplayFrame] = {}
-_ORDERBOOK_REPLAY_CACHE_ORDER: list[tuple[object, ...]] = []
-_ORDERBOOK_REPLAY_CACHE_MAX_DAYS = 1
+AGGTRADE_COLUMNS = (
+    "timestamp",
+    "is_buyer_maker",
+    "impact",
+    "intensity",
+    "volume",
+    "first_price",
+    "last_price",
+    "forced_close",
+)
 
 
 def normalize_date(value: DateLike) -> str:
@@ -93,312 +88,209 @@ def normalize_date(value: DateLike) -> str:
     return dt.date.fromisoformat(text).isoformat()
 
 
-def _path_safe_value(value: object) -> str:
-    if isinstance(value, bool):
-        text = "true" if value else "false"
-    elif isinstance(value, float):
-        text = f"{value:.12g}"
+def day_start_timestamp_ms(date_str: str) -> int:
+    date_obj = dt.date.fromisoformat(date_str)
+    day_start = dt.datetime.combine(date_obj, dt.time.min)
+    epoch = dt.datetime(1970, 1, 1)
+    return int((day_start - epoch).total_seconds() * MS_IN_SECOND)
+
+
+def day_end_timestamp_ms(date_str: str) -> int:
+    return day_start_timestamp_ms(date_str) + MS_IN_DAY - 1
+
+
+def _ensure_paths(value: Any) -> tuple[Path, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, Path):
+        items = [value]
+    elif isinstance(value, str):
+        items = [value]
+    elif isinstance(value, Iterable):
+        items = list(value)
     else:
-        text = str(value)
-    return text.replace("-", "m").replace("+", "").replace(".", "p")
+        items = [value]
+
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for item in items:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if not text:
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
+        paths.append(Path(text))
+    return tuple(paths)
 
 
-def parse_orderbook_replay_config(raw: dict[str, Any] | None) -> OrderBookReplayConfig:
-    if raw is None:
-        raise ValueError("orderbook_path config is required when optimize_by_orderbook is enabled")
-    if not isinstance(raw, dict):
-        raise ValueError("orderbook config must be an object")
-
-    replay_raw = raw.get("orderbook_replay", {})
-    if replay_raw is None:
-        replay_raw = {}
-    if not isinstance(replay_raw, dict):
-        raise ValueError("orderbook_replay config must be an object")
-
-    root_raw = raw.get("orderbook_path")
-    if root_raw in (None, "", []):
-        root_raw = replay_raw.get("root") or replay_raw.get("output_path") or replay_raw.get("cache_root")
-    if root_raw in (None, "", []):
-        raise ValueError("orderbook_path config is required when optimize_by_orderbook is enabled")
-
-    cfg = OrderBookReplayConfig(
-        root=Path(root_raw),
-        replay_levels=int(replay_raw.get("replay_levels", 1000)),
-        sample_interval_ms=int(replay_raw.get("sample_interval_ms", 1000)),
-        tick_size=float(replay_raw.get("tick_size", 0.1)),
-        depth_price_min=float(replay_raw.get("depth_price_min", 20_000.0)),
-        depth_price_max=float(replay_raw.get("depth_price_max", 200_000.0)),
-        raw_quantity_max=float(replay_raw.get("raw_quantity_max", 10_000.0)),
-    )
-    validate_orderbook_replay_config(cfg)
-    return cfg
+def input_path(root: Path, symbol: str, date_str: str, category: str) -> Path:
+    return root / symbol / f"{symbol}--{category}--{date_str}.parquet"
 
 
-def validate_orderbook_replay_config(cfg: OrderBookReplayConfig) -> None:
-    if cfg.replay_levels < 1:
-        raise ValueError("orderbook_replay.replay_levels must be >= 1")
-    if cfg.sample_interval_ms < 1:
-        raise ValueError("orderbook_replay.sample_interval_ms must be >= 1")
-    if cfg.tick_size <= 0.0:
-        raise ValueError("orderbook_replay.tick_size must be > 0")
-    if cfg.depth_price_max <= cfg.depth_price_min:
-        raise ValueError("orderbook_replay.depth_price_max must be > depth_price_min")
-    if cfg.raw_quantity_max <= 0.0:
-        raise ValueError("orderbook_replay.raw_quantity_max must be > 0")
-
-
-def orderbook_replay_path(
-    root: Path,
+def resolve_existing_input_path(
+    roots: Any,
     symbol: str,
     date_str: str,
-    cfg: OrderBookReplayConfig,
+    category: str,
 ) -> Path:
-    path = root / "ORDERBOOK_REPLAY" / "depth_update" / symbol
-    for name in (
-        "replay_levels",
-        "sample_interval_ms",
-        "tick_size",
-        "depth_price_min",
-        "depth_price_max",
-        "raw_quantity_max",
-    ):
-        path = path / f"{name}-{_path_safe_value(getattr(cfg, name))}"
-    return path / f"{date_str}.parquet"
+    candidates = [
+        input_path(root=root, symbol=symbol, date_str=date_str, category=category)
+        for root in _ensure_paths(roots)
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    if not candidates:
+        raise FileNotFoundError("no input roots configured")
+    raise FileNotFoundError(
+        "missing input file; tried: " + ", ".join(str(path) for path in candidates)
+    )
+
+
+def empty_aggtrade_events() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "timestamp": pd.Series(dtype="int64"),
+            "is_buyer_maker": pd.Series(dtype="bool"),
+            "impact": pd.Series(dtype="float64"),
+            "intensity": pd.Series(dtype="float64"),
+            "volume": pd.Series(dtype="float64"),
+            "first_price": pd.Series(dtype="float64"),
+            "last_price": pd.Series(dtype="float64"),
+            "forced_close": pd.Series(dtype="bool"),
+        }
+    )
+
+
+def build_confirmed_aggtrade_events(
+    trades: pd.DataFrame,
+    force_close_timestamp: int | None = None,
+) -> pd.DataFrame:
+    if trades.empty:
+        return empty_aggtrade_events()
+
+    side = trades["is_buyer_maker"].to_numpy(dtype="bool", copy=False)
+    ts = trades["timestamp"].to_numpy(dtype="int64", copy=False)
+    price = trades["price"].to_numpy(dtype="float64", copy=False)
+    volume = trades["volume"].to_numpy(dtype="float64", copy=False)
+
+    starts = np.r_[0, np.flatnonzero(side[1:] != side[:-1]) + 1]
+    if len(starts) < 2 and force_close_timestamp is None:
+        return empty_aggtrade_events()
+    ends = np.r_[starts[1:], len(ts)]
+
+    group_starts = starts[:-1].astype("int64", copy=False)
+    group_ends = ends[:-1].astype("int64", copy=False)
+    confirm_ts = ts[starts[1:]].astype("int64", copy=False)
+    forced_close = np.zeros(len(confirm_ts), dtype="bool")
+
+    if force_close_timestamp is not None:
+        group_starts = np.r_[group_starts, int(starts[-1])]
+        group_ends = np.r_[group_ends, len(ts)]
+        confirm_ts = np.r_[confirm_ts, int(force_close_timestamp)].astype(
+            "int64",
+            copy=False,
+        )
+        forced_close = np.r_[forced_close, True].astype("bool", copy=False)
+
+    group_side = side[group_starts]
+    first_price = price[group_starts]
+    last_price = price[group_ends - 1]
+    volume_cumsum = np.r_[0.0, np.cumsum(volume, dtype="float64")]
+    group_volume = volume_cumsum[group_ends] - volume_cumsum[group_starts]
+
+    buy_impact = last_price - first_price
+    sell_impact = first_price - last_price
+    impact = np.where(group_side, sell_impact, buy_impact)
+    impact = np.maximum(impact, 0.0).astype("float64", copy=False)
+
+    return pd.DataFrame(
+        {
+            "timestamp": confirm_ts.astype("int64", copy=False),
+            "is_buyer_maker": group_side.astype("bool", copy=False),
+            "impact": impact,
+            "volume": group_volume.astype("float64", copy=False),
+            "first_price": first_price.astype("float64", copy=False),
+            "last_price": last_price.astype("float64", copy=False),
+            "forced_close": forced_close,
+        }
+    )
 
 
 class BinanceEventLoader:
     """
-    Load the cached sampler outputs and raw trades as a single timestamp stream.
+    Stream raw trades, raw bookticker, and confirmed aggtrade impact events.
 
-    Trade events are yielded before ticker/alpha events when timestamps are
-    identical. That avoids letting a zero-latency quote react to a sampled book
-    and fill against a trade at the same millisecond.
+    Same-timestamp public trades are emitted before book state and aggtrade
+    updates so resting maker orders cannot react before they are eligible to fill.
     """
 
     def __init__(
         self,
-        cache_root: str | Path | None = None,
         input_path: str | Path | None = None,
         input_backup_path: str | Path | None = None,
+        bookticker_roots: Iterable[str | Path] | None = None,
+        ticker_category: str | None = None,
         trade_roots: Iterable[str | Path] | None = None,
         trade_category: str | None = None,
-        scheme_shift: int = 0,
-        orderbook_replay_config: OrderBookReplayConfig | dict[str, Any] | None = None,
     ) -> None:
-        category = str(trade_category or "TRADE").strip().upper()
-        if not category:
+        trade_cat = str(trade_category or "TRADE").strip().upper()
+        ticker_cat = str(ticker_category or "BOOKTICKER").strip().upper()
+        if not trade_cat:
             raise ValueError("trade_category must not be empty")
+        if not ticker_cat:
+            raise ValueError("ticker_category must not be empty")
 
-        default_cache_root = Path(cache_root) if cache_root is not None else DEFAULT_CACHE_ROOT
-        self.cache_root = default_cache_root
-        self.scheme_shift = int(scheme_shift)
-        self.trade_category = category
+        self.trade_category = trade_cat
+        self.ticker_category = ticker_cat
+
         if trade_roots is not None:
-            roots = tuple(Path(path) for path in trade_roots)
+            self.trade_roots = tuple(Path(path) for path in trade_roots)
         elif input_path is not None:
-            root_list = [Path(input_path) / category]
+            roots = [Path(input_path) / trade_cat]
             if input_backup_path not in (None, "", []):
-                root_list.append(Path(input_backup_path) / category)
-            roots = tuple(root_list)
+                roots.append(Path(input_backup_path) / trade_cat)
+            self.trade_roots = tuple(roots)
         else:
-            roots = (DEFAULT_DATA_ROOT / category, DEFAULT_BACKUP_DATA_ROOT / category)
-        self.trade_roots = roots
-        if isinstance(orderbook_replay_config, OrderBookReplayConfig):
-            self.orderbook_replay_config = orderbook_replay_config
-        elif orderbook_replay_config is None:
-            self.orderbook_replay_config = None
-        else:
-            self.orderbook_replay_config = parse_orderbook_replay_config(orderbook_replay_config)
+            self.trade_roots = (
+                DEFAULT_DATA_ROOT / trade_cat,
+                DEFAULT_BACKUP_DATA_ROOT / trade_cat,
+            )
 
-    def iter_merged_alpha_trade_tuples(
+        if bookticker_roots is not None:
+            self.bookticker_roots = tuple(Path(path) for path in bookticker_roots)
+        elif input_path is not None:
+            roots = [Path(input_path) / ticker_cat]
+            if input_backup_path not in (None, "", []):
+                roots.append(Path(input_backup_path) / ticker_cat)
+            self.bookticker_roots = tuple(roots)
+        else:
+            self.bookticker_roots = (
+                DEFAULT_DATA_ROOT / ticker_cat,
+                DEFAULT_BACKUP_DATA_ROOT / ticker_cat,
+            )
+
+    def iter_merged_trade_intensity_tuples(
         self,
         symbol: str,
         date: DateLike,
-        freq: int,
-        trade_intensity_spec: dict[str, int | str] | None = None,
-        volatility_specs: Iterable[dict[str, int | str]] | None = None,
-        instructor_spec: dict[str, int | str] | None = None,
     ) -> Iterator[MergedEventTuple]:
         symbol = str(symbol).upper()
         date_str = normalize_date(date)
-        freq_ms = int(freq)
-        if freq_ms <= 0:
-            raise ValueError("freq must be > 0")
-
-        alpha = self._read_alpha_frame(
-            symbol=symbol,
-            date=date_str,
-            freq_ms=freq_ms,
-            trade_intensity_spec=trade_intensity_spec,
-            volatility_specs=volatility_specs,
-            instructor_spec=instructor_spec,
-        )
-        replay = self._read_orderbook_replay_frame(symbol=symbol, date=date_str)
-        if replay is not None:
-            alpha_ts = alpha["timestamp"].to_numpy(dtype="int64", copy=False)
-            replay = self._align_orderbook_replay_frame(
-                symbol=symbol,
-                date=date_str,
-                alpha_timestamps=alpha_ts,
-                replay=replay,
-            )
         trades = self._read_trade_frame(symbol=symbol, date=date_str)
-        yield from self._merge_sorted(alpha=alpha, trades=trades, replay=replay)
-
-    def _read_alpha_frame(
-        self,
-        symbol: str,
-        date: str,
-        freq_ms: int,
-        trade_intensity_spec: dict[str, int | str] | None,
-        volatility_specs: Iterable[dict[str, int | str]] | None,
-        instructor_spec: dict[str, int | str] | None,
-    ) -> pd.DataFrame:
-        ticker = self._read_sampled_ticker(symbol=symbol, date=date, freq_ms=freq_ms)
-        alpha = ticker.loc[:, TICKER_COLUMNS].copy()
-        alpha["instructor"] = 0.0
-        alpha["intensity"] = 0.0
-        alpha["volatility_scalar"] = 0.0
-
-        if instructor_spec is not None:
-            instructor = self._read_instructor_frame(
-                symbol=symbol,
-                date=date,
-                freq_ms=freq_ms,
-                spec=instructor_spec,
-            )
-            alpha = alpha.merge(instructor, on="timestamp", how="left", suffixes=("", "_new"))
-            alpha["instructor"] = alpha["instructor_new"].fillna(alpha["instructor"])
-            alpha = alpha.drop(columns=["instructor_new"])
-
-        if trade_intensity_spec is not None:
-            intensity = self._read_intensity_frame(
-                symbol=symbol,
-                date=date,
-                freq_ms=freq_ms,
-                spec=trade_intensity_spec,
-            )
-            alpha = alpha.merge(intensity, on="timestamp", how="left", suffixes=("", "_new"))
-            alpha["intensity"] = alpha["intensity_new"].fillna(alpha["intensity"])
-            alpha = alpha.drop(columns=["intensity_new"])
-
-        for idx, spec in enumerate(volatility_specs or ()):
-            vol = self._read_volatility_frame(
-                symbol=symbol,
-                date=date,
-                freq_ms=freq_ms,
-                spec=spec,
-            )
-            column = f"volatility_scalar_{idx}"
-            vol = vol.rename(columns={"volatility": column})
-            alpha = alpha.merge(vol, on="timestamp", how="left")
-            alpha["volatility_scalar"] = (
-                alpha["volatility_scalar"] + alpha[column].fillna(0.0)
-            )
-            alpha = alpha.drop(columns=[column])
-
-        alpha["timestamp"] = alpha["timestamp"].astype("int64")
-        for column in (
-            "best_bid_price",
-            "best_ask_price",
-            "instructor",
-            "intensity",
-            "volatility_scalar",
-        ):
-            alpha[column] = alpha[column].astype("float64")
-        return alpha.sort_values("timestamp", kind="mergesort", ignore_index=True)
-
-    def _read_sampled_ticker(self, symbol: str, date: str, freq_ms: int) -> pd.DataFrame:
-        path = sampled_ticker_path(
-            root=self.cache_root,
-            symbol=symbol,
-            freq_ms=freq_ms,
-            date_str=date,
-            scheme_shift_ms=normalize_scheme_shift(self.scheme_shift, freq_ms),
+        bookticker = self._read_bookticker_frame(symbol=symbol, date=date_str)
+        aggtrades = self._build_aggtrade_intensity_frame(
+            trades=trades,
+            force_close_timestamp=day_end_timestamp_ms(date_str),
         )
-        if not path.exists():
-            raise FileNotFoundError(f"missing sampled ticker: {path}")
-
-        frame = pd.read_parquet(path, columns=list(TICKER_COLUMNS))
-        missing = set(TICKER_COLUMNS) - set(frame.columns)
-        if missing:
-            raise ValueError(f"sampled ticker missing columns: {sorted(missing)}")
-        return frame
-
-    def _read_instructor_frame(
-        self,
-        symbol: str,
-        date: str,
-        freq_ms: int,
-        spec: dict[str, int | str],
-    ) -> pd.DataFrame:
-        name, lookback = self._parse_spec(spec=spec, default_name="trade_imbalance")
-        path = instructor_output_path(
-            root=self.cache_root,
-            symbol=symbol,
-            indicator=name,
-            freq_ms=freq_ms,
-            lookback=lookback,
-            date_str=date,
-            scheme_shift_ms=normalize_scheme_shift(self.scheme_shift, freq_ms),
+        yield from self._merge_events(
+            trades=trades,
+            bookticker=bookticker,
+            aggtrades=aggtrades,
         )
-        if not path.exists():
-            raise FileNotFoundError(f"missing instructor: {path}")
-
-        frame = pd.read_parquet(path, columns=["timestamp", "instructor"])
-        frame["timestamp"] = frame["timestamp"].astype("int64")
-        frame["instructor"] = frame["instructor"].astype("float64")
-        return frame.loc[:, ["timestamp", "instructor"]]
-
-    def _read_intensity_frame(
-        self,
-        symbol: str,
-        date: str,
-        freq_ms: int,
-        spec: dict[str, int | str],
-    ) -> pd.DataFrame:
-        name, lookback = self._parse_spec(spec=spec, default_name="k")
-        path = intensity_output_path(
-            root=self.cache_root,
-            symbol=symbol,
-            indicator=name,
-            freq_ms=freq_ms,
-            lookback=lookback,
-            date_str=date,
-            scheme_shift_ms=normalize_scheme_shift(self.scheme_shift, freq_ms),
-        )
-        if not path.exists():
-            raise FileNotFoundError(f"missing intensity: {path}")
-
-        frame = pd.read_parquet(path, columns=["timestamp", "intensity"])
-        frame["timestamp"] = frame["timestamp"].astype("int64")
-        frame["intensity"] = frame["intensity"].astype("float64")
-        return frame.loc[:, ["timestamp", "intensity"]]
-
-    def _read_volatility_frame(
-        self,
-        symbol: str,
-        date: str,
-        freq_ms: int,
-        spec: dict[str, int | str],
-    ) -> pd.DataFrame:
-        name, lookback = self._parse_spec(spec=spec, default_name="sigma")
-        path = volatility_output_path(
-            root=self.cache_root,
-            symbol=symbol,
-            indicator=name,
-            freq_ms=freq_ms,
-            lookback=lookback,
-            date_str=date,
-            scheme_shift_ms=normalize_scheme_shift(self.scheme_shift, freq_ms),
-        )
-        if not path.exists():
-            raise FileNotFoundError(f"missing volatility: {path}")
-
-        frame = pd.read_parquet(path, columns=["timestamp", "volatility"])
-        frame["timestamp"] = frame["timestamp"].astype("int64")
-        frame["volatility"] = frame["volatility"].astype("float64")
-        return frame.loc[:, ["timestamp", "volatility"]]
 
     def _read_trade_frame(self, symbol: str, date: str) -> pd.DataFrame:
         path = resolve_existing_input_path(
@@ -435,186 +327,154 @@ class BinanceEventLoader:
             ignore_index=True,
         )
 
-    def _read_orderbook_replay_frame(
-        self,
-        symbol: str,
-        date: str,
-    ) -> OrderBookReplayFrame | None:
-        cfg = self.orderbook_replay_config
-        if cfg is None:
-            return None
-
-        key = (
-            str(cfg.root),
-            symbol,
-            date,
-            cfg.replay_levels,
-            cfg.sample_interval_ms,
-            cfg.tick_size,
-            cfg.depth_price_min,
-            cfg.depth_price_max,
-            cfg.raw_quantity_max,
+    def _read_bookticker_frame(self, symbol: str, date: str) -> pd.DataFrame:
+        path = resolve_existing_input_path(
+            roots=self.bookticker_roots,
+            symbol=symbol,
+            date_str=date,
+            category=self.ticker_category,
         )
-        cached = _ORDERBOOK_REPLAY_CACHE.get(key)
-        if cached is not None:
-            return cached
-
-        path = orderbook_replay_path(root=cfg.root, symbol=symbol, date_str=date, cfg=cfg)
-        if not path.exists():
-            raise FileNotFoundError(f"missing orderbook replay snapshot: {path}")
-
-        columns = ["timestamp"]
-        for side in ("bid", "ask"):
-            for idx in range(cfg.replay_levels):
-                columns.append(f"{side}_price_{idx}")
-                columns.append(f"{side}_qty_{idx}")
-        frame = pd.read_parquet(path, columns=columns)
-        missing = set(columns) - set(frame.columns)
+        raw = pd.read_parquet(path, columns=list(RAW_TICKER_COLUMNS))
+        missing = set(RAW_TICKER_COLUMNS) - set(raw.columns)
         if missing:
-            raise ValueError(f"orderbook replay frame missing columns: {sorted(missing)}")
+            raise ValueError(f"bookticker frame missing columns: {sorted(missing)}")
 
-        timestamps = frame["timestamp"].astype("int64").to_numpy(copy=True)
-
-        def read_side(side: str) -> tuple[np.ndarray, np.ndarray]:
-            price_cols = [f"{side}_price_{idx}" for idx in range(cfg.replay_levels)]
-            qty_cols = [f"{side}_qty_{idx}" for idx in range(cfg.replay_levels)]
-            prices = frame.loc[:, price_cols].to_numpy(dtype="float64", copy=False)
-            qtys = frame.loc[:, qty_cols].to_numpy(dtype="float64", copy=False)
-            valid = np.isfinite(prices) & np.isfinite(qtys) & (prices > 0.0) & (qtys > 0.0)
-            raw_ticks = np.rint(prices / cfg.tick_size)
-            ticks = np.where(valid, raw_ticks, -1).astype(np.int32, copy=False)
-            notional = np.where(valid, prices * qtys, 0.0).astype(np.float32, copy=False)
-            return np.ascontiguousarray(ticks), np.ascontiguousarray(notional)
-
-        bid_ticks, bid_notional = read_side("bid")
-        ask_ticks, ask_notional = read_side("ask")
-
-        replay = OrderBookReplayFrame(
-            timestamps=timestamps,
-            bid_ticks=bid_ticks,
-            ask_ticks=ask_ticks,
-            bid_notional=bid_notional,
-            ask_notional=ask_notional,
+        frame = raw.rename(
+            columns={
+                "exchange_timestamp": "timestamp",
+                "price_bid": "best_bid_price",
+                "price_ask": "best_ask_price",
+                "volume_bid": "best_bid_qty",
+                "volume_ask": "best_ask_qty",
+            }
         )
-        _ORDERBOOK_REPLAY_CACHE[key] = replay
-        _ORDERBOOK_REPLAY_CACHE_ORDER.append(key)
-        while len(_ORDERBOOK_REPLAY_CACHE_ORDER) > _ORDERBOOK_REPLAY_CACHE_MAX_DAYS:
-            old_key = _ORDERBOOK_REPLAY_CACHE_ORDER.pop(0)
-            if old_key != key:
-                _ORDERBOOK_REPLAY_CACHE.pop(old_key, None)
-        return replay
+        frame = frame.dropna(subset=list(BBO_COLUMNS))
+        frame = frame[
+            (frame["best_bid_price"] > 0.0)
+            & (frame["best_ask_price"] > 0.0)
+            & (frame["best_ask_price"] >= frame["best_bid_price"])
+            & (frame["best_bid_qty"] >= 0.0)
+            & (frame["best_ask_qty"] >= 0.0)
+        ]
+        if frame.empty:
+            return pd.DataFrame({column: pd.Series(dtype="float64") for column in BBO_COLUMNS})
+
+        frame["timestamp"] = frame["timestamp"].astype("int64")
+        for column in BBO_COLUMNS[1:]:
+            frame[column] = frame[column].astype("float64")
+        return frame.loc[:, BBO_COLUMNS].sort_values(
+            "timestamp",
+            kind="mergesort",
+            ignore_index=True,
+        )
 
     @staticmethod
-    def _align_orderbook_replay_frame(
+    def _build_aggtrade_intensity_frame(
         *,
-        symbol: str,
-        date: str,
-        alpha_timestamps: np.ndarray,
-        replay: OrderBookReplayFrame,
-    ) -> OrderBookReplayFrame:
-        if len(alpha_timestamps) == len(replay.timestamps) and np.array_equal(
-            alpha_timestamps,
-            replay.timestamps,
-        ):
-            return replay
-
-        indices = np.searchsorted(replay.timestamps, alpha_timestamps)
-        if (
-            indices.shape[0] != alpha_timestamps.shape[0]
-            or np.any(indices >= len(replay.timestamps))
-            or not np.array_equal(replay.timestamps[indices], alpha_timestamps)
-        ):
-            raise ValueError(
-                "orderbook replay timestamp grid does not match sampled ticker "
-                f"for {symbol} {date}"
-            )
-        return OrderBookReplayFrame(
-            timestamps=np.array(alpha_timestamps, dtype=np.int64, copy=True),
-            bid_ticks=np.ascontiguousarray(replay.bid_ticks[indices]),
-            ask_ticks=np.ascontiguousarray(replay.ask_ticks[indices]),
-            bid_notional=np.ascontiguousarray(replay.bid_notional[indices]),
-            ask_notional=np.ascontiguousarray(replay.ask_notional[indices]),
-        )
-
-    @staticmethod
-    def _parse_spec(spec: dict[str, int | str], default_name: str) -> tuple[str, int]:
-        name = str(spec.get("name", default_name)).strip().lower()
-        if not name:
-            raise ValueError("indicator name must not be empty")
-        lookback = int(spec.get("lookback", 0))
-        if name == "bbo_imbalance":
-            if lookback != 0:
-                raise ValueError("bbo_imbalance lookback must be 0")
-        elif lookback <= 0:
-            raise ValueError(f"{name} lookback must be > 0")
-        return name, lookback
-
-    @staticmethod
-    def _merge_sorted(
-        alpha: pd.DataFrame,
         trades: pd.DataFrame,
-        replay: OrderBookReplayFrame | None = None,
-    ) -> Iterator[MergedEventTuple]:
-        alpha_iter = iter(
-            alpha.loc[
-                :,
-                [
-                    "timestamp",
-                    "best_bid_price",
-                    "best_ask_price",
-                    "instructor",
-                    "intensity",
-                    "volatility_scalar",
-                ],
-            ].itertuples(index=False, name=None)
+        force_close_timestamp: int | None = None,
+    ) -> pd.DataFrame:
+        columns = {
+            "timestamp": pd.Series(dtype="int64"),
+            "is_buyer_maker": pd.Series(dtype="bool"),
+            "impact": pd.Series(dtype="float64"),
+            "intensity": pd.Series(dtype="float64"),
+            "volume": pd.Series(dtype="float64"),
+            "first_price": pd.Series(dtype="float64"),
+            "last_price": pd.Series(dtype="float64"),
+            "forced_close": pd.Series(dtype="bool"),
+        }
+        if trades.empty:
+            return pd.DataFrame(columns)
+
+        events = build_confirmed_aggtrade_events(
+            trades=trades,
+            force_close_timestamp=force_close_timestamp,
         )
+        if events.empty:
+            return pd.DataFrame(columns)
+        events = events.sort_values("timestamp", kind="mergesort", ignore_index=True)
+        events["intensity"] = events["impact"].astype("float64")
+        return events.loc[:, AGGTRADE_COLUMNS]
+
+    @staticmethod
+    def _merge_events(
+        trades: pd.DataFrame,
+        bookticker: pd.DataFrame,
+        aggtrades: pd.DataFrame,
+    ) -> Iterator[MergedEventTuple]:
         trade_iter = iter(
             trades.loc[:, ["timestamp", "is_buyer_maker", "price", "volume"]].itertuples(
                 index=False,
                 name=None,
             )
         )
+        bbo_iter = iter(bookticker.loc[:, BBO_COLUMNS].itertuples(index=False, name=None))
+        agg_iter = iter(
+            aggtrades.loc[
+                :,
+                [
+                    "timestamp",
+                    "is_buyer_maker",
+                    "impact",
+                    "intensity",
+                    "volume",
+                    "first_price",
+                    "last_price",
+                ],
+            ].itertuples(index=False, name=None)
+        )
 
-        alpha_row = next(alpha_iter, None)
-        alpha_idx = 0
         trade_row = next(trade_iter, None)
+        bbo_row = next(bbo_iter, None)
+        agg_row = next(agg_iter, None)
+        while trade_row is not None or bbo_row is not None or agg_row is not None:
+            candidates: list[int] = []
+            if trade_row is not None:
+                candidates.append(int(trade_row[0]))
+            if bbo_row is not None:
+                candidates.append(int(bbo_row[0]))
+            if agg_row is not None:
+                candidates.append(int(agg_row[0]))
+            ts = min(candidates)
 
-        while alpha_row is not None or trade_row is not None:
-            if trade_row is not None and (
-                alpha_row is None or int(trade_row[0]) <= int(alpha_row[0])
-            ):
+            while trade_row is not None and int(trade_row[0]) == ts:
+                row = trade_row
                 yield (
                     "trade",
-                    int(trade_row[0]),
-                    bool(trade_row[1]),
-                    float(trade_row[2]),
-                    float(trade_row[3]),
+                    int(row[0]),
+                    bool(row[1]),
+                    float(row[2]),
+                    float(row[3]),
                 )
                 trade_row = next(trade_iter, None)
-                continue
 
-            assert alpha_row is not None
-            bid = float(alpha_row[1])
-            ask = float(alpha_row[2])
-            instructor = float(alpha_row[3]) if math.isfinite(float(alpha_row[3])) else 0.0
-            intensity = float(alpha_row[4]) if math.isfinite(float(alpha_row[4])) else 0.0
-            volatility = float(alpha_row[5]) if math.isfinite(float(alpha_row[5])) else 0.0
-            bid_replay_ticks = None if replay is None else replay.bid_ticks[alpha_idx]
-            ask_replay_ticks = None if replay is None else replay.ask_ticks[alpha_idx]
-            bid_replay_notional = None if replay is None else replay.bid_notional[alpha_idx]
-            ask_replay_notional = None if replay is None else replay.ask_notional[alpha_idx]
-            yield (
-                "ticker",
-                int(alpha_row[0]),
-                bid,
-                ask,
-                instructor,
-                intensity,
-                volatility,
-                bid_replay_ticks,
-                ask_replay_ticks,
-                bid_replay_notional,
-                ask_replay_notional,
-            )
-            alpha_row = next(alpha_iter, None)
-            alpha_idx += 1
+            while bbo_row is not None and int(bbo_row[0]) == ts:
+                row = bbo_row
+                bid = float(row[1])
+                ask = float(row[2])
+                bid_qty = float(row[3]) if math.isfinite(float(row[3])) else 0.0
+                ask_qty = float(row[4]) if math.isfinite(float(row[4])) else 0.0
+                yield (
+                    "bookticker",
+                    int(row[0]),
+                    bid,
+                    ask,
+                    bid_qty,
+                    ask_qty,
+                )
+                bbo_row = next(bbo_iter, None)
+
+            while agg_row is not None and int(agg_row[0]) == ts:
+                row = agg_row
+                yield (
+                    "aggtrade",
+                    int(row[0]),
+                    bool(row[1]),
+                    float(row[2]),
+                    float(row[3]),
+                    float(row[4]),
+                    float(row[5]),
+                    float(row[6]),
+                )
+                agg_row = next(agg_iter, None)
