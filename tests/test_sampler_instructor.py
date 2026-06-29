@@ -239,8 +239,8 @@ class SamplerInstructorTest(unittest.TestCase):
             pd.DataFrame(
                 {
                     "exchange_timestamp": [timestamps[0], timestamps[1], timestamps[2]],
-                    "price": [103.0, 104.0, 100.0],
-                    "volume": [1.0, 3.0, 100.0],
+                    "price": [103.0, 95.0, 104.0],
+                    "volume": [1.0, 3.0, 2.0],
                 }
             ).to_parquet(trade_dir / f"{symbol}--TRADE--{date}.parquet", index=False)
 
@@ -254,10 +254,19 @@ class SamplerInstructorTest(unittest.TestCase):
                 trade_roots=(trade_root,),
             )
 
-            self.assertEqual(float(out.loc[0, "intensity"]), 0.0)
-            self.assertEqual(float(out.loc[1, "intensity"]), 2.0)
-            self.assertAlmostEqual(float(out.loc[2, "intensity"]), 2.75)
-            self.assertEqual(float(out.loc[3, "intensity"]), 3.0)
+            self.assertEqual(out.columns.tolist(), [
+                "timestamp",
+                "intensity_positive",
+                "intensity_negative",
+            ])
+            self.assertEqual(float(out.loc[0, "intensity_positive"]), 0.0)
+            self.assertEqual(float(out.loc[0, "intensity_negative"]), 0.0)
+            self.assertEqual(float(out.loc[1, "intensity_positive"]), 2.0)
+            self.assertEqual(float(out.loc[1, "intensity_negative"]), 0.0)
+            self.assertEqual(float(out.loc[2, "intensity_positive"]), 2.0)
+            self.assertEqual(float(out.loc[2, "intensity_negative"]), 4.0)
+            self.assertEqual(float(out.loc[3, "intensity_positive"]), 3.0)
+            self.assertEqual(float(out.loc[3, "intensity_negative"]), 4.0)
 
     def test_loader_merges_instructor_into_alpha_frame(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -320,12 +329,14 @@ class SamplerInstructorTest(unittest.TestCase):
                     "best_bid_price",
                     "best_ask_price",
                     "instructor",
-                    "intensity",
+                    "intensity_positive",
+                    "intensity_negative",
                     "volatility_scalar",
                 ],
             )
             self.assertEqual(alpha["instructor"].tolist(), [0.25, -0.5])
-            self.assertEqual(alpha["intensity"].tolist(), [1.5, 2.5])
+            self.assertEqual(alpha["intensity_positive"].tolist(), [1.5, 2.5])
+            self.assertEqual(alpha["intensity_negative"].tolist(), [1.5, 2.5])
             self.assertEqual(alpha["volatility_scalar"].tolist(), [0.1, 0.2])
 
     def test_loader_uses_shifted_cache_paths(self):
@@ -378,7 +389,96 @@ class SamplerInstructorTest(unittest.TestCase):
             )
 
             self.assertEqual(alpha["timestamp"].tolist(), timestamps)
-            self.assertEqual(alpha["intensity"].tolist(), [1.5, 2.5])
+            self.assertEqual(alpha["intensity_positive"].tolist(), [1.5, 2.5])
+            self.assertEqual(alpha["intensity_negative"].tolist(), [1.5, 2.5])
+
+    def test_loader_maps_split_kw_vol_columns_into_directional_intensity(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "cache"
+            symbol = "BTCUSDT"
+            date = "2025-01-01"
+            freq_ms = 1000
+            ts0 = int(day_timestamp_grid(date, freq_ms)[0])
+            timestamps = [ts0, ts0 + freq_ms]
+
+            ticker_path = sampled_ticker_path(root, symbol, freq_ms, date)
+            ticker_path.parent.mkdir(parents=True)
+            pd.DataFrame(
+                {
+                    "timestamp": timestamps,
+                    "best_bid_price": [100.0, 101.0],
+                    "best_ask_price": [100.5, 101.5],
+                    "best_bid_qty": [1.0, 1.0],
+                    "best_ask_qty": [1.0, 1.0],
+                }
+            ).to_parquet(ticker_path, index=False)
+
+            intensity_path = intensity_output_path(root, symbol, "kw_vol", freq_ms, 300, date)
+            intensity_path.parent.mkdir(parents=True)
+            pd.DataFrame(
+                {
+                    "timestamp": timestamps,
+                    "kw_vol_positive": [1.5, 2.5],
+                    "kw_vol_negative": [3.5, 4.5],
+                }
+            ).to_parquet(intensity_path, index=False)
+
+            loader = BinanceEventLoader(cache_root=root, scheme_shift=0)
+            alpha = loader._read_alpha_frame(
+                symbol=symbol,
+                date=date,
+                freq_ms=freq_ms,
+                trade_intensity_spec={"name": "kw_vol", "lookback": 300},
+                volatility_specs=[],
+                instructor_spec=None,
+            )
+
+            self.assertEqual(alpha["intensity_positive"].tolist(), [1.5, 2.5])
+            self.assertEqual(alpha["intensity_negative"].tolist(), [3.5, 4.5])
+
+    def test_loader_pairs_split_kw_vol_files_into_directional_intensity(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "cache"
+            symbol = "BTCUSDT"
+            date = "2025-01-01"
+            freq_ms = 1000
+            ts0 = int(day_timestamp_grid(date, freq_ms)[0])
+            timestamps = [ts0, ts0 + freq_ms]
+
+            ticker_path = sampled_ticker_path(root, symbol, freq_ms, date)
+            ticker_path.parent.mkdir(parents=True)
+            pd.DataFrame(
+                {
+                    "timestamp": timestamps,
+                    "best_bid_price": [100.0, 101.0],
+                    "best_ask_price": [100.5, 101.5],
+                    "best_bid_qty": [1.0, 1.0],
+                    "best_ask_qty": [1.0, 1.0],
+                }
+            ).to_parquet(ticker_path, index=False)
+
+            for name, values in (
+                ("kw_vol_positive", [1.5, 2.5]),
+                ("kw_vol_negative", [3.5, 4.5]),
+            ):
+                intensity_path = intensity_output_path(root, symbol, name, freq_ms, 300, date)
+                intensity_path.parent.mkdir(parents=True)
+                pd.DataFrame(
+                    {"timestamp": timestamps, "intensity": values}
+                ).to_parquet(intensity_path, index=False)
+
+            loader = BinanceEventLoader(cache_root=root, scheme_shift=0)
+            alpha = loader._read_alpha_frame(
+                symbol=symbol,
+                date=date,
+                freq_ms=freq_ms,
+                trade_intensity_spec={"name": "kw_vol", "lookback": 300},
+                volatility_specs=[],
+                instructor_spec=None,
+            )
+
+            self.assertEqual(alpha["intensity_positive"].tolist(), [1.5, 2.5])
+            self.assertEqual(alpha["intensity_negative"].tolist(), [3.5, 4.5])
 
     def test_loader_allows_bbo_imbalance_zero_lookback(self):
         self.assertEqual(

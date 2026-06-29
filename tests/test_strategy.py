@@ -1212,6 +1212,26 @@ class StrategyQuoteTest(unittest.TestCase):
         self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(101.4, 1.0)])
         self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.6, 1.0)])
 
+    def test_flat_open_quote_uses_directional_intensity_by_quote_side(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                adj_spread_intensity=(3.0, 1.0),
+                adj_spread_volatility=(0.0, 0.0),
+            )
+        )
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=100.4,
+            best_ask=100.6,
+            intensity_positive=0.2,
+            intensity_negative=0.5,
+            volatility_scalar=0.0,
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(101.2, 1.0)])
+        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(98.9, 1.0)])
+
     def test_min_quote_distance_bps_floors_simple_open_quotes_to_ticks(self):
         engine = SimpleMakerStrategy(make_config(min_quote_distance_bps=59.0))
 

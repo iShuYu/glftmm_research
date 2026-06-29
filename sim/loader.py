@@ -4,7 +4,7 @@ import datetime as dt
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Literal, TypeAlias
+from typing import Any, Iterable, Iterator, Literal, NamedTuple, TypeAlias
 
 import numpy as np
 import pandas as pd
@@ -18,21 +18,32 @@ from sampler.volatility import volatility_output_path
 
 
 DateLike: TypeAlias = str | dt.date | dt.datetime | pd.Timestamp
-TradeTuple: TypeAlias = tuple[Literal["trade"], int, bool, float, float]
-AlphaTuple: TypeAlias = tuple[
-    Literal["ticker"],
-    int,
-    float,
-    float,
-    float | None,
-    float | None,
-    float,
-    Any,
-    Any,
-    Any,
-    Any,
-]
-MergedEventTuple: TypeAlias = TradeTuple | AlphaTuple
+
+
+class TradeEvent(NamedTuple):
+    kind: Literal["trade"]
+    timestamp: int
+    is_buyer_maker: bool
+    price: float
+    volume: float
+
+
+class AlphaEvent(NamedTuple):
+    kind: Literal["ticker"]
+    timestamp: int
+    best_bid_price: float
+    best_ask_price: float
+    instructor: float | None
+    intensity_positive: float | None
+    intensity_negative: float | None
+    volatility_scalar: float
+    replay_bid_ticks: Any
+    replay_ask_ticks: Any
+    replay_bid_notional: Any
+    replay_ask_notional: Any
+
+
+MergedEventTuple: TypeAlias = TradeEvent | AlphaEvent
 
 RAW_TRADE_TIME_COLUMN = "exchange_timestamp"
 RAW_TRADE_COLUMNS = (
@@ -46,6 +57,11 @@ TICKER_COLUMNS = (
     "best_bid_price",
     "best_ask_price",
 )
+INTENSITY_COLUMNS = ("intensity_positive", "intensity_negative")
+INTENSITY_COLUMN_ALIASES = {
+    "intensity_positive": ("intensity_positive", "kw_vol_positive"),
+    "intensity_negative": ("intensity_negative", "kw_vol_negative"),
+}
 DEFAULT_CACHE_ROOT = Path("/data/users/kang/backtest/glftmm/cached")
 DEFAULT_DATA_ROOT = Path("/data/users/data-helper/PROCESSED/TARDIS/BINANCE/UFUTURES")
 DEFAULT_BACKUP_DATA_ROOT = Path("/home/kang/data_helper/PROCESSED/DATA_RECORDER/BINANCE/UFUTURES")
@@ -257,7 +273,8 @@ class BinanceEventLoader:
         ticker = self._read_sampled_ticker(symbol=symbol, date=date, freq_ms=freq_ms)
         alpha = ticker.loc[:, TICKER_COLUMNS].copy()
         alpha["instructor"] = 0.0
-        alpha["intensity"] = 0.0
+        alpha["intensity_positive"] = 0.0
+        alpha["intensity_negative"] = 0.0
         alpha["volatility_scalar"] = 0.0
 
         if instructor_spec is not None:
@@ -279,8 +296,10 @@ class BinanceEventLoader:
                 spec=trade_intensity_spec,
             )
             alpha = alpha.merge(intensity, on="timestamp", how="left", suffixes=("", "_new"))
-            alpha["intensity"] = alpha["intensity_new"].fillna(alpha["intensity"])
-            alpha = alpha.drop(columns=["intensity_new"])
+            for column in INTENSITY_COLUMNS:
+                new_column = f"{column}_new"
+                alpha[column] = alpha[new_column].fillna(alpha[column])
+                alpha = alpha.drop(columns=[new_column])
 
         for idx, spec in enumerate(volatility_specs or ()):
             vol = self._read_volatility_frame(
@@ -302,7 +321,8 @@ class BinanceEventLoader:
             "best_bid_price",
             "best_ask_price",
             "instructor",
-            "intensity",
+            "intensity_positive",
+            "intensity_negative",
             "volatility_scalar",
         ):
             alpha[column] = alpha[column].astype("float64")
@@ -368,12 +388,114 @@ class BinanceEventLoader:
             scheme_shift_ms=normalize_scheme_shift(self.scheme_shift, freq_ms),
         )
         if not path.exists():
+            frame = self._read_directional_intensity_pair(
+                symbol=symbol,
+                date=date,
+                freq_ms=freq_ms,
+                name=name,
+                lookback=lookback,
+            )
+            if frame is not None:
+                return frame
             raise FileNotFoundError(f"missing intensity: {path}")
 
-        frame = pd.read_parquet(path, columns=["timestamp", "intensity"])
+        frame = pd.read_parquet(path)
+        frame = self._normalize_intensity_columns(frame, source=str(path))
+        return frame.loc[:, ["timestamp", *INTENSITY_COLUMNS]]
+
+    def _read_directional_intensity_pair(
+        self,
+        symbol: str,
+        date: str,
+        freq_ms: int,
+        name: str,
+        lookback: int,
+    ) -> pd.DataFrame | None:
+        if name not in ("kw_vol", "kw_vol_positive", "kw_vol_negative"):
+            return None
+
+        positive = self._read_single_intensity_file(
+            symbol=symbol,
+            date=date,
+            freq_ms=freq_ms,
+            name="kw_vol_positive",
+            lookback=lookback,
+        )
+        negative = self._read_single_intensity_file(
+            symbol=symbol,
+            date=date,
+            freq_ms=freq_ms,
+            name="kw_vol_negative",
+            lookback=lookback,
+        )
+        if positive is None or negative is None:
+            return None
+
+        frame = positive.merge(negative, on="timestamp", how="outer")
+        frame["intensity_positive"] = frame["intensity_positive"].fillna(0.0)
+        frame["intensity_negative"] = frame["intensity_negative"].fillna(0.0)
         frame["timestamp"] = frame["timestamp"].astype("int64")
-        frame["intensity"] = frame["intensity"].astype("float64")
-        return frame.loc[:, ["timestamp", "intensity"]]
+        frame["intensity_positive"] = frame["intensity_positive"].astype("float64")
+        frame["intensity_negative"] = frame["intensity_negative"].astype("float64")
+        return frame.loc[:, ["timestamp", *INTENSITY_COLUMNS]].sort_values(
+            "timestamp",
+            kind="mergesort",
+            ignore_index=True,
+        )
+
+    def _read_single_intensity_file(
+        self,
+        symbol: str,
+        date: str,
+        freq_ms: int,
+        name: str,
+        lookback: int,
+    ) -> pd.DataFrame | None:
+        path = intensity_output_path(
+            root=self.cache_root,
+            symbol=symbol,
+            indicator=name,
+            freq_ms=freq_ms,
+            lookback=lookback,
+            date_str=date,
+            scheme_shift_ms=normalize_scheme_shift(self.scheme_shift, freq_ms),
+        )
+        if not path.exists():
+            return None
+
+        side = name.rsplit("_", 1)[-1]
+        column = f"intensity_{side}"
+        frame = pd.read_parquet(path)
+        if "timestamp" not in frame.columns or "intensity" not in frame.columns:
+            raise ValueError(f"single-side intensity frame has invalid schema: {path}")
+        frame["timestamp"] = frame["timestamp"].astype("int64")
+        frame[column] = frame["intensity"].astype("float64")
+        return frame.loc[:, ["timestamp", column]]
+
+    @staticmethod
+    def _normalize_intensity_columns(frame: pd.DataFrame, source: str) -> pd.DataFrame:
+        if "timestamp" not in frame.columns:
+            raise ValueError(f"intensity frame missing timestamp column: {source}")
+
+        out = frame.loc[:, ["timestamp"]].copy()
+        if "intensity" in frame.columns:
+            out["intensity_positive"] = frame["intensity"]
+            out["intensity_negative"] = frame["intensity"]
+        else:
+            for output_column, aliases in INTENSITY_COLUMN_ALIASES.items():
+                for alias in aliases:
+                    if alias in frame.columns:
+                        out[output_column] = frame[alias]
+                        break
+                else:
+                    raise ValueError(
+                        f"intensity frame missing {output_column} column: {source}"
+                    )
+
+        out["timestamp"] = out["timestamp"].astype("int64")
+        out["intensity_positive"] = out["intensity_positive"].astype("float64")
+        out["intensity_negative"] = out["intensity_negative"].astype("float64")
+        return out
 
     def _read_volatility_frame(
         self,
@@ -563,7 +685,8 @@ class BinanceEventLoader:
                     "best_bid_price",
                     "best_ask_price",
                     "instructor",
-                    "intensity",
+                    "intensity_positive",
+                    "intensity_negative",
                     "volatility_scalar",
                 ],
             ].itertuples(index=False, name=None)
@@ -583,12 +706,12 @@ class BinanceEventLoader:
             if trade_row is not None and (
                 alpha_row is None or int(trade_row[0]) <= int(alpha_row[0])
             ):
-                yield (
-                    "trade",
-                    int(trade_row[0]),
-                    bool(trade_row[1]),
-                    float(trade_row[2]),
-                    float(trade_row[3]),
+                yield TradeEvent(
+                    kind="trade",
+                    timestamp=int(trade_row[0]),
+                    is_buyer_maker=bool(trade_row[1]),
+                    price=float(trade_row[2]),
+                    volume=float(trade_row[3]),
                 )
                 trade_row = next(trade_iter, None)
                 continue
@@ -597,24 +720,30 @@ class BinanceEventLoader:
             bid = float(alpha_row[1])
             ask = float(alpha_row[2])
             instructor = float(alpha_row[3]) if math.isfinite(float(alpha_row[3])) else 0.0
-            intensity = float(alpha_row[4]) if math.isfinite(float(alpha_row[4])) else 0.0
-            volatility = float(alpha_row[5]) if math.isfinite(float(alpha_row[5])) else 0.0
+            intensity_positive = (
+                float(alpha_row[4]) if math.isfinite(float(alpha_row[4])) else 0.0
+            )
+            intensity_negative = (
+                float(alpha_row[5]) if math.isfinite(float(alpha_row[5])) else 0.0
+            )
+            volatility = float(alpha_row[6]) if math.isfinite(float(alpha_row[6])) else 0.0
             bid_replay_ticks = None if replay is None else replay.bid_ticks[alpha_idx]
             ask_replay_ticks = None if replay is None else replay.ask_ticks[alpha_idx]
             bid_replay_notional = None if replay is None else replay.bid_notional[alpha_idx]
             ask_replay_notional = None if replay is None else replay.ask_notional[alpha_idx]
-            yield (
-                "ticker",
-                int(alpha_row[0]),
-                bid,
-                ask,
-                instructor,
-                intensity,
-                volatility,
-                bid_replay_ticks,
-                ask_replay_ticks,
-                bid_replay_notional,
-                ask_replay_notional,
+            yield AlphaEvent(
+                kind="ticker",
+                timestamp=int(alpha_row[0]),
+                best_bid_price=bid,
+                best_ask_price=ask,
+                instructor=instructor,
+                intensity_positive=intensity_positive,
+                intensity_negative=intensity_negative,
+                volatility_scalar=volatility,
+                replay_bid_ticks=bid_replay_ticks,
+                replay_ask_ticks=ask_replay_ticks,
+                replay_bid_notional=bid_replay_notional,
+                replay_ask_notional=ask_replay_notional,
             )
             alpha_row = next(alpha_iter, None)
             alpha_idx += 1

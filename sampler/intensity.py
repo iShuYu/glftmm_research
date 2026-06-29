@@ -46,7 +46,16 @@ from sampler.resample import (
 DEFAULT_DATA_ROOT = DEFAULT_BOOKTICKER_ROOT.parent
 DEFAULT_TRADE_ROOT = DEFAULT_DATA_ROOT / "TRADE"
 DEFAULT_INTENSITY_ROOT = DEFAULT_DATA_ROOT / "TRADE_INTENSITY"
-SUPPORTED_INDICATORS = ("k", "kw_vol", "k_decay", "k_median")
+SUPPORTED_INDICATORS = (
+    "k",
+    "kw_vol",
+    "kw_vol_positive",
+    "kw_vol_negative",
+    "k_decay",
+    "k_median",
+)
+INTENSITY_COLUMN = "intensity"
+DIRECTIONAL_INTENSITY_COLUMNS = ("intensity_positive", "intensity_negative")
 TICKER_COLUMNS = ("timestamp", "best_bid_price", "best_ask_price")
 RAW_TRADE_TIME_COLUMN = "exchange_timestamp"
 RAW_TRADE_COLUMNS = (RAW_TRADE_TIME_COLUMN, "price", "volume")
@@ -285,6 +294,12 @@ def rolling_median_excluding_zeros(values: pd.Series, lookback: int) -> pd.Serie
     return vals.rolling(window=lookback, min_periods=1).median().fillna(0.0)
 
 
+def output_intensity_columns(indicator: str) -> tuple[str, ...]:
+    if indicator == "kw_vol":
+        return DIRECTIONAL_INTENSITY_COLUMNS
+    return (INTENSITY_COLUMN,)
+
+
 def build_trade_intensity_frame(
     symbol: str,
     date: str,
@@ -326,12 +341,10 @@ def build_trade_intensity_frame(
             ticker_frames.append(tdf.loc[:, TICKER_COLUMNS].copy())
 
     if not ticker_frames:
-        return pd.DataFrame(
-            {
-                "timestamp": pd.Series(dtype="int64"),
-                "intensity": pd.Series(dtype="float64"),
-            }
-        )
+        empty = {"timestamp": pd.Series(dtype="int64")}
+        for column in output_intensity_columns(indicator):
+            empty[column] = pd.Series(dtype="float64")
+        return pd.DataFrame(empty)
 
     ticker = (
         pd.concat(ticker_frames, ignore_index=True)
@@ -358,7 +371,8 @@ def build_trade_intensity_frame(
             trade_frames.append(trades)
 
     out = ticker.copy()
-    out["bucket_break_dist_max"] = 0.0
+    out["bucket_break_dist_positive_max"] = 0.0
+    out["bucket_break_dist_negative_max"] = 0.0
     out["bucket_volume"] = 0.0
 
     if trade_frames:
@@ -382,54 +396,86 @@ def build_trade_intensity_frame(
 
             ask_break = np.where(trade_prices > ask_prices, trade_prices - ask_prices, 0.0)
             bid_break = np.where(trade_prices < bid_prices, bid_prices - trade_prices, 0.0)
-            break_dist = np.maximum(ask_break, bid_break)
 
             bucket = (
                 pd.DataFrame(
                     {
                         "timestamp": trade_buckets,
-                        "bucket_break_dist_max": break_dist,
+                        "bucket_break_dist_positive_max": ask_break,
+                        "bucket_break_dist_negative_max": bid_break,
                         "bucket_volume": trade_volumes,
                     }
                 )
                 .groupby("timestamp", as_index=False, sort=True)
                 .agg(
-                    bucket_break_dist_max=("bucket_break_dist_max", "max"),
+                    bucket_break_dist_positive_max=("bucket_break_dist_positive_max", "max"),
+                    bucket_break_dist_negative_max=("bucket_break_dist_negative_max", "max"),
                     bucket_volume=("bucket_volume", "sum"),
                 )
             )
-            out = out.drop(columns=["bucket_break_dist_max", "bucket_volume"]).merge(
+            out = out.drop(
+                columns=[
+                    "bucket_break_dist_positive_max",
+                    "bucket_break_dist_negative_max",
+                    "bucket_volume",
+                ]
+            ).merge(
                 bucket,
                 on="timestamp",
                 how="left",
             )
-            out["bucket_break_dist_max"] = out["bucket_break_dist_max"].fillna(0.0)
+            out["bucket_break_dist_positive_max"] = out[
+                "bucket_break_dist_positive_max"
+            ].fillna(0.0)
+            out["bucket_break_dist_negative_max"] = out[
+                "bucket_break_dist_negative_max"
+            ].fillna(0.0)
             out["bucket_volume"] = out["bucket_volume"].fillna(0.0)
 
     # Feature at t uses breakouts observed in [t - freq, t).
-    out["bucket_break_dist_max"] = (
-        out["bucket_break_dist_max"].shift(1).fillna(0.0).astype("float64")
-    )
+    for column in ("bucket_break_dist_positive_max", "bucket_break_dist_negative_max"):
+        out[column] = out[column].shift(1).fillna(0.0).astype("float64")
     out["bucket_volume"] = out["bucket_volume"].shift(1).fillna(0.0).astype("float64")
+    out["bucket_break_dist_max"] = np.maximum(
+        out["bucket_break_dist_positive_max"],
+        out["bucket_break_dist_negative_max"],
+    )
 
     if indicator == "k":
-        out["intensity"] = rolling_mean_excluding_zeros(
+        out[INTENSITY_COLUMN] = rolling_mean_excluding_zeros(
             values=out["bucket_break_dist_max"],
             lookback=lookback,
         )
     elif indicator == "kw_vol":
-        out["intensity"] = rolling_volume_weighted_mean_excluding_zeros(
-            values=out["bucket_break_dist_max"],
+        out["intensity_positive"] = rolling_volume_weighted_mean_excluding_zeros(
+            values=out["bucket_break_dist_positive_max"],
+            weights=out["bucket_volume"],
+            lookback=lookback,
+        )
+        out["intensity_negative"] = rolling_volume_weighted_mean_excluding_zeros(
+            values=out["bucket_break_dist_negative_max"],
+            weights=out["bucket_volume"],
+            lookback=lookback,
+        )
+    elif indicator == "kw_vol_positive":
+        out[INTENSITY_COLUMN] = rolling_volume_weighted_mean_excluding_zeros(
+            values=out["bucket_break_dist_positive_max"],
+            weights=out["bucket_volume"],
+            lookback=lookback,
+        )
+    elif indicator == "kw_vol_negative":
+        out[INTENSITY_COLUMN] = rolling_volume_weighted_mean_excluding_zeros(
+            values=out["bucket_break_dist_negative_max"],
             weights=out["bucket_volume"],
             lookback=lookback,
         )
     elif indicator == "k_decay":
-        out["intensity"] = compute_k_decay(
+        out[INTENSITY_COLUMN] = compute_k_decay(
             break_dist=out["bucket_break_dist_max"],
             lookback=lookback,
         )
     elif indicator == "k_median":
-        out["intensity"] = rolling_median_excluding_zeros(
+        out[INTENSITY_COLUMN] = rolling_median_excluding_zeros(
             values=out["bucket_break_dist_max"],
             lookback=lookback,
         )
@@ -443,8 +489,10 @@ def build_trade_intensity_frame(
         ignore_index=True,
     )
     out["timestamp"] = out["timestamp"].astype("int64")
-    out["intensity"] = out["intensity"].astype("float64")
-    return out.loc[:, ["timestamp", "intensity"]]
+    value_columns = output_intensity_columns(indicator)
+    for column in value_columns:
+        out[column] = out[column].astype("float64")
+    return out.loc[:, ["timestamp", *value_columns]]
 
 
 def validate_intensity_frame(
@@ -453,7 +501,16 @@ def validate_intensity_frame(
     freq_ms: int,
     scheme_shift_ms: int = 0,
 ) -> None:
-    required = {"timestamp", "intensity"}
+    value_columns = [
+        column
+        for column in (INTENSITY_COLUMN, *DIRECTIONAL_INTENSITY_COLUMNS)
+        if column in df.columns
+    ]
+    has_single = INTENSITY_COLUMN in value_columns
+    has_directional = all(column in value_columns for column in DIRECTIONAL_INTENSITY_COLUMNS)
+    required = {"timestamp"}
+    if not has_single and not has_directional:
+        required.add(INTENSITY_COLUMN)
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"trade-intensity frame missing columns: {sorted(missing)}")
@@ -479,11 +536,12 @@ def validate_intensity_frame(
     if not np.array_equal(timestamps, expected_grid):
         raise ValueError("trade-intensity timestamp grid does not match scheme_shift")
 
-    values = df["intensity"].to_numpy(dtype="float64")
-    if np.isnan(values).any():
-        raise ValueError("trade-intensity contains NaN")
-    if (values < 0.0).any():
-        raise ValueError("trade-intensity contains negative values")
+    for column in value_columns:
+        values = df[column].to_numpy(dtype="float64")
+        if np.isnan(values).any():
+            raise ValueError(f"trade-intensity {column} contains NaN")
+        if (values < 0.0).any():
+            raise ValueError(f"trade-intensity {column} contains negative values")
 
 
 def run_one(task: Task) -> str:

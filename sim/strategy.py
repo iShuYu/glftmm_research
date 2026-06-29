@@ -563,17 +563,42 @@ class SimpleMakerStrategy:
                     trade_qty=float(event[4]),
                 )
             else:
+                if hasattr(event, "intensity_positive"):
+                    intensity_positive = event.intensity_positive
+                    intensity_negative = event.intensity_negative
+                    volatility_scalar = float(event.volatility_scalar)
+                    replay_bid_ticks = event.replay_bid_ticks
+                    replay_ask_ticks = event.replay_ask_ticks
+                    replay_bid_notional = event.replay_bid_notional
+                    replay_ask_notional = event.replay_ask_notional
+                elif len(event) >= 12:
+                    intensity_positive = event[5]
+                    intensity_negative = event[6]
+                    volatility_scalar = float(event[7])
+                    replay_bid_ticks = event[8] if len(event) > 8 else None
+                    replay_ask_ticks = event[9] if len(event) > 9 else None
+                    replay_bid_notional = event[10] if len(event) > 10 else None
+                    replay_ask_notional = event[11] if len(event) > 11 else None
+                else:
+                    intensity_positive = event[5]
+                    intensity_negative = event[5]
+                    volatility_scalar = float(event[6])
+                    replay_bid_ticks = event[7] if len(event) > 7 else None
+                    replay_ask_ticks = event[8] if len(event) > 8 else None
+                    replay_bid_notional = event[9] if len(event) > 9 else None
+                    replay_ask_notional = event[10] if len(event) > 10 else None
                 self._on_ticker_event(
                     timestamp=ts,
                     best_bid=float(event[2]),
                     best_ask=float(event[3]),
                     instructor_value=event[4],
-                    intensity_value=event[5],
-                    volatility_scalar=float(event[6]),
-                    replay_bid_ticks=event[7] if len(event) > 7 else None,
-                    replay_ask_ticks=event[8] if len(event) > 8 else None,
-                    replay_bid_notional=event[9] if len(event) > 9 else None,
-                    replay_ask_notional=event[10] if len(event) > 10 else None,
+                    intensity_positive=intensity_positive,
+                    intensity_negative=intensity_negative,
+                    volatility_scalar=volatility_scalar,
+                    replay_bid_ticks=replay_bid_ticks,
+                    replay_ask_ticks=replay_ask_ticks,
+                    replay_bid_notional=replay_bid_notional,
+                    replay_ask_notional=replay_ask_notional,
                 )
         return pd.DataFrame(
             self._records,
@@ -688,13 +713,15 @@ class SimpleMakerStrategy:
         timestamp: int,
         best_bid: float,
         best_ask: float,
-        intensity_value: Optional[float],
-        volatility_scalar: float,
+        intensity_value: Optional[float] = None,
+        volatility_scalar: float = 0.0,
         instructor_value: Optional[float] = None,
         replay_bid_ticks: object = None,
         replay_ask_ticks: object = None,
         replay_bid_notional: object = None,
         replay_ask_notional: object = None,
+        intensity_positive: Optional[float] = None,
+        intensity_negative: Optional[float] = None,
     ) -> None:
         rounded_best_bid = self._round_to_precision(float(best_bid), self.sim.price_precision)
         rounded_best_ask = self._round_to_precision(float(best_ask), self.sim.price_precision)
@@ -708,16 +735,31 @@ class SimpleMakerStrategy:
             return
         mid = 0.5 * (rounded_best_bid + rounded_best_ask)
 
-        intensity_base = self._safe_non_negative(intensity_value)
+        if intensity_positive is None:
+            intensity_positive = intensity_value
+        if intensity_negative is None:
+            intensity_negative = intensity_value
+        positive_intensity_base = self._safe_non_negative(intensity_positive)
+        negative_intensity_base = self._safe_non_negative(intensity_negative)
         instructor_scalar = self._safe_finite(instructor_value)
         vol_scalar = self._safe_non_negative(volatility_scalar)
-        open_distance = self._quote_distance(
-            intensity_base=intensity_base,
+        open_ask_distance = self._quote_distance(
+            intensity_base=positive_intensity_base,
             vol_scalar=vol_scalar,
             close=False,
         )
-        close_distance = self._quote_distance(
-            intensity_base=intensity_base,
+        open_bid_distance = self._quote_distance(
+            intensity_base=negative_intensity_base,
+            vol_scalar=vol_scalar,
+            close=False,
+        )
+        close_ask_distance = self._quote_distance(
+            intensity_base=positive_intensity_base,
+            vol_scalar=vol_scalar,
+            close=True,
+        )
+        close_bid_distance = self._quote_distance(
+            intensity_base=negative_intensity_base,
             vol_scalar=vol_scalar,
             close=True,
         )
@@ -731,10 +773,18 @@ class SimpleMakerStrategy:
             ask_instructor_shift = max(0.0, ask_instructor_shift)
             bid_instructor_shift = min(0.0, bid_instructor_shift)
 
-        raw_open_ask_price = rounded_best_ask + open_distance + ask_instructor_shift + skew_shift
-        raw_open_bid_price = rounded_best_bid - open_distance + bid_instructor_shift + skew_shift
-        raw_close_ask_price = rounded_best_ask + close_distance + ask_instructor_shift + skew_shift
-        raw_close_bid_price = rounded_best_bid - close_distance + bid_instructor_shift + skew_shift
+        raw_open_ask_price = (
+            rounded_best_ask + open_ask_distance + ask_instructor_shift + skew_shift
+        )
+        raw_open_bid_price = (
+            rounded_best_bid - open_bid_distance + bid_instructor_shift + skew_shift
+        )
+        raw_close_ask_price = (
+            rounded_best_ask + close_ask_distance + ask_instructor_shift + skew_shift
+        )
+        raw_close_bid_price = (
+            rounded_best_bid - close_bid_distance + bid_instructor_shift + skew_shift
+        )
         open_ask_price = self._price_ceil(raw_open_ask_price)
         open_bid_price = self._price_floor(raw_open_bid_price)
         close_ask_price = self._price_ceil(raw_close_ask_price)
