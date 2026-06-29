@@ -94,8 +94,7 @@
       ]
     ],
     "min_quote_distance_bps": [
-      0,
-      0.1,
+      0.2,
       0.5
     ],
     "adj_spread_instructor": [
@@ -123,28 +122,32 @@
     ],
     "open_curve": [
       [
-        5,
-        5,
+        1,
+        1,
         1
       ]
     ],
     "close_curve": [
       [
-        5,
-        5,
+        1,
+        1,
         1
       ]
     ],
     "boost_underwater": [
       [
-        1,
-        0.2
+        5,
+        0
       ]
     ],
     "boost_profitzone": [
       [
         0,
         1
+      ],
+      [
+        0,
+        5
       ]
     ],
     "cooldown_time": [
@@ -165,6 +168,6 @@
     "summary_csv": "strategy_summary.csv"
   },
   "parallel": {
-    "num_workers": 36
+    "num_workers": 48
   }
 }

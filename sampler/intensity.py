@@ -46,7 +46,7 @@ from sampler.resample import (
 DEFAULT_DATA_ROOT = DEFAULT_BOOKTICKER_ROOT.parent
 DEFAULT_TRADE_ROOT = DEFAULT_DATA_ROOT / "TRADE"
 DEFAULT_INTENSITY_ROOT = DEFAULT_DATA_ROOT / "TRADE_INTENSITY"
-SUPPORTED_INDICATORS = ("k", "k_decay", "k_median")
+SUPPORTED_INDICATORS = ("k", "kw_vol", "k_decay", "k_median")
 TICKER_COLUMNS = ("timestamp", "best_bid_price", "best_ask_price")
 RAW_TRADE_TIME_COLUMN = "exchange_timestamp"
 RAW_TRADE_COLUMNS = (RAW_TRADE_TIME_COLUMN, "price", "volume")
@@ -117,15 +117,17 @@ def normalize_trade_frame(raw_df: pd.DataFrame) -> pd.DataFrame:
             {
                 "timestamp": pd.Series(dtype="int64"),
                 "price": pd.Series(dtype="float64"),
+                "volume": pd.Series(dtype="float64"),
             }
         )
 
     frame["timestamp"] = frame["timestamp"].astype("int64")
     frame["price"] = frame["price"].astype("float64")
+    frame["volume"] = frame["volume"].astype("float64")
     if not frame["timestamp"].is_monotonic_increasing:
         frame = frame.sort_values("timestamp", kind="mergesort")
 
-    return frame.loc[:, ["timestamp", "price"]].reset_index(drop=True)
+    return frame.loc[:, ["timestamp", "price", "volume"]].reset_index(drop=True)
 
 
 def read_trade_frame(
@@ -256,6 +258,24 @@ def rolling_mean_excluding_zeros(values: pd.Series, lookback: int) -> pd.Series:
     return (sum_roll / cnt_roll.where(cnt_roll > 0.0)).fillna(0.0)
 
 
+def rolling_volume_weighted_mean_excluding_zeros(
+    values: pd.Series,
+    weights: pd.Series,
+    lookback: int,
+) -> pd.Series:
+    if lookback <= 0:
+        raise ValueError(f"lookback must be positive integer, got {lookback}")
+
+    vals = pd.to_numeric(values, errors="coerce").fillna(0.0).astype("float64")
+    wts = pd.to_numeric(weights, errors="coerce").fillna(0.0).astype("float64")
+    mask = (vals > 0.0) & (wts > 0.0)
+    effective_weights = wts.where(mask, 0.0)
+    weighted_values = vals.where(mask, 0.0) * effective_weights
+    num_roll = weighted_values.rolling(window=lookback, min_periods=1).sum()
+    weight_roll = effective_weights.rolling(window=lookback, min_periods=1).sum()
+    return (num_roll / weight_roll.where(weight_roll > 0.0)).fillna(0.0)
+
+
 def rolling_median_excluding_zeros(values: pd.Series, lookback: int) -> pd.Series:
     if lookback <= 0:
         raise ValueError(f"lookback must be positive integer, got {lookback}")
@@ -339,6 +359,7 @@ def build_trade_intensity_frame(
 
     out = ticker.copy()
     out["bucket_break_dist_max"] = 0.0
+    out["bucket_volume"] = 0.0
 
     if trade_frames:
         trades = pd.concat(trade_frames, ignore_index=True)
@@ -354,6 +375,7 @@ def build_trade_intensity_frame(
 
         if valid.any():
             trade_prices = trades.loc[valid, "price"].to_numpy(dtype="float64")
+            trade_volumes = trades.loc[valid, "volume"].to_numpy(dtype="float64")
             trade_buckets = trades.loc[valid, "bucket_ts"].to_numpy(dtype="int64")
             bid_prices = bbo["best_bid_price"].to_numpy(dtype="float64")[bucket_index[valid]]
             ask_prices = bbo["best_ask_price"].to_numpy(dtype="float64")[bucket_index[valid]]
@@ -367,26 +389,38 @@ def build_trade_intensity_frame(
                     {
                         "timestamp": trade_buckets,
                         "bucket_break_dist_max": break_dist,
+                        "bucket_volume": trade_volumes,
                     }
                 )
                 .groupby("timestamp", as_index=False, sort=True)
-                .agg(bucket_break_dist_max=("bucket_break_dist_max", "max"))
+                .agg(
+                    bucket_break_dist_max=("bucket_break_dist_max", "max"),
+                    bucket_volume=("bucket_volume", "sum"),
+                )
             )
-            out = out.drop(columns=["bucket_break_dist_max"]).merge(
+            out = out.drop(columns=["bucket_break_dist_max", "bucket_volume"]).merge(
                 bucket,
                 on="timestamp",
                 how="left",
             )
             out["bucket_break_dist_max"] = out["bucket_break_dist_max"].fillna(0.0)
+            out["bucket_volume"] = out["bucket_volume"].fillna(0.0)
 
     # Feature at t uses breakouts observed in [t - freq, t).
     out["bucket_break_dist_max"] = (
         out["bucket_break_dist_max"].shift(1).fillna(0.0).astype("float64")
     )
+    out["bucket_volume"] = out["bucket_volume"].shift(1).fillna(0.0).astype("float64")
 
     if indicator == "k":
         out["intensity"] = rolling_mean_excluding_zeros(
             values=out["bucket_break_dist_max"],
+            lookback=lookback,
+        )
+    elif indicator == "kw_vol":
+        out["intensity"] = rolling_volume_weighted_mean_excluding_zeros(
+            values=out["bucket_break_dist_max"],
+            weights=out["bucket_volume"],
             lookback=lookback,
         )
     elif indicator == "k_decay":

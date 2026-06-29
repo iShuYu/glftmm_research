@@ -213,6 +213,52 @@ class SamplerInstructorTest(unittest.TestCase):
             self.assertEqual(float(out.loc[0, "intensity"]), 0.0)
             self.assertEqual(float(out.loc[1, "intensity"]), 2.0)
 
+    def test_kw_vol_weights_nonzero_break_bins_by_bucket_volume(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_root = Path(tmpdir) / "cache"
+            trade_root = Path(tmpdir) / "TRADE"
+            symbol = "BTCUSDT"
+            date = "2025-01-01"
+            freq_ms = 1000
+            timestamps = day_timestamp_grid(date, freq_ms)[:4].tolist()
+
+            ticker_path = sampled_ticker_path(cache_root, symbol, freq_ms, date)
+            ticker_path.parent.mkdir(parents=True)
+            pd.DataFrame(
+                {
+                    "timestamp": timestamps,
+                    "best_bid_price": [99.0, 99.0, 99.0, 99.0],
+                    "best_ask_price": [101.0, 101.0, 101.0, 101.0],
+                    "best_bid_qty": [1.0, 1.0, 1.0, 1.0],
+                    "best_ask_qty": [1.0, 1.0, 1.0, 1.0],
+                }
+            ).to_parquet(ticker_path, index=False)
+
+            trade_dir = trade_root / symbol
+            trade_dir.mkdir(parents=True)
+            pd.DataFrame(
+                {
+                    "exchange_timestamp": [timestamps[0], timestamps[1], timestamps[2]],
+                    "price": [103.0, 104.0, 100.0],
+                    "volume": [1.0, 3.0, 100.0],
+                }
+            ).to_parquet(trade_dir / f"{symbol}--TRADE--{date}.parquet", index=False)
+
+            out = build_trade_intensity_frame(
+                symbol=symbol,
+                date=date,
+                freq_ms=freq_ms,
+                lookback=2,
+                indicator="kw_vol",
+                ticker_cache_root=cache_root,
+                trade_roots=(trade_root,),
+            )
+
+            self.assertEqual(float(out.loc[0, "intensity"]), 0.0)
+            self.assertEqual(float(out.loc[1, "intensity"]), 2.0)
+            self.assertAlmostEqual(float(out.loc[2, "intensity"]), 2.75)
+            self.assertEqual(float(out.loc[3, "intensity"]), 3.0)
+
     def test_loader_merges_instructor_into_alpha_frame(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / "cache"
@@ -358,7 +404,7 @@ class SamplerInstructorTest(unittest.TestCase):
             "scheme_shift": [0, 250],
             "name_instructor": ["bbo_imbalance"],
             "lookback_instructor": [0],
-            "name_intensity": ["k"],
+            "name_intensity": ["kw_vol"],
             "lookback_intensity": [300],
             "name_volatility": ["sigma"],
             "lookback_volatility": [600],
@@ -373,6 +419,7 @@ class SamplerInstructorTest(unittest.TestCase):
         self.assertEqual(instructor_cfg["instructor"]["lookback"], [0])
         self.assertEqual(instructor_cfg["instructor"]["scheme_shift"], [0, 250])
         self.assertEqual(instructor_cfg["paths"]["ticker_cache_root"], "/tmp/output")
+        self.assertEqual(intensity_cfg["intensity"]["indicator"], ["kw_vol"])
         self.assertEqual(intensity_cfg["intensity"]["lookback"], [300])
         self.assertEqual(intensity_cfg["intensity"]["scheme_shift"], [0, 250])
         self.assertEqual(volatility_cfg["volatility"]["lookback"], [600])
