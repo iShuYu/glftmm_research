@@ -49,7 +49,7 @@ def make_config(**overrides):
         "close_curve": (1000.0, 1000.0, 1.0),
         "boost_underwater": (1.0, 1.0),
         "boost_profitzone": (1.0, 1.0),
-        "cooldown_time": 0,
+        "toxic_lock": (0, 0),
         "strict_mode": True,
         "simple_mode": True,
     }
@@ -84,7 +84,7 @@ def raw_config(**overrides):
         "stoploss": 0.0,
         "boost_underwater": [1.0, 1.0],
         "boost_profitzone": [1.0, 1.0],
-        "cooldown_time": 0,
+        "toxic_lock": [[0, 0]],
         "strict_mode": True,
         "simple_mode": True,
     }
@@ -232,14 +232,41 @@ class StrategyConfigTest(unittest.TestCase):
                 max_position_usdt=[250.0, 750.0],
                 max_open_inventory_utilization=[0.5, 0.8],
                 stoploss=[25.0, 75.0],
-                cooldown_time=[20_000, 30_000],
+                toxic_lock=[[20, 15]],
             )
         )
 
         self.assertEqual(sim_map["max_position_usdt"], [250.0, 750.0])
         self.assertEqual(sim_map["max_open_inventory_utilization"], [0.5, 0.8])
         self.assertEqual(sim_map["stoploss"], [25.0, 75.0])
-        self.assertEqual(sim_map["cooldown_time"], [20_000, 30_000])
+        self.assertEqual(sim_map["toxic_lock"], [[20, 15]])
+
+    def test_rejects_bare_toxic_lock_pair_in_parameter_grid(self):
+        with self.assertRaisesRegex(ValueError, "list of"):
+            _normalize_sim_param_map(raw_config(toxic_lock=[20, 15]))
+
+    def test_normalizes_toxic_lock_grid_rows(self):
+        sim_map = _normalize_sim_param_map(
+            raw_config(toxic_lock=[[20, 15], [40, 25]])
+        )
+
+        self.assertEqual(sim_map["toxic_lock"], [[20, 15], [40, 25]])
+
+    def test_build_config_parses_toxic_lock(self):
+        cfg = _build_simulation_config(raw_config(toxic_lock=[[20, 15]])["simulation"])
+
+        self.assertEqual(cfg.toxic_lock, (20, 15))
+
+    def test_build_config_rejects_legacy_cooldown_time(self):
+        raw = raw_config()["simulation"]
+        raw.pop("toxic_lock", None)
+        raw["cooldown_time"] = 30_000
+
+        with self.assertRaisesRegex(ValueError, "toxic_lock"):
+            _build_simulation_config(raw)
+
+        with self.assertRaisesRegex(ValueError, "toxic_lock"):
+            _normalize_sim_param_map({"simulation": raw})
 
     def test_build_config_parses_max_open_inventory_utilization(self):
         cfg = _build_simulation_config(
@@ -979,50 +1006,113 @@ class StrategyQuoteTest(unittest.TestCase):
         self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
         self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(98.9, 2.024)])
 
-    def test_cooldown_time_mutes_open_until_elapsed(self):
+    def test_toxic_lock_mutes_long_open_bid_until_slip_count_recovers(self):
         engine = SimpleMakerStrategy(
             make_config(
-                cooldown_time=30_000,
+                toxic_lock=(3, 2),
                 min_order_notional=100.0,
                 open_curve=(1.0, 1.0, 1.0),
+                close_curve=(1.0, 1.0, 1.0),
+                strict_mode=False,
             )
         )
         set_position(engine, qty=1.0, cost=100.0)
 
+        for idx, mid in enumerate([99.0, 98.8, 98.6], start=1):
+            engine._on_ticker_event(
+                timestamp=idx * 1000,
+                best_bid=mid - 0.1,
+                best_ask=mid + 0.1,
+                intensity_value=0.0,
+                volatility_scalar=0.0,
+            )
+        self.assertGreater(len(price_levels(engine, engine.manager.books.ask_maker)), 0)
+        self.assertGreater(len(price_levels(engine, engine.manager.books.bid_maker)), 0)
+
         engine._on_ticker_event(
-            timestamp=1000,
-            best_bid=98.9,
-            best_ask=99.1,
+            timestamp=4000,
+            best_bid=98.3,
+            best_ask=98.5,
             intensity_value=0.0,
             volatility_scalar=0.0,
         )
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(98.9, 1.012)])
-
-        engine._on_trade_event(
-            trade_time=1050,
-            is_buyer_maker=True,
-            trade_price=98.8,
-            trade_qty=1.012,
-        )
+        self.assertTrue(engine.snapshot_state()["toxic_lock_active"])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.ask_maker)), 0)
         self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
 
         engine._on_ticker_event(
-            timestamp=30_999,
-            best_bid=98.9,
-            best_ask=99.1,
+            timestamp=5000,
+            best_bid=98.4,
+            best_ask=98.6,
             intensity_value=0.0,
             volatility_scalar=0.0,
         )
+        self.assertTrue(engine.snapshot_state()["toxic_lock_active"])
         self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
 
         engine._on_ticker_event(
-            timestamp=31_050,
-            best_bid=98.9,
-            best_ask=99.1,
+            timestamp=6000,
+            best_bid=98.5,
+            best_ask=98.7,
             intensity_value=0.0,
             volatility_scalar=0.0,
         )
-        self.assertEqual(len(price_levels(engine, engine.manager.books.bid_maker)), 1)
+        self.assertFalse(engine.snapshot_state()["toxic_lock_active"])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.bid_maker)), 0)
+
+    def test_toxic_lock_mutes_short_open_ask_until_slip_count_recovers(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                toxic_lock=(3, 2),
+                min_order_notional=100.0,
+                open_curve=(1.0, 1.0, 1.0),
+                close_curve=(1.0, 1.0, 1.0),
+                strict_mode=False,
+            )
+        )
+        set_position(engine, qty=-1.0, cost=100.0)
+
+        for idx, mid in enumerate([101.0, 101.2, 101.4], start=1):
+            engine._on_ticker_event(
+                timestamp=idx * 1000,
+                best_bid=mid - 0.1,
+                best_ask=mid + 0.1,
+                intensity_value=0.0,
+                volatility_scalar=0.0,
+            )
+        self.assertGreater(len(price_levels(engine, engine.manager.books.ask_maker)), 0)
+        self.assertGreater(len(price_levels(engine, engine.manager.books.bid_maker)), 0)
+
+        engine._on_ticker_event(
+            timestamp=4000,
+            best_bid=101.5,
+            best_ask=101.7,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+        self.assertTrue(engine.snapshot_state()["toxic_lock_active"])
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.bid_maker)), 0)
+
+        engine._on_ticker_event(
+            timestamp=5000,
+            best_bid=101.4,
+            best_ask=101.6,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+        self.assertTrue(engine.snapshot_state()["toxic_lock_active"])
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+
+        engine._on_ticker_event(
+            timestamp=6000,
+            best_bid=101.3,
+            best_ask=101.5,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+        self.assertFalse(engine.snapshot_state()["toxic_lock_active"])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.ask_maker)), 0)
 
     def test_long_above_cost_places_glftmm_close_ask_only(self):
         engine = SimpleMakerStrategy(make_config())

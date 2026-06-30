@@ -119,7 +119,7 @@ class SimulationConfig:
     close_curve: Optional[tuple[float, float, float]] = None
     boost_underwater: float | tuple[float, float] = (1.0, 1.0)
     boost_profitzone: float | tuple[float, float] = (1.0, 1.0)
-    cooldown_time: int = 0
+    toxic_lock: tuple[int, int] | Sequence[int] = (0, 0)
     strict_mode: bool = True
     simple_mode: bool = True
 
@@ -273,13 +273,22 @@ class SimulationConfig:
                 positive=False,
             ),
         )
-        cooldown_time = int(self.cooldown_time)
-        if cooldown_time < 0:
-            raise ValueError("cooldown_time must be >= 0")
+        if not isinstance(self.toxic_lock, (tuple, list)) or len(self.toxic_lock) != 2:
+            raise ValueError("toxic_lock must be a (lookback_bar, open_side_slip) pair")
+        lookback_bar = self._normalize_count(
+            self.toxic_lock[0],
+            "toxic_lock lookback_bar",
+        )
+        open_side_slip = self._normalize_count(
+            self.toxic_lock[1],
+            "toxic_lock open_side_slip",
+        )
+        if lookback_bar > 0 and open_side_slip > lookback_bar:
+            raise ValueError("toxic_lock open_side_slip must be <= lookback_bar")
         object.__setattr__(
             self,
-            "cooldown_time",
-            cooldown_time,
+            "toxic_lock",
+            (lookback_bar, open_side_slip),
         )
         if not isinstance(self.strict_mode, bool):
             raise ValueError("strict_mode must be boolean")
@@ -299,6 +308,19 @@ class SimulationConfig:
         if not math.isfinite(value_float):
             raise ValueError(f"{name} must be finite")
         return value_float
+
+    @staticmethod
+    def _normalize_count(value: object, name: str) -> int:
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be an integer")
+        value_float = float(value)
+        if (
+            not math.isfinite(value_float)
+            or value_float < 0.0
+            or not value_float.is_integer()
+        ):
+            raise ValueError(f"{name} must be an integer >= 0")
+        return int(value_float)
 
     @property
     def total_max_position_usdt(self) -> float:
@@ -338,7 +360,8 @@ class SimpleMakerStrategy:
         self._max_holding_was_at_limit: bool = False
         self._pending_maker_quotes: deque[PendingMakerQuote] = deque()
         self._pending_simple_maker_quotes: deque[SimplePendingMakerQuote] = deque()
-        self._open_cooldown_until: Optional[int] = None
+        self._toxic_lock_prev_mid: Optional[float] = None
+        self._toxic_lock_mid_moves: deque[int] = self._new_toxic_lock_mid_moves()
         self._open_liquidity_snap_adjusted: int = 0
         self._open_liquidity_snap_cancelled: int = 0
         self._open_liquidity_snap_moved_ticks: int = 0
@@ -370,7 +393,10 @@ class SimpleMakerStrategy:
             "reach_and_release_active": bool(self._reach_and_release_active),
             "max_holding_start_ts": self._max_holding_start_ts,
             "max_holding_was_at_limit": bool(self._max_holding_was_at_limit),
-            "open_cooldown_until": self._open_cooldown_until,
+            "toxic_lock_prev_mid": self._toxic_lock_prev_mid,
+            "toxic_lock_mid_moves": list(self._toxic_lock_mid_moves),
+            "toxic_lock_open_side_slip": self._toxic_lock_open_side_slip_count(),
+            "toxic_lock_active": self._toxic_lock_active(),
             "open_liquidity_snap_adjusted": int(self._open_liquidity_snap_adjusted),
             "open_liquidity_snap_cancelled": int(self._open_liquidity_snap_cancelled),
             "open_liquidity_snap_moved_ticks": int(self._open_liquidity_snap_moved_ticks),
@@ -452,9 +478,12 @@ class SimpleMakerStrategy:
         start_ts_raw = state.get("max_holding_start_ts")
         self._max_holding_start_ts = None if start_ts_raw is None else int(start_ts_raw)
         self._max_holding_was_at_limit = bool(state.get("max_holding_was_at_limit", False))
-        cooldown_until_raw = state.get("open_cooldown_until")
-        self._open_cooldown_until = (
-            None if cooldown_until_raw is None else int(cooldown_until_raw)
+        prev_mid_raw = state.get("toxic_lock_prev_mid")
+        self._toxic_lock_prev_mid = (
+            None if prev_mid_raw is None else float(prev_mid_raw)
+        )
+        self._toxic_lock_mid_moves = self._new_toxic_lock_mid_moves(
+            state.get("toxic_lock_mid_moves", [])
         )
         self._open_liquidity_snap_adjusted = int(
             state.get("open_liquidity_snap_adjusted", 0)
@@ -673,30 +702,12 @@ class SimpleMakerStrategy:
         if filled_qty > 0.0:
             self._traded_volume += float(filled_qty) * float(trade_price)
         new_abs_pos_qty = abs(float(self.manager.position.qty))
-        maker_position_opened = new_abs_pos_qty > prev_abs_pos_qty + self.EPS
-        if maker_position_opened:
-            self._record_open_maker_fill(trade_time=int(trade_time))
         position_reduced = new_abs_pos_qty + self.EPS < prev_abs_pos_qty
         self._update_max_holding_tracking(
             timestamp=int(trade_time),
             position_reduced=position_reduced,
         )
         return float(filled_qty)
-
-    def _open_cooldown_active(self, timestamp: int) -> bool:
-        return (
-            self._open_cooldown_until is not None
-            and int(timestamp) < int(self._open_cooldown_until)
-        )
-
-    def _record_open_maker_fill(self, *, trade_time: int) -> None:
-        cooldown_time = int(self.cfg.cooldown_time)
-        if cooldown_time <= 0:
-            return
-        self._open_cooldown_until = int(trade_time) + cooldown_time
-        self._clear_open_maker_books()
-        self._pending_maker_quotes.clear()
-        self._pending_simple_maker_quotes.clear()
 
     def _clear_open_maker_books(self) -> None:
         pos_qty = float(self.manager.position.qty)
@@ -707,6 +718,64 @@ class SimpleMakerStrategy:
         else:
             self.manager.books.ask_maker.clear()
             self.manager.books.bid_maker.clear()
+
+    def _toxic_lock_params(self) -> tuple[int, int]:
+        lookback_bar, open_side_slip = self.cfg.toxic_lock
+        return int(lookback_bar), int(open_side_slip)
+
+    def _new_toxic_lock_mid_moves(
+        self,
+        moves: Iterable[int] = (),
+    ) -> deque[int]:
+        lookback_bar, _open_side_slip = self._toxic_lock_params()
+        maxlen = max(0, int(lookback_bar))
+        normalized: list[int] = []
+        for move in moves:
+            move_int = int(move)
+            if move_int < 0:
+                normalized.append(-1)
+            elif move_int > 0:
+                normalized.append(1)
+            else:
+                normalized.append(0)
+        return deque(normalized[-maxlen:] if maxlen > 0 else [], maxlen=maxlen)
+
+    def _update_toxic_lock_mid_moves(self, mid: float) -> None:
+        lookback_bar, open_side_slip = self._toxic_lock_params()
+        mid = float(mid)
+        prev_mid = self._toxic_lock_prev_mid
+        self._toxic_lock_prev_mid = mid
+
+        if lookback_bar <= 0 or open_side_slip <= 0:
+            self._toxic_lock_mid_moves.clear()
+            return
+        if prev_mid is None or not math.isfinite(prev_mid) or not math.isfinite(mid):
+            return
+
+        if mid < prev_mid - self.EPS:
+            self._toxic_lock_mid_moves.append(-1)
+        elif mid > prev_mid + self.EPS:
+            self._toxic_lock_mid_moves.append(1)
+        else:
+            self._toxic_lock_mid_moves.append(0)
+
+    def _toxic_lock_open_side_slip_count(self) -> int:
+        pos_qty = float(self.manager.position.qty)
+        if pos_qty > self.EPS:
+            return sum(1 for move in self._toxic_lock_mid_moves if move < 0)
+        if pos_qty < -self.EPS:
+            return sum(1 for move in self._toxic_lock_mid_moves if move > 0)
+        return 0
+
+    def _toxic_lock_active(self) -> bool:
+        lookback_bar, open_side_slip = self._toxic_lock_params()
+        if lookback_bar <= 0 or open_side_slip <= 0:
+            return False
+        if len(self._toxic_lock_mid_moves) < lookback_bar:
+            return False
+        if abs(float(self.manager.position.qty)) <= self.EPS:
+            return False
+        return self._toxic_lock_open_side_slip_count() >= open_side_slip
 
     def _on_ticker_event(
         self,
@@ -804,6 +873,7 @@ class SimpleMakerStrategy:
 
         self._latest_best_bid = rounded_best_bid
         self._latest_best_ask = rounded_best_ask
+        self._update_toxic_lock_mid_moves(mid)
         self._update_max_holding_tracking(timestamp=timestamp)
 
         if self._should_activate_stoploss(mid=mid):
@@ -816,7 +886,10 @@ class SimpleMakerStrategy:
             return
 
         self._clear_taker_books()
-        open_allowed = not self._open_cooldown_active(timestamp)
+        toxic_lock_active = self._toxic_lock_active()
+        if toxic_lock_active:
+            self._clear_open_maker_books()
+        open_allowed = not toxic_lock_active
         if self.sim.simple_mode:
             best_ask_ticks = self._price_round_ticks(rounded_best_ask)
             best_bid_ticks = self._price_round_ticks(rounded_best_bid)

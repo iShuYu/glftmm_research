@@ -79,12 +79,12 @@
     ],
     "adj_spread_intensity": [
       [
-        2.0,
-        2.0
+        1.0,
+        1.0
       ],
       [
-        2.5,
-        2.5
+        1.5,
+        1.5
       ]
     ],
     "adj_spread_volatility": [
@@ -108,16 +108,8 @@
     ],
     "inventory_skew": [
       [
-        100,
+        0,
         1
-      ],
-      [
-        50,
-        1
-      ],
-      [
-        100,
-        2
       ]
     ],
     "open_curve": [
@@ -143,15 +135,22 @@
     "boost_profitzone": [
       [
         0,
-        1
-      ],
-      [
-        0,
         5
       ]
     ],
-    "cooldown_time": [
-      0
+    "toxic_lock": [
+      [
+        20,
+        15
+      ],
+      [
+        15,
+        10
+      ],
+      [
+        10,
+        7
+      ]
     ],
     "strict_mode": [
       false

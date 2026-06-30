@@ -73,7 +73,7 @@ PARAM_KEY_ALIAS = {
     "close_curve": "cc",
     "boost_underwater": "bu",
     "boost_profitzone": "bp",
-    "cooldown_time": "cdt",
+    "toxic_lock": "tl",
     "strict_mode": "stm",
     "min_order_qty": "moq",
     "min_order_notional": "mon",
@@ -103,7 +103,7 @@ SIM_OPTIONAL_KEYS = (
     "close_curve",
     "boost_underwater",
     "boost_profitzone",
-    "cooldown_time",
+    "toxic_lock",
     "strict_mode",
     "simple_mode",
 )
@@ -176,6 +176,46 @@ def _normalize_open_close_rows(value: Any, key: str, *, positive: bool) -> list[
         _normalize_open_close_pair(row, key, positive=positive)
         for row in rows
     ]
+
+
+def _normalize_toxic_lock_pair(value: Any) -> list[int]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError("simulation.toxic_lock must be [lookback_bar, open_side_slip]")
+    if not all(_is_number(item) for item in value):
+        raise ValueError("simulation.toxic_lock values must be numbers")
+
+    lookback_bar_float = float(value[0])
+    open_side_slip_float = float(value[1])
+    if (
+        not math.isfinite(lookback_bar_float)
+        or not math.isfinite(open_side_slip_float)
+        or lookback_bar_float < 0.0
+        or open_side_slip_float < 0.0
+    ):
+        raise ValueError("simulation.toxic_lock values must be finite and >= 0")
+    if (
+        not lookback_bar_float.is_integer()
+        or not open_side_slip_float.is_integer()
+    ):
+        raise ValueError("simulation.toxic_lock values must be integers")
+
+    lookback_bar = int(lookback_bar_float)
+    open_side_slip = int(open_side_slip_float)
+    if lookback_bar > 0 and open_side_slip > lookback_bar:
+        raise ValueError(
+            "simulation.toxic_lock open_side_slip must be <= lookback_bar"
+        )
+    return [lookback_bar, open_side_slip]
+
+
+def _normalize_toxic_lock_rows(value: Any) -> list[list[int]]:
+    if not isinstance(value, list) or (
+        len(value) == 2 and all(_is_number(item) for item in value)
+    ):
+        raise ValueError(
+            "simulation.toxic_lock must be list of [lookback_bar, open_side_slip] pairs"
+        )
+    return [_normalize_toxic_lock_pair(row) for row in value]
 
 
 def _max_position_total(value: Any) -> float | None:
@@ -310,6 +350,10 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
         raise ValueError("config requires simulation section(object)")
     if "strategy" in cfg:
         raise ValueError("strategy section is not supported, use simulation only")
+    if "cooldown_time" in sim_raw:
+        raise ValueError(
+            "simulation.cooldown_time has been replaced by simulation.toxic_lock"
+        )
 
     sim_map = ensure_list_map(sim_raw)
     if "inventory_skew" in sim_raw:
@@ -343,11 +387,8 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
             for row in sim_map["stoploss"]
         ]
 
-    if "cooldown_time" in sim_map:
-        sim_map["cooldown_time"] = [
-            int(_normalize_non_negative_scalar(row, "cooldown_time"))
-            for row in sim_map["cooldown_time"]
-        ]
+    if "toxic_lock" in sim_raw:
+        sim_map["toxic_lock"] = _normalize_toxic_lock_rows(sim_raw["toxic_lock"])
 
     if "optimize_by_orderbook" in sim_map:
         sim_map["optimize_by_orderbook"] = [
@@ -411,6 +452,10 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
 
 
 def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
+    if "cooldown_time" in raw:
+        raise ValueError(
+            "simulation.cooldown_time has been replaced by simulation.toxic_lock"
+        )
     if "min_quote_distance_ticks" in raw:
         raise ValueError(
             "simulation.min_quote_distance_ticks has been replaced by "
@@ -472,6 +517,22 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
             raise ValueError("simulation.close_curve must be [min, max, order]")
         close_curve = tuple(float(v) for v in close_curve_raw)
 
+    toxic_lock_raw = raw.get("toxic_lock", [0, 0])
+    if (
+        isinstance(toxic_lock_raw, list)
+        and len(toxic_lock_raw) == 1
+        and isinstance(toxic_lock_raw[0], (list, tuple))
+    ):
+        toxic_lock_raw = toxic_lock_raw[0]
+    elif (
+        isinstance(toxic_lock_raw, list)
+        and toxic_lock_raw
+        and all(isinstance(row, (list, tuple)) for row in toxic_lock_raw)
+    ):
+        raise ValueError(
+            "simulation.toxic_lock must be a single [lookback_bar, open_side_slip] pair after parameter normalization"
+        )
+
     return SimulationConfig(
         freq=int(raw["freq"]),
         latency=int(raw["latency"]),
@@ -518,7 +579,7 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
         close_curve=close_curve,
         boost_underwater=raw.get("boost_underwater", [1.0, 1.0]),
         boost_profitzone=raw.get("boost_profitzone", [1.0, 1.0]),
-        cooldown_time=int(raw.get("cooldown_time", 0)),
+        toxic_lock=toxic_lock_raw,
         strict_mode=_parse_bool(raw.get("strict_mode", True), "strict_mode"),
         simple_mode=_parse_bool(raw.get("simple_mode", True), "simple_mode"),
     )
