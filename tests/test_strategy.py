@@ -31,7 +31,8 @@ def make_config(**overrides):
         "max_open_inventory_utilization": 1.0,
         "max_holding_time": -1,
         "adj_spread_intensity": (1.0, 1.0),
-        "passive_only": False,
+        "ewma_intensity": 1.0,
+        "consequtive_sameside": 0,
         "min_quote_distance_bps": 0.0,
         "inventory_skew": (0.0, 1.0),
         "min_order_qty": 0.0,
@@ -62,7 +63,8 @@ def raw_config(**overrides):
         "max_open_inventory_utilization": 1.0,
         "max_holding_time": -1,
         "adj_spread_intensity": [1.0, 1.0],
-        "passive_only": False,
+        "ewma_intensity": 1.0,
+        "consequtive_sameside": 0,
         "min_quote_distance_bps": 0.0,
         "min_order_qty": 0.0,
         "min_order_notional": 0.0,
@@ -191,7 +193,38 @@ class StrategyConfigTest(unittest.TestCase):
         self.assertFalse(hasattr(cfg, "lookback_" + "intensity"))
         self.assertFalse(hasattr(cfg, "name_" + "instr" + "uctor"))
         self.assertFalse(hasattr(cfg, "name_" + "vola" + "tility"))
+        self.assertFalse(hasattr(cfg, "passive_" + "only"))
         self.assertEqual(cfg.adj_spread_intensity, (2.0, 0.5))
+        self.assertEqual(cfg.ewma_intensity, 1.0)
+        self.assertEqual(cfg.consequtive_sameside, 0)
+
+    def test_build_config_accepts_ewma_intensity(self):
+        sim_map = _normalize_sim_param_map(raw_config(ewma_intensity=[0.2, 1.0]))
+        cfg = _build_simulation_config(raw_config(ewma_intensity=0.2)["simulation"])
+
+        self.assertEqual(sim_map["ewma_intensity"], [0.2, 1.0])
+        self.assertEqual(cfg.ewma_intensity, 0.2)
+
+    def test_ewma_intensity_validation(self):
+        for value in (0.0, -0.1, 1.1, float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "ewma_intensity"):
+                    _normalize_sim_param_map(raw_config(ewma_intensity=value))
+
+    def test_build_config_accepts_consequtive_sameside(self):
+        sim_map = _normalize_sim_param_map(raw_config(consequtive_sameside=[0, 3]))
+        cfg = _build_simulation_config(
+            raw_config(consequtive_sameside=3)["simulation"]
+        )
+
+        self.assertEqual(sim_map["consequtive_sameside"], [0, 3])
+        self.assertEqual(cfg.consequtive_sameside, 3)
+
+    def test_consequtive_sameside_validation(self):
+        for value in (-1, 1.5, True, float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "consequtive_sameside"):
+                    _normalize_sim_param_map(raw_config(consequtive_sameside=value))
 
     def test_normalize_rejects_removed_simulation_keys(self):
         removed = {
@@ -206,6 +239,7 @@ class StrategyConfigTest(unittest.TestCase):
             "adj_spread_" + "vola" + "tility": [0.0, 0.0],
             "optimize_by_" + "orderbook": -1,
             "event_driven_" + "quotes": True,
+            "passive_" + "only": True,
         }
         for key, value in removed.items():
             with self.subTest(key=key):
@@ -420,7 +454,7 @@ class StrategyQuoteTest(unittest.TestCase):
         books = engine.manager.snapshot_ticks()
 
         self.assertEqual(len(day), 1)
-        self.assertEqual(engine.snapshot_state()["latest_buy_intensity"], 0.0)
+        self.assertEqual(engine.snapshot_state()["latest_buy_intensity"], 2.0)
         self.assertEqual(books["ask_maker"][0][0], 1030)
         self.assertEqual(books["bid_maker"], [])
 
@@ -476,6 +510,121 @@ class StrategyQuoteTest(unittest.TestCase):
         self.assertEqual(books["ask_maker"][0][0], 1030)
         self.assertEqual(books["bid_maker"][0][0], 970)
 
+    def test_ewma_intensity_smooths_same_side_and_keeps_sides_separate(self):
+        loader = StaticEventLoader(
+            [
+                ("bookticker", 1000, 100.0, 101.0, 1.0, 1.0),
+                ("aggtrade", 1000, False, 2.0, 2.0, 1.0, 101.0, 103.0),
+                ("aggtrade", 1001, True, 6.0, 6.0, 1.0, 100.0, 94.0),
+                ("aggtrade", 1002, False, 6.0, 6.0, 1.0, 101.0, 107.0),
+            ]
+        )
+        engine = SimpleMakerStrategy(
+            make_config(
+                ewma_intensity=0.2,
+                adj_spread_intensity=(1.0, 1.0),
+                min_order_notional=10.0,
+                inventory_skew=None,
+            ),
+            loader=loader,
+        )
+
+        engine.run_day(symbol="BTCUSDT", date="2025-01-01")
+        state = engine.snapshot_state()
+        books = engine.manager.snapshot_ticks()
+
+        self.assertAlmostEqual(state["latest_buy_intensity"], 2.8)
+        self.assertAlmostEqual(state["latest_sell_intensity"], 6.0)
+        self.assertEqual(books["ask_maker"][0][0], 1038)
+        self.assertEqual(books["bid_maker"][0][0], 940)
+
+    def test_consequtive_sameside_blocks_quote_side_after_threshold(self):
+        loader = StaticEventLoader(
+            [
+                ("bookticker", 1000, 100.0, 101.0, 1.0, 1.0),
+                ("aggtrade", 1000, False, 2.0, 2.0, 1.0, 101.0, 103.0),
+                ("aggtrade", 1001, False, 2.0, 2.0, 1.0, 101.0, 103.0),
+            ]
+        )
+        engine = SimpleMakerStrategy(
+            make_config(
+                consequtive_sameside=2,
+                adj_spread_intensity=(1.0, 1.0),
+                min_order_notional=10.0,
+                inventory_skew=None,
+            ),
+            loader=loader,
+        )
+
+        engine.run_day(symbol="BTCUSDT", date="2025-01-01")
+        state = engine.snapshot_state()
+        books = engine.manager.snapshot_ticks()
+
+        self.assertEqual(state["last_nonzero_agg_side"], "ask")
+        self.assertEqual(state["same_side_nonzero_count"], 2)
+        self.assertTrue(state["blocked_quote_sides"]["ask"])
+        self.assertEqual(books["ask_maker"], [])
+        self.assertEqual(books["bid_maker"], [])
+
+    def test_reverse_nonzero_unblocks_previous_quote_side(self):
+        loader = StaticEventLoader(
+            [
+                ("bookticker", 1000, 100.0, 101.0, 1.0, 1.0),
+                ("aggtrade", 1000, False, 2.0, 2.0, 1.0, 101.0, 103.0),
+                ("aggtrade", 1001, False, 2.0, 2.0, 1.0, 101.0, 103.0),
+                ("aggtrade", 1002, True, 2.0, 2.0, 1.0, 100.0, 98.0),
+                ("aggtrade", 1003, False, 2.0, 2.0, 1.0, 101.0, 103.0),
+            ]
+        )
+        engine = SimpleMakerStrategy(
+            make_config(
+                consequtive_sameside=2,
+                adj_spread_intensity=(1.0, 1.0),
+                min_order_notional=10.0,
+                inventory_skew=None,
+            ),
+            loader=loader,
+        )
+
+        engine.run_day(symbol="BTCUSDT", date="2025-01-01")
+        state = engine.snapshot_state()
+        books = engine.manager.snapshot_ticks()
+
+        self.assertEqual(state["last_nonzero_agg_side"], "ask")
+        self.assertEqual(state["same_side_nonzero_count"], 1)
+        self.assertFalse(state["blocked_quote_sides"]["ask"])
+        self.assertFalse(state["blocked_quote_sides"]["bid"])
+        self.assertEqual(books["ask_maker"][0][0], 1030)
+
+    def test_consequtive_sameside_blocks_close_side(self):
+        position = Position()
+        position.execute(1.0, 100.0)
+        loader = StaticEventLoader(
+            [
+                ("bookticker", 1000, 100.0, 101.0, 1.0, 1.0),
+                ("aggtrade", 1000, False, 2.0, 2.0, 1.0, 101.0, 103.0),
+                ("aggtrade", 1001, False, 2.0, 2.0, 1.0, 101.0, 103.0),
+            ]
+        )
+        engine = SimpleMakerStrategy(
+            make_config(
+                consequtive_sameside=2,
+                adj_spread_intensity=(1.0, 1.0),
+                min_order_notional=10.0,
+                inventory_skew=None,
+            ),
+            position=position,
+            loader=loader,
+        )
+
+        engine.run_day(symbol="BTCUSDT", date="2025-01-01")
+        state = engine.snapshot_state()
+        books = engine.manager.snapshot_ticks()
+
+        self.assertTrue(state["blocked_quote_sides"]["ask"])
+        self.assertEqual(books["ask_maker"], [])
+        self.assertEqual(books["bid_maker"], [])
+
     def test_latency_activates_due_quotes_on_both_sides(self):
         loader = StaticEventLoader(
             [
@@ -500,6 +649,51 @@ class StrategyQuoteTest(unittest.TestCase):
 
         self.assertEqual(books["ask_maker"][0][0], 1030)
         self.assertEqual(books["bid_maker"][0][0], 970)
+
+    def test_side_quote_close_side_is_capped_at_placement(self):
+        position = Position()
+        position.execute(1.0, 100.0)
+        engine = SimpleMakerStrategy(make_config(), position=position)
+
+        engine._activate_simple_maker_quote(
+            (
+                0,
+                "ask",
+                1200,
+                2000,
+                None,
+                0,
+                1100,
+                900,
+                False,
+            )
+        )
+        books = engine.manager.snapshot_ticks()
+
+        self.assertEqual(books["ask_maker"], [(1200, 1000)])
+
+    def test_full_quote_caps_only_close_side_at_placement(self):
+        position = Position()
+        position.execute(1.0, 100.0)
+        engine = SimpleMakerStrategy(make_config(), position=position)
+
+        engine._activate_simple_maker_quote(
+            (
+                0,
+                None,
+                1200,
+                2000,
+                800,
+                2000,
+                1100,
+                900,
+                False,
+            )
+        )
+        books = engine.manager.snapshot_ticks()
+
+        self.assertEqual(books["ask_maker"], [(1200, 1000)])
+        self.assertEqual(books["bid_maker"], [(800, 2000)])
 
     def test_daily_parallel_stoploss_flattens_then_stops_trading_until_day_end(self):
         loader = StaticEventLoader(

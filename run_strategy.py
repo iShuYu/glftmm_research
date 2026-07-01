@@ -51,7 +51,8 @@ PARAM_KEY_ALIAS = {
     "max_open_inventory_utilization": "moiu",
     "max_holding_time": "mht",
     "adj_spread_intensity": "asi",
-    "passive_only": "po",
+    "ewma_intensity": "ewmi",
+    "consequtive_sameside": "css",
     "min_quote_distance_bps": "mqdb",
     "inventory_skew": "isk",
     "stoploss": "sl",
@@ -71,7 +72,8 @@ SIM_OPTIONAL_KEYS = (
     "max_holding_time",
     "max_open_inventory_utilization",
     "adj_spread_intensity",
-    "passive_only",
+    "ewma_intensity",
+    "consequtive_sameside",
     "min_quote_distance_bps",
     "inventory_skew",
     "min_order_qty",
@@ -125,6 +127,28 @@ def _normalize_ratio(value: Any, key: str) -> float:
     if not math.isfinite(value_float) or value_float < 0.0 or value_float > 1.0:
         raise ValueError(f"simulation.{key} must be finite and between 0 and 1")
     return value_float
+
+
+def _normalize_ewma_intensity(value: Any) -> float:
+    if not _is_number(value):
+        raise ValueError("simulation.ewma_intensity must be a number")
+    value_float = float(value)
+    if not math.isfinite(value_float) or value_float <= 0.0 or value_float > 1.0:
+        raise ValueError("simulation.ewma_intensity must be finite, > 0, and <= 1")
+    return value_float
+
+
+def _normalize_non_negative_int(value: Any, key: str) -> int:
+    if isinstance(value, bool) or not _is_number(value):
+        raise ValueError(f"simulation.{key} must be a non-negative integer")
+    value_float = float(value)
+    if (
+        not math.isfinite(value_float)
+        or value_float < 0.0
+        or not value_float.is_integer()
+    ):
+        raise ValueError(f"simulation.{key} must be a non-negative integer")
+    return int(value_float)
 
 
 def _normalize_open_close_pair(value: Any, key: str, *, positive: bool) -> list[float]:
@@ -312,6 +336,17 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
             for row in sim_map["min_quote_distance_bps"]
         ]
 
+    if "ewma_intensity" in sim_map:
+        sim_map["ewma_intensity"] = [
+            _normalize_ewma_intensity(row) for row in sim_map["ewma_intensity"]
+        ]
+
+    if "consequtive_sameside" in sim_map:
+        sim_map["consequtive_sameside"] = [
+            _normalize_non_negative_int(row, "consequtive_sameside")
+            for row in sim_map["consequtive_sameside"]
+        ]
+
     if "open_curve" in sim_map:
         open_curve_rows = ensure_list_map({"open_curve": sim_map["open_curve"]})[
             "open_curve"
@@ -411,7 +446,11 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
         ),
         max_holding_time=int(raw.get("max_holding_time", 0)),
         adj_spread_intensity=adj_spread_intensity,
-        passive_only=_parse_bool(raw.get("passive_only", False), "passive_only"),
+        ewma_intensity=_normalize_ewma_intensity(raw.get("ewma_intensity", 1.0)),
+        consequtive_sameside=_normalize_non_negative_int(
+            raw.get("consequtive_sameside", 0),
+            "consequtive_sameside",
+        ),
         min_quote_distance_bps=_normalize_non_negative_scalar(
             raw.get("min_quote_distance_bps", 0.0),
             "min_quote_distance_bps",

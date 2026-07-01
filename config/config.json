@@ -2,8 +2,8 @@
   "symbols": [
     "BTCUSDT"
   ],
-  "date_start": "2025-01-02",
-  "date_end": "2025-12-31",
+  "date_start": "2025-01-01",
+  "date_end": "2025-01-31",
   "daily_parallel": true,
   "paths": {
     "input_path": "/data/users/data-helper/PROCESSED/TARDIS/BINANCE/UFUTURES",
@@ -39,10 +39,10 @@
       -1
     ],
     "max_position_usdt": [
-      1000000
+      100000
     ],
     "stoploss": [
-      100000
+      5000
     ],
     "min_order_qty": [
       0.0
@@ -53,11 +53,14 @@
         1.0
       ]
     ],
-    "min_quote_distance_bps": [
-      0.1
+    "ewma_intensity": [
+      0.01
     ],
-    "passive_only": [
-      true
+    "consequtive_sameside": [
+      2
+    ],
+    "min_quote_distance_bps": [
+      0
     ],
     "inventory_skew": [
       [
@@ -81,14 +84,14 @@
     ],
     "boost_underwater": [
       [
-        1,
-        1
+        10,
+        5
       ]
     ],
     "boost_profitzone": [
       [
-        1,
-        1
+        5,
+        10
       ]
     ],
     "cooldown_time": [

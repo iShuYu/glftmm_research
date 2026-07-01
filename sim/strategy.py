@@ -108,7 +108,8 @@ class SimulationConfig:
     max_open_inventory_utilization: float = 1.0
     max_holding_time: int = 0
     adj_spread_intensity: float | tuple[float, float] = 1.0
-    passive_only: bool = False
+    ewma_intensity: float = 1.0
+    consequtive_sameside: int = 0
     min_quote_distance_bps: float = 0.0
     inventory_skew: Optional[tuple[float, float]] = None
     min_order_qty: float = 0.0
@@ -164,8 +165,18 @@ class SimulationConfig:
                 positive=True,
             ),
         )
-        if not isinstance(self.passive_only, bool):
-            raise ValueError("passive_only must be boolean")
+        ewma_intensity = self._normalize_scalar(self.ewma_intensity, "ewma_intensity")
+        if ewma_intensity <= 0.0 or ewma_intensity > 1.0:
+            raise ValueError("ewma_intensity must be > 0 and <= 1")
+        object.__setattr__(self, "ewma_intensity", ewma_intensity)
+        object.__setattr__(
+            self,
+            "consequtive_sameside",
+            self._normalize_non_negative_int(
+                self.consequtive_sameside,
+                "consequtive_sameside",
+            ),
+        )
         try:
             min_quote_distance_bps = float(self.min_quote_distance_bps)
         except (TypeError, ValueError):
@@ -261,6 +272,19 @@ class SimulationConfig:
             raise ValueError(f"{name} must be finite")
         return value_float
 
+    @staticmethod
+    def _normalize_non_negative_int(value: object, name: str) -> int:
+        if isinstance(value, bool) or isinstance(value, (list, tuple)):
+            raise ValueError(f"{name} must be a non-negative integer")
+        value_float = float(value)
+        if (
+            not math.isfinite(value_float)
+            or value_float < 0.0
+            or not value_float.is_integer()
+        ):
+            raise ValueError(f"{name} must be a non-negative integer")
+        return int(value_float)
+
     @property
     def total_max_position_usdt(self) -> float:
         return float(self.max_position_usdt)
@@ -312,6 +336,9 @@ class SimpleMakerStrategy:
             "ask": None,
             "bid": None,
         }
+        self._last_nonzero_agg_side: Optional[QuoteSide] = None
+        self._same_side_nonzero_count: int = 0
+        self._blocked_quote_sides: dict[QuoteSide, bool] = {"ask": False, "bid": False}
         self._daily_stop_trading: bool = False
         self._daily_stop_date_key: Optional[str] = None
         self._current_date_key: Optional[str] = None
@@ -345,6 +372,12 @@ class SimpleMakerStrategy:
             "max_holding_start_ts": self._max_holding_start_ts,
             "max_holding_was_at_limit": bool(self._max_holding_was_at_limit),
             "open_cooldown_until": self._open_cooldown_until,
+            "last_nonzero_agg_side": self._last_nonzero_agg_side,
+            "same_side_nonzero_count": int(self._same_side_nonzero_count),
+            "blocked_quote_sides": {
+                side: bool(blocked)
+                for side, blocked in self._blocked_quote_sides.items()
+            },
             "daily_parallel": bool(self.cfg.daily_parallel),
             "daily_stop_trading": bool(self._daily_stop_trading),
             "daily_stop_date": self._daily_stop_date_key,
@@ -439,6 +472,22 @@ class SimpleMakerStrategy:
         self._last_level_quote_key = None
         self._last_simple_quote_side_keys = {"ask": None, "bid": None}
         self._last_level_quote_side_keys = {"ask": None, "bid": None}
+        side_raw = state.get("last_nonzero_agg_side")
+        self._last_nonzero_agg_side = side_raw if side_raw in ("ask", "bid") else None
+        self._same_side_nonzero_count = max(
+            0,
+            int(state.get("same_side_nonzero_count", 0)),
+        )
+        blocked_raw = state.get("blocked_quote_sides")
+        if not isinstance(blocked_raw, dict):
+            blocked_raw = state.get("blocked_open_sides")
+        if isinstance(blocked_raw, dict):
+            self._blocked_quote_sides = {
+                "ask": bool(blocked_raw.get("ask", False)),
+                "bid": bool(blocked_raw.get("bid", False)),
+            }
+        else:
+            self._blocked_quote_sides = {"ask": False, "bid": False}
         self._daily_stop_trading = bool(state.get("daily_stop_trading", False))
         stop_date_raw = state.get("daily_stop_date")
         self._daily_stop_date_key = None if stop_date_raw is None else str(stop_date_raw)
@@ -623,20 +672,61 @@ class SimpleMakerStrategy:
         if self._latest_best_bid is None or self._latest_best_ask is None:
             return
         intensity = self._safe_non_negative(intensity_value)
-        if is_buyer_maker:
-            self._latest_sell_intensity = intensity
-            quote_side: QuoteSide = "bid"
-        else:
-            self._latest_buy_intensity = intensity
-            quote_side = "ask"
         if intensity <= self.EPS:
             return
+        if is_buyer_maker:
+            self._latest_sell_intensity = self._ewma_intensity_update(
+                previous=self._latest_sell_intensity,
+                current=intensity,
+            )
+            quote_side: QuoteSide = "bid"
+        else:
+            self._latest_buy_intensity = self._ewma_intensity_update(
+                previous=self._latest_buy_intensity,
+                current=intensity,
+            )
+            quote_side = "ask"
+        self._record_nonzero_agg_side(quote_side)
         self._on_ticker_event(
             timestamp=timestamp,
             best_bid=float(self._latest_best_bid),
             best_ask=float(self._latest_best_ask),
             apply_quote_gate=True,
             quote_side=quote_side,
+        )
+
+    def _ewma_intensity_update(self, *, previous: float, current: float) -> float:
+        current = self._safe_non_negative(current)
+        if current <= self.EPS:
+            return self._safe_non_negative(previous)
+        previous = self._safe_non_negative(previous)
+        if previous <= self.EPS:
+            return current
+        alpha = float(self.cfg.ewma_intensity)
+        return alpha * current + (1.0 - alpha) * previous
+
+    def _record_nonzero_agg_side(self, side: QuoteSide) -> None:
+        threshold = int(self.cfg.consequtive_sameside)
+        if threshold <= 0:
+            return
+        opposite = self._opposite_quote_side(side)
+        if self._last_nonzero_agg_side == side:
+            self._same_side_nonzero_count += 1
+        else:
+            self._same_side_nonzero_count = 1
+            self._blocked_quote_sides[opposite] = False
+        self._last_nonzero_agg_side = side
+        if self._same_side_nonzero_count >= threshold:
+            self._blocked_quote_sides[side] = True
+
+    @staticmethod
+    def _opposite_quote_side(side: QuoteSide) -> QuoteSide:
+        return "bid" if side == "ask" else "ask"
+
+    def _blocked_quote_side_active(self, side: QuoteSide) -> bool:
+        return (
+            int(self.cfg.consequtive_sameside) > 0
+            and bool(self._blocked_quote_sides.get(side, False))
         )
 
     def _update_latest_bbo(self, *, best_bid: float, best_ask: float) -> bool:
@@ -846,6 +936,12 @@ class SimpleMakerStrategy:
                 best_ask_ticks=best_ask_ticks,
                 best_bid_ticks=best_bid_ticks,
             )
+            if self._blocked_quote_side_active("ask"):
+                quote_ask_price_ticks = None
+                ask_qty_steps = 0
+            if self._blocked_quote_side_active("bid"):
+                quote_bid_price_ticks = None
+                bid_qty_steps = 0
             if quote_side is not None:
                 if quote_side == "ask":
                     quote_bid_price_ticks = None
@@ -930,6 +1026,10 @@ class SimpleMakerStrategy:
                 best_ask=rounded_best_ask,
                 best_bid=rounded_best_bid,
             )
+            if self._blocked_quote_side_active("ask"):
+                ask_levels = []
+            if self._blocked_quote_side_active("bid"):
+                bid_levels = []
             if quote_side is not None:
                 if quote_side == "ask":
                     bid_levels = []
@@ -1622,26 +1722,50 @@ class SimpleMakerStrategy:
                 levels=levels,
                 best_ask=best_ask,
                 best_bid=best_bid,
-                close_only=close_only,
+                close_only=(
+                    bool(close_only)
+                    or self._side_is_close_at_placement(
+                        side=quote_side,
+                        has_order=bool(levels),
+                    )
+                ),
             )
-        elif len(ask_levels) <= 1 and len(bid_levels) <= 1:
-            self._clear_maker_books()
-            self.manager.place_maker_single_levels(
-                ask_levels=ask_levels,
-                bid_levels=bid_levels,
-                best_ask=best_ask,
-                best_bid=best_bid,
-                close_only=close_only,
-            )
-        else:
-            self._clear_maker_books()
-            self.manager.place_maker_levels(
-                ask_levels=ask_levels,
-                bid_levels=bid_levels,
-                best_ask=best_ask,
-                best_bid=best_bid,
-                close_only=close_only,
-            )
+            return
+
+        self.manager.place_maker_levels_side(
+            side="sell",
+            levels=ask_levels,
+            best_ask=best_ask,
+            best_bid=best_bid,
+            close_only=(
+                bool(close_only)
+                or self._side_is_close_at_placement(
+                    side="ask",
+                    has_order=bool(ask_levels),
+                )
+            ),
+        )
+        self.manager.place_maker_levels_side(
+            side="buy",
+            levels=bid_levels,
+            best_ask=best_ask,
+            best_bid=best_bid,
+            close_only=(
+                bool(close_only)
+                or self._side_is_close_at_placement(
+                    side="bid",
+                    has_order=bool(bid_levels),
+                )
+            ),
+        )
+
+    def _side_is_close_at_placement(self, *, side: QuoteSide, has_order: bool) -> bool:
+        if not has_order:
+            return False
+        position_steps = int(getattr(self.manager, "position_steps", 0))
+        return (side == "ask" and position_steps > 0) or (
+            side == "bid" and position_steps < 0
+        )
 
     def _activate_pending_simple_maker_quotes(self, current_timestamp: int) -> None:
         ts = int(current_timestamp)
@@ -1677,7 +1801,13 @@ class SimpleMakerStrategy:
                 qty_steps=ask_qty_steps,
                 best_ask_ticks=best_ask_ticks,
                 best_bid_ticks=best_bid_ticks,
-                close_only=close_only,
+                close_only=(
+                    bool(close_only)
+                    or self._side_is_close_at_placement(
+                        side="ask",
+                        has_order=int(ask_qty_steps) > 0,
+                    )
+                ),
             )
         elif quote_side == "bid":
             self.manager.place_maker_steps_side(
@@ -1686,17 +1816,42 @@ class SimpleMakerStrategy:
                 qty_steps=bid_qty_steps,
                 best_ask_ticks=best_ask_ticks,
                 best_bid_ticks=best_bid_ticks,
-                close_only=close_only,
+                close_only=(
+                    bool(close_only)
+                    or self._side_is_close_at_placement(
+                        side="bid",
+                        has_order=int(bid_qty_steps) > 0,
+                    )
+                ),
             )
         else:
-            self.manager.place_maker_steps(
-                ask_price_ticks=ask_price_ticks,
-                ask_qty_steps=ask_qty_steps,
-                bid_price_ticks=bid_price_ticks,
-                bid_qty_steps=bid_qty_steps,
+            self.manager.place_maker_steps_side(
+                side="sell",
+                price_ticks=ask_price_ticks,
+                qty_steps=ask_qty_steps,
                 best_ask_ticks=best_ask_ticks,
                 best_bid_ticks=best_bid_ticks,
-                close_only=close_only,
+                close_only=(
+                    bool(close_only)
+                    or self._side_is_close_at_placement(
+                        side="ask",
+                        has_order=int(ask_qty_steps) > 0,
+                    )
+                ),
+            )
+            self.manager.place_maker_steps_side(
+                side="buy",
+                price_ticks=bid_price_ticks,
+                qty_steps=bid_qty_steps,
+                best_ask_ticks=best_ask_ticks,
+                best_bid_ticks=best_bid_ticks,
+                close_only=(
+                    bool(close_only)
+                    or self._side_is_close_at_placement(
+                        side="bid",
+                        has_order=int(bid_qty_steps) > 0,
+                    )
+                ),
             )
 
     def _simple_maker_steps_for_ticker(
