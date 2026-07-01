@@ -34,6 +34,9 @@ def make_config(**overrides):
         "lookback_volatility": 300,
         "max_position_usdt": 100000.0,
         "max_open_inventory_utilization": 1.0,
+        "phase_change_position": 0.0,
+        "boost_phase_change": 1.0,
+        "phase_mode": "market",
         "max_holding_time": -1,
         "adj_spread_intensity": (1.0, 1.0),
         "adj_spread_instructor": 0.0,
@@ -72,6 +75,9 @@ def raw_config(**overrides):
         "lookback_volatility": 300,
         "max_position_usdt": 100000.0,
         "max_open_inventory_utilization": 1.0,
+        "phase_change_position": 0.0,
+        "boost_phase_change": 1.0,
+        "phase_mode": "market",
         "max_holding_time": -1,
         "adj_spread_intensity": [1.0, 1.0],
         "adj_spread_instructor": 0.0,
@@ -231,6 +237,8 @@ class StrategyConfigTest(unittest.TestCase):
             raw_config(
                 max_position_usdt=[250.0, 750.0],
                 max_open_inventory_utilization=[0.5, 0.8],
+                phase_change_position=[100.0, 200.0],
+                boost_phase_change=[1.0, 2.0],
                 stoploss=[25.0, 75.0],
                 toxic_lock=[[20, 15]],
             )
@@ -238,6 +246,8 @@ class StrategyConfigTest(unittest.TestCase):
 
         self.assertEqual(sim_map["max_position_usdt"], [250.0, 750.0])
         self.assertEqual(sim_map["max_open_inventory_utilization"], [0.5, 0.8])
+        self.assertEqual(sim_map["phase_change_position"], [100.0, 200.0])
+        self.assertEqual(sim_map["boost_phase_change"], [1.0, 2.0])
         self.assertEqual(sim_map["stoploss"], [25.0, 75.0])
         self.assertEqual(sim_map["toxic_lock"], [[20, 15]])
 
@@ -328,6 +338,19 @@ class StrategyConfigTest(unittest.TestCase):
 
         self.assertEqual(cfg.min_quote_distance_bps, 20.5)
 
+    def test_build_config_parses_phase_change_controls(self):
+        cfg = _build_simulation_config(
+            raw_config(
+                phase_change_position=250.0,
+                boost_phase_change=2.5,
+                phase_mode="trade",
+            )["simulation"]
+        )
+
+        self.assertEqual(cfg.phase_change_position, 250.0)
+        self.assertEqual(cfg.boost_phase_change, 2.5)
+        self.assertEqual(cfg.phase_mode, "trade")
+
     def test_build_config_rejects_boolean_optimize_by_orderbook(self):
         with self.assertRaisesRegex(ValueError, "optimize_by_orderbook"):
             _build_simulation_config(
@@ -339,6 +362,16 @@ class StrategyConfigTest(unittest.TestCase):
             _build_simulation_config(
                 raw_config(min_quote_distance_bps=-0.1)["simulation"]
             )
+
+    def test_build_config_rejects_invalid_phase_change_controls(self):
+        with self.assertRaisesRegex(ValueError, "phase_change_position"):
+            _build_simulation_config(
+                raw_config(phase_change_position=-1.0)["simulation"]
+            )
+        with self.assertRaisesRegex(ValueError, "boost_phase_change"):
+            _build_simulation_config(raw_config(boost_phase_change=-1.0)["simulation"])
+        with self.assertRaisesRegex(ValueError, "phase_mode"):
+            _build_simulation_config(raw_config(phase_mode="last_open")["simulation"])
 
     def test_build_config_rejects_legacy_min_quote_distance_ticks(self):
         with self.assertRaisesRegex(ValueError, "min_quote_distance_bps"):
@@ -1005,6 +1038,118 @@ class StrategyQuoteTest(unittest.TestCase):
 
         self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
         self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(98.9, 2.024)])
+
+    def test_phase_change_anchors_and_boosts_simple_long_add(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                phase_change_position=50.0,
+                boost_phase_change=2.0,
+            )
+        )
+        set_position(engine, qty=1.0, cost=100.0)
+        engine._phase_side = 1
+        engine._phase_best_mid = 99.0
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=99.9,
+            best_ask=100.1,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.0, 2.0)])
+
+    def test_phase_change_anchors_and_boosts_level_long_add(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                phase_change_position=50.0,
+                boost_phase_change=2.0,
+                simple_mode=False,
+            )
+        )
+        set_position(engine, qty=1.0, cost=100.0)
+        engine._phase_side = 1
+        engine._phase_best_mid = 99.0
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=99.9,
+            best_ask=100.1,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.0, 2.0)])
+
+    def test_phase_change_anchors_and_boosts_simple_short_add(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                phase_change_position=50.0,
+                boost_phase_change=2.0,
+            )
+        )
+        set_position(engine, qty=-1.0, cost=100.0)
+        engine._phase_side = -1
+        engine._phase_best_mid = 101.0
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=99.9,
+            best_ask=100.1,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(101.0, 2.0)])
+        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+
+    def test_phase_change_trade_mode_uses_own_fill_price_for_add(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                phase_change_position=50.0,
+                phase_mode="trade",
+            )
+        )
+        set_position(engine, qty=1.0, cost=100.0)
+        engine._phase_side = 1
+        engine._phase_best_mid = 101.0
+        engine.manager.books.bid_maker.merge([(1000, 200)])
+
+        engine._on_trade_event(
+            trade_time=1,
+            is_buyer_maker=True,
+            trade_price=99.9,
+            trade_qty=0.2,
+        )
+
+        self.assertAlmostEqual(engine.manager.position.qty, 1.2)
+        self.assertEqual(engine._phase_side, 1)
+        self.assertEqual(engine._phase_best_mid, 100.0)
+
+    def test_phase_change_trade_mode_ignores_market_best_without_fill(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                phase_change_position=50.0,
+                phase_mode="trade",
+            )
+        )
+        set_position(engine, qty=1.0, cost=100.0)
+        engine._phase_side = 1
+        engine._phase_best_mid = 99.0
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=98.9,
+            best_ask=99.1,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(98.9, 1.0)])
+        self.assertEqual(engine._phase_best_mid, 99.0)
 
     def test_toxic_lock_mutes_long_open_bid_until_slip_count_recovers(self):
         engine = SimpleMakerStrategy(

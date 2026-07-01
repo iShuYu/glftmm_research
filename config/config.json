@@ -71,6 +71,15 @@
     "max_position_usdt": [
       1000000
     ],
+    "phase_change_position": [
+      1000000
+    ],
+    "boost_phase_change": [
+      1.0
+    ],
+    "phase_mode": [
+      "market"
+    ],
     "stoploss": [
       100000
     ],

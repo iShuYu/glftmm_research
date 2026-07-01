@@ -59,6 +59,9 @@ PARAM_KEY_ALIAS = {
     "lookback_intensity": "lbi",
     "max_position_usdt": "mp",
     "max_open_inventory_utilization": "moiu",
+    "phase_change_position": "pcp",
+    "boost_phase_change": "bpc",
+    "phase_mode": "phm",
     "max_holding_time": "mht",
     "freq": "fr",
     "adj_spread_intensity": "asi",
@@ -89,6 +92,9 @@ SIM_OPTIONAL_KEYS = (
     "lookback_volatility",
     "max_holding_time",
     "max_open_inventory_utilization",
+    "phase_change_position",
+    "boost_phase_change",
+    "phase_mode",
     "adj_spread_intensity",
     "adj_spread_instructor",
     "passive_only",
@@ -381,6 +387,18 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
             for row in sim_map["max_open_inventory_utilization"]
         ]
 
+    if "phase_change_position" in sim_map:
+        sim_map["phase_change_position"] = [
+            _normalize_non_negative_scalar(row, "phase_change_position")
+            for row in sim_map["phase_change_position"]
+        ]
+
+    if "boost_phase_change" in sim_map:
+        sim_map["boost_phase_change"] = [
+            _normalize_non_negative_scalar(row, "boost_phase_change")
+            for row in sim_map["boost_phase_change"]
+        ]
+
     if "stoploss" in sim_map:
         sim_map["stoploss"] = [
             _normalize_non_negative_scalar(row, "stoploss")
@@ -559,6 +577,15 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
             raw.get("max_open_inventory_utilization", 1.0),
             "max_open_inventory_utilization",
         ),
+        phase_change_position=_normalize_non_negative_scalar(
+            raw.get("phase_change_position", 0.0),
+            "phase_change_position",
+        ),
+        boost_phase_change=_normalize_non_negative_scalar(
+            raw.get("boost_phase_change", 1.0),
+            "boost_phase_change",
+        ),
+        phase_mode=str(raw.get("phase_mode", "market")).strip().lower(),
         max_holding_time=int(raw.get("max_holding_time", 0)),
         adj_spread_intensity=adj_spread_intensity,
         adj_spread_instructor=float(raw.get("adj_spread_instructor", 0.0)),
