@@ -152,6 +152,47 @@ def positive_int_list(
     return values
 
 
+def _is_empty_config_value(value: Any) -> bool:
+    return value in (None, "", [])
+
+
+def positive_freq_list(cfg: dict[str, Any], key: str) -> list[int]:
+    value = cfg.get(key)
+    if _is_empty_config_value(value):
+        return []
+    values = [int(item) for item in ensure_list(value)]
+    if not values:
+        return []
+    for freq in values:
+        if freq <= 0:
+            raise ValueError(f"{key} must contain positive integer ms, got {freq}")
+    return values
+
+
+def stage_freqs(cfg: dict[str, Any], stage: str, required: bool) -> list[int]:
+    stage_key = f"freq_ms_{stage}"
+    freqs = positive_freq_list(cfg, stage_key)
+    if freqs:
+        return freqs
+
+    freqs = positive_freq_list(cfg, "freq_ms")
+    if freqs:
+        return freqs
+
+    freqs = positive_freq_list(cfg, "freq")
+    if freqs:
+        return freqs
+
+    if not required:
+        return []
+
+    raise ValueError(f"config requires {stage_key} or freq_ms")
+
+
+def unique_sorted_ints(values: list[int]) -> list[int]:
+    return sorted(set(int(value) for value in values))
+
+
 def common_dates_and_symbols(cfg: dict[str, Any]) -> dict[str, Any]:
     return {
         "symbols": [
@@ -171,15 +212,9 @@ def build_stage_configs(
 
     output_root = Path(require_non_empty(cfg, "output_path"))
 
-    freqs = [int(freq) for freq in ensure_list(require_non_empty(cfg, "freq_ms"))]
-    if not freqs:
-        raise ValueError("config requires freq_ms")
     scheme_shift = [int(shift) for shift in ensure_list(cfg.get("scheme_shift", [0]))]
     if not scheme_shift:
         scheme_shift = [0]
-    for freq in freqs:
-        for shift in scheme_shift:
-            resample.normalize_scheme_shift(shift, freq)
 
     name_instructor = [
         str(name).strip().lower()
@@ -196,6 +231,23 @@ def build_stage_configs(
         for name in ensure_list(cfg.get("name_volatility", []))
         if str(name).strip()
     ]
+
+    instructor_freqs = stage_freqs(cfg, "instructor", required=bool(name_instructor))
+    intensity_freqs = stage_freqs(cfg, "intensity", required=bool(name_intensity))
+    volatility_freqs = stage_freqs(cfg, "volatility", required=bool(name_volatility))
+    resample_freqs = unique_sorted_ints(
+        [*instructor_freqs, *intensity_freqs, *volatility_freqs]
+    )
+    if not resample_freqs:
+        resample_freqs = (
+            positive_freq_list(cfg, "freq_ms")
+            or positive_freq_list(cfg, "freq")
+        )
+    if not resample_freqs:
+        raise ValueError("config requires at least one sampler frequency")
+    for freq in resample_freqs:
+        for shift in scheme_shift:
+            resample.normalize_scheme_shift(shift, freq)
 
     lookback_instructor = positive_int_list(
         cfg,
@@ -226,7 +278,7 @@ def build_stage_configs(
             "output_root": str(output_root),
         },
         "sampler": {
-            "freq": freqs,
+            "freq": resample_freqs,
             "scheme_shift": scheme_shift,
             "ticker_category": input_paths.ticker_category,
             "overwrite": overwrite,
@@ -244,7 +296,7 @@ def build_stage_configs(
             "output_root": str(output_root),
         },
         "instructor": {
-            "freq": freqs,
+            "freq": instructor_freqs,
             "scheme_shift": scheme_shift,
             "indicator": name_instructor,
             "lookback": lookback_instructor,
@@ -265,7 +317,7 @@ def build_stage_configs(
             "output_root": str(output_root),
         },
         "intensity": {
-            "freq": freqs,
+            "freq": intensity_freqs,
             "scheme_shift": scheme_shift,
             "indicator": name_intensity,
             "lookback": lookback_intensity,
@@ -288,7 +340,7 @@ def build_stage_configs(
             "output_root": str(output_root),
         },
         "volatility": {
-            "freq": freqs,
+            "freq": volatility_freqs,
             "scheme_shift": scheme_shift,
             "indicator": name_volatility,
             "lookback": lookback_volatility,

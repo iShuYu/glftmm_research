@@ -215,6 +215,96 @@ class SamplerInstructorTest(unittest.TestCase):
             self.assertEqual(alpha["intensity"].tolist(), [1.5, 2.5])
             self.assertEqual(alpha["volatility_scalar"].tolist(), [0.1, 0.2])
 
+    def test_loader_broadcasts_slower_alpha_features_to_fastest_grid(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "cache"
+            symbol = "BTCUSDT"
+            date = "2025-01-01"
+            fast_freq_ms = 1000
+            instructor_freq_ms = 2000
+            volatility_freq_ms = 3000
+            ts0 = int(day_timestamp_grid(date, fast_freq_ms)[0])
+            fast_timestamps = [ts0 + i * fast_freq_ms for i in range(4)]
+
+            ticker_path = sampled_ticker_path(root, symbol, fast_freq_ms, date)
+            ticker_path.parent.mkdir(parents=True)
+            pd.DataFrame(
+                {
+                    "timestamp": fast_timestamps,
+                    "best_bid_price": [100.0, 101.0, 102.0, 103.0],
+                    "best_ask_price": [100.5, 101.5, 102.5, 103.5],
+                    "best_bid_qty": [1.0, 1.0, 1.0, 1.0],
+                    "best_ask_qty": [1.0, 1.0, 1.0, 1.0],
+                }
+            ).to_parquet(ticker_path, index=False)
+
+            intensity_path = intensity_output_path(root, symbol, "k", fast_freq_ms, 300, date)
+            intensity_path.parent.mkdir(parents=True)
+            pd.DataFrame(
+                {"timestamp": fast_timestamps, "intensity": [1.0, 2.0, 3.0, 4.0]}
+            ).to_parquet(intensity_path, index=False)
+
+            instructor_path = instructor_output_path(
+                root,
+                symbol,
+                "trade_imbalance",
+                instructor_freq_ms,
+                5,
+                date,
+            )
+            instructor_path.parent.mkdir(parents=True)
+            pd.DataFrame(
+                {
+                    "timestamp": [ts0, ts0 + instructor_freq_ms],
+                    "instructor": [0.25, -0.5],
+                }
+            ).to_parquet(instructor_path, index=False)
+
+            volatility_path = volatility_output_path(
+                root,
+                symbol,
+                "sigma",
+                volatility_freq_ms,
+                300,
+                date,
+            )
+            volatility_path.parent.mkdir(parents=True)
+            pd.DataFrame(
+                {
+                    "timestamp": [ts0, ts0 + volatility_freq_ms],
+                    "volatility": [0.1, 0.2],
+                }
+            ).to_parquet(volatility_path, index=False)
+
+            loader = BinanceEventLoader(cache_root=root, scheme_shift=0)
+            alpha = loader._read_alpha_frame(
+                symbol=symbol,
+                date=date,
+                freq_ms=60000,
+                trade_intensity_spec={
+                    "name": "k",
+                    "lookback": 300,
+                    "freq_ms": fast_freq_ms,
+                },
+                volatility_specs=[
+                    {
+                        "name": "sigma",
+                        "lookback": 300,
+                        "freq_ms": volatility_freq_ms,
+                    }
+                ],
+                instructor_spec={
+                    "name": "trade_imbalance",
+                    "lookback": 5,
+                    "freq_ms": instructor_freq_ms,
+                },
+            )
+
+            self.assertEqual(alpha["timestamp"].tolist(), fast_timestamps)
+            self.assertEqual(alpha["intensity"].tolist(), [1.0, 2.0, 3.0, 4.0])
+            self.assertEqual(alpha["instructor"].tolist(), [0.25, 0.25, -0.5, -0.5])
+            self.assertEqual(alpha["volatility_scalar"].tolist(), [0.1, 0.1, 0.1, 0.2])
+
     def test_loader_uses_shifted_cache_paths(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / "cache"
@@ -284,7 +374,9 @@ class SamplerInstructorTest(unittest.TestCase):
             "date_start": "2025-01-01",
             "input_path": "/tmp/input",
             "output_path": "/tmp/output",
-            "freq_ms": [1000],
+            "freq_ms_instructor": [1000],
+            "freq_ms_intensity": [500],
+            "freq_ms_volatility": [2000],
             "scheme_shift": [0, 250],
             "name_instructor": ["bbo_imbalance"],
             "lookback_instructor": [0],
@@ -300,6 +392,10 @@ class SamplerInstructorTest(unittest.TestCase):
             instructor_cfg["instructor"]["indicator"],
             ["bbo_imbalance"],
         )
+        self.assertEqual(resample_cfg["sampler"]["freq"], [500, 1000, 2000])
+        self.assertEqual(instructor_cfg["instructor"]["freq"], [1000])
+        self.assertEqual(intensity_cfg["intensity"]["freq"], [500])
+        self.assertEqual(volatility_cfg["volatility"]["freq"], [2000])
         self.assertEqual(instructor_cfg["instructor"]["lookback"], [0])
         self.assertEqual(instructor_cfg["instructor"]["scheme_shift"], [0, 250])
         self.assertEqual(instructor_cfg["paths"]["ticker_cache_root"], "/tmp/output")
@@ -309,7 +405,7 @@ class SamplerInstructorTest(unittest.TestCase):
         self.assertEqual(volatility_cfg["volatility"]["scheme_shift"], [0, 250])
         self.assertEqual(
             [task.scheme_shift_ms for task in build_resample_tasks(resample_cfg)],
-            [0, 250],
+            [0, 250, 0, 250, 0, 250],
         )
         self.assertEqual(
             [task.scheme_shift_ms for task in build_intensity_tasks(intensity_cfg)],
@@ -332,6 +428,24 @@ class SamplerInstructorTest(unittest.TestCase):
         bad_cfg["scheme_shift"] = [0, 1000]
         with self.assertRaisesRegex(ValueError, "scheme_shift"):
             build_stage_configs(bad_cfg)
+
+    def test_build_stage_configs_only_requires_active_stage_frequencies(self):
+        cfg = {
+            "symbols": ["BTCUSDT"],
+            "date_start": "2025-01-01",
+            "input_path": "/tmp/input",
+            "output_path": "/tmp/output",
+            "freq_ms_intensity": [1000],
+            "name_intensity": ["k"],
+            "lookback_intensity": [300],
+        }
+
+        resample_cfg, instructor_cfg, intensity_cfg, volatility_cfg = build_stage_configs(cfg)
+
+        self.assertEqual(resample_cfg["sampler"]["freq"], [1000])
+        self.assertEqual(instructor_cfg["instructor"]["freq"], [])
+        self.assertEqual(intensity_cfg["intensity"]["freq"], [1000])
+        self.assertEqual(volatility_cfg["volatility"]["freq"], [])
 
 
 if __name__ == "__main__":

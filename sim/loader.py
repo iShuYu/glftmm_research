@@ -397,8 +397,20 @@ class BinanceEventLoader:
         volatility_specs: Iterable[dict[str, int | str]] | None,
         instructor_spec: dict[str, int | str] | None,
     ) -> pd.DataFrame:
-        ticker = self._read_sampled_ticker(symbol=symbol, date=date, freq_ms=freq_ms)
+        volatility_spec_list = list(volatility_specs or ())
+        alpha_freq_ms = self._alpha_freq_ms(
+            default_freq_ms=freq_ms,
+            trade_intensity_spec=trade_intensity_spec,
+            volatility_specs=volatility_spec_list,
+            instructor_spec=instructor_spec,
+        )
+        ticker = self._read_sampled_ticker(
+            symbol=symbol,
+            date=date,
+            freq_ms=alpha_freq_ms,
+        )
         alpha = ticker.loc[:, TICKER_COLUMNS].copy()
+        alpha = alpha.sort_values("timestamp", kind="mergesort", ignore_index=True)
         alpha["instructor"] = 0.0
         alpha["intensity"] = 0.0
         alpha["volatility_scalar"] = 0.0
@@ -407,38 +419,43 @@ class BinanceEventLoader:
             instructor = self._read_instructor_frame(
                 symbol=symbol,
                 date=date,
-                freq_ms=freq_ms,
+                freq_ms=self._spec_freq_ms(
+                    instructor_spec,
+                    default_freq_ms=freq_ms,
+                    label="instructor",
+                ),
                 spec=instructor_spec,
             )
-            alpha = alpha.merge(instructor, on="timestamp", how="left", suffixes=("", "_new"))
-            alpha["instructor"] = alpha["instructor_new"].fillna(alpha["instructor"])
-            alpha = alpha.drop(columns=["instructor_new"])
+            values = self._broadcast_feature_values(alpha, instructor, "instructor")
+            alpha["instructor"] = values.fillna(alpha["instructor"])
 
         if trade_intensity_spec is not None:
             intensity = self._read_intensity_frame(
                 symbol=symbol,
                 date=date,
-                freq_ms=freq_ms,
+                freq_ms=self._spec_freq_ms(
+                    trade_intensity_spec,
+                    default_freq_ms=freq_ms,
+                    label="intensity",
+                ),
                 spec=trade_intensity_spec,
             )
-            alpha = alpha.merge(intensity, on="timestamp", how="left", suffixes=("", "_new"))
-            alpha["intensity"] = alpha["intensity_new"].fillna(alpha["intensity"])
-            alpha = alpha.drop(columns=["intensity_new"])
+            values = self._broadcast_feature_values(alpha, intensity, "intensity")
+            alpha["intensity"] = values.fillna(alpha["intensity"])
 
-        for idx, spec in enumerate(volatility_specs or ()):
+        for spec in volatility_spec_list:
             vol = self._read_volatility_frame(
                 symbol=symbol,
                 date=date,
-                freq_ms=freq_ms,
+                freq_ms=self._spec_freq_ms(
+                    spec,
+                    default_freq_ms=freq_ms,
+                    label="volatility",
+                ),
                 spec=spec,
             )
-            column = f"volatility_scalar_{idx}"
-            vol = vol.rename(columns={"volatility": column})
-            alpha = alpha.merge(vol, on="timestamp", how="left")
-            alpha["volatility_scalar"] = (
-                alpha["volatility_scalar"] + alpha[column].fillna(0.0)
-            )
-            alpha = alpha.drop(columns=[column])
+            values = self._broadcast_feature_values(alpha, vol, "volatility")
+            alpha["volatility_scalar"] = alpha["volatility_scalar"] + values.fillna(0.0)
 
         alpha["timestamp"] = alpha["timestamp"].astype("int64")
         for column in (
@@ -450,6 +467,84 @@ class BinanceEventLoader:
         ):
             alpha[column] = alpha[column].astype("float64")
         return alpha.sort_values("timestamp", kind="mergesort", ignore_index=True)
+
+    @staticmethod
+    def _spec_freq_ms(
+        spec: dict[str, int | str],
+        default_freq_ms: int,
+        label: str,
+    ) -> int:
+        raw = spec.get("freq_ms", spec.get("freq", default_freq_ms))
+        try:
+            freq_ms = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"{label}.freq_ms must be a positive integer") from None
+        if freq_ms <= 0:
+            raise ValueError(f"{label}.freq_ms must be a positive integer")
+        return freq_ms
+
+    @classmethod
+    def _alpha_freq_ms(
+        cls,
+        default_freq_ms: int,
+        trade_intensity_spec: dict[str, int | str] | None,
+        volatility_specs: Iterable[dict[str, int | str]],
+        instructor_spec: dict[str, int | str] | None,
+    ) -> int:
+        default_freq_ms = int(default_freq_ms)
+        if default_freq_ms <= 0:
+            raise ValueError("freq must be > 0")
+
+        active_freqs: list[int] = []
+        if instructor_spec is not None:
+            active_freqs.append(
+                cls._spec_freq_ms(
+                    instructor_spec,
+                    default_freq_ms=default_freq_ms,
+                    label="instructor",
+                )
+            )
+        if trade_intensity_spec is not None:
+            active_freqs.append(
+                cls._spec_freq_ms(
+                    trade_intensity_spec,
+                    default_freq_ms=default_freq_ms,
+                    label="intensity",
+                )
+            )
+        for spec in volatility_specs:
+            active_freqs.append(
+                cls._spec_freq_ms(
+                    spec,
+                    default_freq_ms=default_freq_ms,
+                    label="volatility",
+                )
+            )
+        return min(active_freqs) if active_freqs else default_freq_ms
+
+    @staticmethod
+    def _broadcast_feature_values(
+        alpha: pd.DataFrame,
+        feature: pd.DataFrame,
+        column: str,
+    ) -> pd.Series:
+        if feature.empty:
+            return pd.Series(np.nan, index=alpha.index, dtype="float64")
+
+        base = alpha.loc[:, ["timestamp"]].copy()
+        base["__row_idx"] = np.arange(len(base), dtype=np.int64)
+        feature_values = feature.loc[:, ["timestamp", column]].copy()
+        feature_values["timestamp"] = feature_values["timestamp"].astype("int64")
+        feature_values[column] = feature_values[column].astype("float64")
+
+        merged = pd.merge_asof(
+            base.sort_values("timestamp", kind="mergesort"),
+            feature_values.sort_values("timestamp", kind="mergesort"),
+            on="timestamp",
+            direction="backward",
+        )
+        merged = merged.sort_values("__row_idx", kind="mergesort")
+        return pd.Series(merged[column].to_numpy(dtype="float64"), index=alpha.index)
 
     def _read_sampled_ticker(self, symbol: str, date: str, freq_ms: int) -> pd.DataFrame:
         path = sampled_ticker_path(

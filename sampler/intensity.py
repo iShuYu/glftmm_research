@@ -77,6 +77,10 @@ def load_config(path: str | Path) -> dict[str, Any]:
         return json.load(f)
 
 
+def _is_empty_config_value(value: Any) -> bool:
+    return value in (None, "", [])
+
+
 def trade_input_path(root: Path, symbol: str, date_str: str, category: str = "TRADE") -> Path:
     return raw_input_path(root=root, symbol=symbol, date_str=date_str, category=category)
 
@@ -568,7 +572,15 @@ def build_tasks(cfg: dict[str, Any]) -> list[Task]:
     if not isinstance(intensity_cfg, dict):
         raise ValueError("config requires intensity section")
 
-    freqs = [int(v) for v in ensure_list(intensity_cfg.get("freq", cfg.get("freq", 1000)))]
+    raw_freqs = intensity_cfg.get("freq")
+    if _is_empty_config_value(raw_freqs):
+        raw_freqs = cfg.get("freq_ms_intensity")
+    if _is_empty_config_value(raw_freqs):
+        raw_freqs = cfg.get("freq_ms")
+    if _is_empty_config_value(raw_freqs):
+        raw_freqs = cfg.get("freq", 1000)
+
+    freqs = [int(v) for v in ensure_list(raw_freqs)]
     if not freqs:
         raise ValueError("intensity.freq must not be empty")
     for freq in freqs:
@@ -797,6 +809,10 @@ def build_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
         cfg["paths"]["output_root"] = args.output_root
 
     cfg.setdefault("intensity", {})
+    if "freq" not in cfg["intensity"]:
+        raw_freq = cfg.get("freq_ms_intensity", cfg.get("freq_ms"))
+        if not _is_empty_config_value(raw_freq):
+            cfg["intensity"]["freq"] = raw_freq
     if args.ticker_category is not None:
         cfg["intensity"]["ticker_category"] = args.ticker_category
     if args.trade_category is not None:

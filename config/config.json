@@ -28,7 +28,7 @@
       1
     ],
     "latency": [
-      1.5
+      2
     ],
     "price_precision": [
       1
@@ -48,20 +48,23 @@
     "freq": [
       1000
     ],
+    "freq_ms_intensity": [
+      1000
+    ],
+    "freq_ms_instructor": [
+      60000
+    ],
+    "freq_ms_volatility": [
+      1000
+    ],
     "name_intensity": [
       "k"
     ],
     "name_volatility": [
       "sigma"
     ],
-    "name_instructor": [
-      "trade_imbalance"
-    ],
     "lookback_volatility": [
       300
-    ],
-    "lookback_instructor": [
-      1
     ],
     "lookback_intensity": [
       300
@@ -73,7 +76,7 @@
       1000000
     ],
     "boost_phase_change": [
-      2.0
+      1.0
     ],
     "phase_mode": [
       "market"
@@ -85,31 +88,33 @@
       0.1
     ],
     "order_amt": [
-      2000
+      1000
     ],
     "min_order_qty": [
       0.0
     ],
     "adj_spread_intensity": [
-      1.5,
-      2.0
+      1.0,
+      1.2,
+      1.4
     ],
     "adj_spread_instructor": [
-      0
+      0,
+      -1000
     ],
     "open_passive_only": [
       true
     ],
     "optimize_by_orderbook": [
-      10000,
-      100000,
-      200000
+      -1
     ],
     "adj_spread_volatility": [
-      0
+      0,
+      0.5
     ],
     "min_quote_distance_bps": [
-      50
+      0.1,
+      0.2
     ],
     "inventory_skew": [
       [
@@ -122,6 +127,13 @@
         20,
         120,
         10,
+        "exponential",
+        0.2
+      ],
+      [
+        10,
+        120,
+        20,
         "exponential",
         0.2
       ]
@@ -142,6 +154,6 @@
     "summary_csv": "strategy_summary.csv"
   },
   "parallel": {
-    "num_workers": 12
+    "num_workers": 36
   }
 }

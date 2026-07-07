@@ -68,6 +68,10 @@ def load_config(path: str | Path) -> dict[str, Any]:
         return json.load(f)
 
 
+def _is_empty_config_value(value: Any) -> bool:
+    return value in (None, "", [])
+
+
 def trade_input_path(root: Path, symbol: str, date_str: str, category: str = "TRADE") -> Path:
     return raw_input_path(root=root, symbol=symbol, date_str=date_str, category=category)
 
@@ -516,7 +520,15 @@ def build_tasks(cfg: dict[str, Any]) -> list[Task]:
     if not isinstance(instructor_cfg, dict):
         raise ValueError("config requires instructor section")
 
-    freqs = [int(v) for v in ensure_list(instructor_cfg.get("freq", cfg.get("freq", 1000)))]
+    raw_freqs = instructor_cfg.get("freq")
+    if _is_empty_config_value(raw_freqs):
+        raw_freqs = cfg.get("freq_ms_instructor")
+    if _is_empty_config_value(raw_freqs):
+        raw_freqs = cfg.get("freq_ms")
+    if _is_empty_config_value(raw_freqs):
+        raw_freqs = cfg.get("freq", 1000)
+
+    freqs = [int(v) for v in ensure_list(raw_freqs)]
     if not freqs:
         raise ValueError("instructor.freq must not be empty")
     for freq in freqs:
@@ -703,6 +715,10 @@ def build_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
         cfg["paths"]["ticker_cache_root"] = args.ticker_cache_root
 
     cfg.setdefault("instructor", {})
+    if "freq" not in cfg["instructor"]:
+        raw_freq = cfg.get("freq_ms_instructor", cfg.get("freq_ms"))
+        if not _is_empty_config_value(raw_freq):
+            cfg["instructor"]["freq"] = raw_freq
     if args.trade_category is not None:
         cfg["instructor"]["trade_category"] = args.trade_category
     if raw_scheme_shift is not None:

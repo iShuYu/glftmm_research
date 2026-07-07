@@ -9,6 +9,7 @@ from sim.strategy import (
     build_profit_grid_levels,
 )
 from run_strategy import (
+    _build_tasks,
     _build_loader,
     _build_simulation_config,
     _normalize_sim_param_map,
@@ -368,6 +369,81 @@ class ProfitGridConfigTest(unittest.TestCase):
 
         self.assertEqual(cfg.name_instructor, "bbo_imbalance")
         self.assertEqual(cfg.lookback_instructor, 0)
+
+    def test_zero_spread_adjustments_prune_inactive_task_axes(self):
+        cfg = raw_config(
+            name_intensity="k",
+            lookback_intensity=[100, 300],
+            name_instructor="trade_imbalance",
+            lookback_instructor=[1, 5],
+            freq_ms_intensity=[1000, 2000],
+            freq_ms_instructor=[5000, 10000],
+            freq_ms_volatility=[30000],
+            adj_spread_intensity=0.0,
+            adj_spread_instructor=0.0,
+            adj_spread_volatility=0.0,
+        )
+        cfg["symbols"] = ["BTCUSDT"]
+        cfg["date_start"] = "2025-01-02"
+        cfg["date_end"] = "2025-01-02"
+
+        tasks = _build_tasks(cfg)
+
+        self.assertEqual(len(tasks), 1)
+        self.assertNotIn("name_intensity", tasks[0].sim_params)
+        self.assertNotIn("lookback_intensity", tasks[0].sim_params)
+        self.assertNotIn("name_instructor", tasks[0].sim_params)
+        self.assertNotIn("lookback_instructor", tasks[0].sim_params)
+        self.assertNotIn("name_volatility", tasks[0].sim_params)
+        self.assertNotIn("lookback_volatility", tasks[0].sim_params)
+        self.assertNotIn("freq_ms_intensity", tasks[0].sim_params)
+        self.assertNotIn("freq_ms_instructor", tasks[0].sim_params)
+        self.assertNotIn("freq_ms_volatility", tasks[0].sim_params)
+
+    def test_zero_spread_adjustments_skip_feature_specs(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                name_instructor="trade_imbalance",
+                lookback_instructor=1,
+                name_volatility="sigma",
+                lookback_volatility=300,
+                adj_spread_intensity=0.0,
+                adj_spread_instructor=0.0,
+                adj_spread_volatility=0.0,
+            )
+        )
+
+        self.assertIsNone(engine._selected_intensity_spec())
+        self.assertIsNone(engine._selected_instructor_spec())
+        self.assertEqual(engine._selected_volatility_specs(), [])
+
+    def test_positive_intensity_adjustment_requires_lookback(self):
+        cfg = raw_config(adj_spread_intensity=1.0)["simulation"]
+        cfg.pop("lookback_intensity")
+
+        with self.assertRaisesRegex(ValueError, "lookback_intensity"):
+            _build_simulation_config(cfg)
+
+    def test_split_alpha_frequencies_flow_into_feature_specs(self):
+        cfg = _build_simulation_config(
+            raw_config(
+                name_instructor="trade_imbalance",
+                lookback_instructor=5,
+                name_volatility="sigma",
+                lookback_volatility=300,
+                adj_spread_instructor=0.001,
+                adj_spread_volatility=0.5,
+                freq_ms_intensity=1000,
+                freq_ms_instructor=5000,
+                freq_ms_volatility=60000,
+            )["simulation"]
+        )
+        engine = SimpleMakerStrategy(cfg)
+
+        self.assertEqual(cfg.alpha_freq, 1000)
+        self.assertEqual(engine._selected_intensity_spec()["freq_ms"], 1000)
+        self.assertEqual(engine._selected_instructor_spec()["freq_ms"], 5000)
+        self.assertEqual(engine._selected_volatility_specs()[0]["freq_ms"], 60000)
 
     def test_invalid_phase_mode_is_rejected(self):
         with self.assertRaises(ValueError):

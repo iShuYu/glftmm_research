@@ -53,10 +53,12 @@ SIM_REQUIRED_KEYS = (
     "mode",
     "taker_fee",
     "maker_fee",
-    "lookback_intensity",
     "order_amt",
     "max_position_usdt",
 )
+INTENSITY_PARAM_KEYS = ("name_intensity", "lookback_intensity", "freq_ms_intensity")
+INSTRUCTOR_PARAM_KEYS = ("name_instructor", "lookback_instructor", "freq_ms_instructor")
+VOLATILITY_PARAM_KEYS = ("name_volatility", "lookback_volatility", "freq_ms_volatility")
 
 PARAM_KEY_ALIAS = {
     "latency": "lat",
@@ -71,6 +73,9 @@ PARAM_KEY_ALIAS = {
     "lookback_volatility": "vlb",
     "lookback_instructor": "ilb",
     "lookback_intensity": "lbi",
+    "freq_ms_volatility": "fvol",
+    "freq_ms_instructor": "finst",
+    "freq_ms_intensity": "fint",
     "order_amt": "oa",
     "max_position_usdt": "mp",
     "phase_change_position": "pcp",
@@ -97,8 +102,12 @@ SIM_OPTIONAL_KEYS = (
     "name_intensity",
     "name_instructor",
     "name_volatility",
+    "lookback_intensity",
     "lookback_instructor",
     "lookback_volatility",
+    "freq_ms_intensity",
+    "freq_ms_instructor",
+    "freq_ms_volatility",
     "phase_change_position",
     "boost_phase_change",
     "phase_mode",
@@ -266,6 +275,32 @@ def build_param_path_parts(sim_params: dict[str, Any]) -> tuple[str, str]:
     return sim_dir, "strat__all"
 
 
+def _is_effectively_zero(raw: Any) -> bool:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(value) and abs(value) <= 1e-12
+
+
+def _effective_sim_params(sim_params: dict[str, Any]) -> dict[str, Any]:
+    effective = dict(sim_params)
+    if _is_effectively_zero(effective.get("adj_spread_intensity", 1.0)):
+        for key in INTENSITY_PARAM_KEYS:
+            effective.pop(key, None)
+    if _is_effectively_zero(effective.get("adj_spread_instructor", 0.0)):
+        for key in INSTRUCTOR_PARAM_KEYS:
+            effective.pop(key, None)
+    if _is_effectively_zero(effective.get("adj_spread_volatility", 0.0)):
+        for key in VOLATILITY_PARAM_KEYS:
+            effective.pop(key, None)
+    return effective
+
+
+def _sim_params_dedupe_key(sim_params: dict[str, Any]) -> str:
+    return json.dumps(sim_params, sort_keys=True, separators=(",", ":"))
+
+
 def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
     sim_raw = cfg.get("simulation")
     if sim_raw is None or not isinstance(sim_raw, dict):
@@ -348,6 +383,23 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
             "simulation.min_quote_distance_bps"
         )
 
+    freq = int(raw["freq"])
+    freq_ms_intensity = int(raw.get("freq_ms_intensity", freq))
+    freq_ms_instructor = int(raw.get("freq_ms_instructor", freq))
+    freq_ms_volatility = int(raw.get("freq_ms_volatility", freq))
+
+    adj_spread_intensity = float(raw.get("adj_spread_intensity", 1.0))
+    lookback_intensity_raw = raw.get("lookback_intensity")
+    if lookback_intensity_raw is None:
+        if adj_spread_intensity > 1e-12:
+            raise ValueError(
+                "simulation.lookback_intensity is required when "
+                "adj_spread_intensity > 0"
+            )
+        lookback_intensity = 100
+    else:
+        lookback_intensity = int(lookback_intensity_raw)
+
     name_instructor = raw.get("name_instructor")
     if name_instructor is not None:
         name_instructor = str(name_instructor).strip() or None
@@ -391,7 +443,7 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
     )
 
     return SimulationConfig(
-        freq=int(raw["freq"]),
+        freq=freq,
         latency=int(raw["latency"]),
         price_precision=int(raw["price_precision"]),
         qty_precision=int(raw["qty_precision"]),
@@ -403,7 +455,10 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
         ),
         lookback_instructor=lookback_instructor,
         name_intensity=str(raw.get("name_intensity", "k")).strip().lower(),
-        lookback_intensity=int(raw["lookback_intensity"]),
+        lookback_intensity=lookback_intensity,
+        freq_ms_instructor=freq_ms_instructor,
+        freq_ms_intensity=freq_ms_intensity,
+        freq_ms_volatility=freq_ms_volatility,
         name_volatility=(
             None if name_volatility is None else str(name_volatility).strip().lower()
         ),
@@ -414,7 +469,7 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
         boost_phase_change=float(raw.get("boost_phase_change", 1.0)),
         phase_mode=str(raw.get("phase_mode", "market")).strip().lower(),
         max_holding_time=int(raw.get("max_holding_time", 0)),
-        adj_spread_intensity=float(raw.get("adj_spread_intensity", 1.0)),
+        adj_spread_intensity=adj_spread_intensity,
         adj_spread_instructor=float(raw.get("adj_spread_instructor", 0.0)),
         open_passive_only=_parse_bool(raw.get("open_passive_only", False), "open_passive_only"),
         optimize_by_orderbook=_parse_orderbook_optimizer_threshold(
@@ -587,10 +642,10 @@ def _build_loader(
                 "orderbook_replay.tick_size must match simulation tick size "
                 f"({orderbook_replay_config.tick_size} != {simulation.tick_size})"
             )
-        if int(orderbook_replay_config.sample_interval_ms) != int(simulation.freq):
+        if int(orderbook_replay_config.sample_interval_ms) != int(simulation.alpha_freq):
             raise ValueError(
-                "orderbook_replay.sample_interval_ms must match simulation.freq "
-                f"({orderbook_replay_config.sample_interval_ms} != {simulation.freq})"
+                "orderbook_replay.sample_interval_ms must match simulation alpha_freq "
+                f"({orderbook_replay_config.sample_interval_ms} != {simulation.alpha_freq})"
             )
 
     return BinanceEventLoader(
@@ -1130,8 +1185,14 @@ def _build_tasks(cfg: dict[str, Any]) -> list[Task]:
     tasks: list[Task] = []
     for symbol in symbols:
         combos = itertools.product(*sim_lists) if sim_lists else [()]
+        seen_params: set[str] = set()
         for combo in combos:
             sim_params = {k: combo[i] for i, k in enumerate(sim_keys)}
+            sim_params = _effective_sim_params(sim_params)
+            dedupe_key = _sim_params_dedupe_key(sim_params)
+            if dedupe_key in seen_params:
+                continue
+            seen_params.add(dedupe_key)
             tasks.append(Task(symbol=str(symbol), dates=dates, sim_params=sim_params, cfg=cfg))
     return tasks
 

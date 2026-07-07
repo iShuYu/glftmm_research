@@ -55,3 +55,4 @@ class AlphaEvent(BaseEvent):
     instructor_event: InstructorEvent
     intensity_event: IntensityEvent
     volatility_event: VolatilityEvent
+    prediction: float = 0.0

@@ -95,6 +95,10 @@ def load_config(path: str | Path) -> dict[str, Any]:
         return json.load(f)
 
 
+def _is_empty_config_value(value: Any) -> bool:
+    return value in (None, "", [])
+
+
 def trade_input_path(root: Path, symbol: str, date_str: str, category: str = "TRADE") -> Path:
     return raw_input_path(root=root, symbol=symbol, date_str=date_str, category=category)
 
@@ -804,7 +808,15 @@ def build_tasks(cfg: dict[str, Any]) -> list[Task]:
     if not isinstance(vol_cfg, dict):
         raise ValueError("config requires volatility section")
 
-    freqs = [int(v) for v in ensure_list(vol_cfg.get("freq", cfg.get("freq", 1000)))]
+    raw_freqs = vol_cfg.get("freq")
+    if _is_empty_config_value(raw_freqs):
+        raw_freqs = cfg.get("freq_ms_volatility")
+    if _is_empty_config_value(raw_freqs):
+        raw_freqs = cfg.get("freq_ms")
+    if _is_empty_config_value(raw_freqs):
+        raw_freqs = cfg.get("freq", 1000)
+
+    freqs = [int(v) for v in ensure_list(raw_freqs)]
     if not freqs:
         raise ValueError("volatility.freq must not be empty")
     for freq in freqs:
@@ -1034,8 +1046,10 @@ def build_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
         cfg["paths"].setdefault("ticker_cache_root", output_root)
         cfg["paths"].setdefault("output_root", output_root)
 
-    if "freq" not in cfg["volatility"] and "freq_ms" in cfg:
-        cfg["volatility"]["freq"] = cfg["freq_ms"]
+    if "freq" not in cfg["volatility"]:
+        raw_freq = cfg.get("freq_ms_volatility", cfg.get("freq_ms"))
+        if not _is_empty_config_value(raw_freq):
+            cfg["volatility"]["freq"] = raw_freq
     if "indicator" not in cfg["volatility"] and "name_volatility" in cfg:
         cfg["volatility"]["indicator"] = cfg["name_volatility"]
     if "lookback" not in cfg["volatility"] and "lookback_volatility" in cfg:

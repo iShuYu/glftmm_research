@@ -80,6 +80,20 @@ def ensure_list(value: Any) -> list[Any]:
     return [value]
 
 
+def _is_empty_config_value(value: Any) -> bool:
+    return value in (None, "", [])
+
+
+def _split_stage_freqs(cfg: dict[str, Any]) -> list[int]:
+    values: list[int] = []
+    for key in ("freq_ms_instructor", "freq_ms_intensity", "freq_ms_volatility"):
+        raw = cfg.get(key)
+        if _is_empty_config_value(raw):
+            continue
+        values.extend(int(item) for item in ensure_list(raw))
+    return sorted(set(values))
+
+
 def normalize_category(value: Any, default: str = "BOOKTICKER") -> str:
     category = str(value if value is not None else default).strip().upper()
     if not category:
@@ -785,7 +799,15 @@ def build_tasks(cfg: dict[str, Any]) -> list[Task]:
     if not isinstance(sampler_cfg, dict):
         raise ValueError("config sampler section must be a dict")
 
-    freqs = [int(x) for x in ensure_list(sampler_cfg.get("freq", cfg.get("freq", 1000)))]
+    raw_freqs = sampler_cfg.get("freq")
+    if _is_empty_config_value(raw_freqs):
+        raw_freqs = cfg.get("freq_ms")
+    if _is_empty_config_value(raw_freqs):
+        raw_freqs = _split_stage_freqs(cfg)
+    if _is_empty_config_value(raw_freqs):
+        raw_freqs = cfg.get("freq", 1000)
+
+    freqs = [int(x) for x in ensure_list(raw_freqs)]
     if not freqs:
         raise ValueError("sampler.freq must not be empty")
     for freq in freqs:

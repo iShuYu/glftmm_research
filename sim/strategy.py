@@ -293,6 +293,9 @@ class SimulationConfig:
     lookback_instructor: Optional[int] = None
     name_intensity: str = "k"
     lookback_intensity: int = 100
+    freq_ms_instructor: Optional[int] = None
+    freq_ms_intensity: Optional[int] = None
+    freq_ms_volatility: Optional[int] = None
     name_volatility: Optional[str] = None
     lookback_volatility: Optional[int] = None
     order_amt: float = 0.0
@@ -329,6 +332,12 @@ class SimulationConfig:
         object.__setattr__(self, "phase_mode", str(self.phase_mode).strip().lower())
         if self.freq <= 0:
             raise ValueError("freq must be > 0")
+        for attr in ("freq_ms_instructor", "freq_ms_intensity", "freq_ms_volatility"):
+            raw_freq = getattr(self, attr)
+            freq_ms = int(self.freq if raw_freq is None else raw_freq)
+            if freq_ms <= 0:
+                raise ValueError(f"{attr} must be > 0")
+            object.__setattr__(self, attr, freq_ms)
         if self.latency < 0:
             raise ValueError("latency must be >= 0")
         if self.price_precision < 0:
@@ -337,7 +346,31 @@ class SimulationConfig:
             raise ValueError("qty_precision must be >= 0")
         if self.mode not in (0, 1):
             raise ValueError("mode must be 0 or 1")
-        if self.name_instructor is not None:
+        try:
+            adj_spread_intensity = float(self.adj_spread_intensity)
+        except (TypeError, ValueError):
+            raise ValueError("adj_spread_intensity must be finite and >= 0") from None
+        if not math.isfinite(adj_spread_intensity) or adj_spread_intensity < 0:
+            raise ValueError("adj_spread_intensity must be finite and >= 0")
+        object.__setattr__(self, "adj_spread_intensity", adj_spread_intensity)
+
+        try:
+            adj_spread_instructor = float(self.adj_spread_instructor)
+        except (TypeError, ValueError):
+            raise ValueError("adj_spread_instructor must be finite") from None
+        if not math.isfinite(adj_spread_instructor):
+            raise ValueError("adj_spread_instructor must be finite")
+        object.__setattr__(self, "adj_spread_instructor", adj_spread_instructor)
+
+        try:
+            adj_spread_volatility = float(self.adj_spread_volatility)
+        except (TypeError, ValueError):
+            raise ValueError("adj_spread_volatility must be finite and >= 0") from None
+        if not math.isfinite(adj_spread_volatility) or adj_spread_volatility < 0:
+            raise ValueError("adj_spread_volatility must be finite and >= 0")
+        object.__setattr__(self, "adj_spread_volatility", adj_spread_volatility)
+
+        if abs(adj_spread_instructor) > 1e-12 and self.name_instructor is not None:
             instructor_name = str(self.name_instructor).strip().lower()
             if self.lookback_instructor is None:
                 raise ValueError(
@@ -350,11 +383,15 @@ class SimulationConfig:
                 raise ValueError(
                     "lookback_instructor must be > 0 when name_instructor is provided"
                 )
-        if self.lookback_intensity <= 0:
-            raise ValueError("lookback_intensity must be > 0")
-        if self.name_volatility is not None:
+        if adj_spread_intensity > 1e-12 and self.lookback_intensity <= 0:
+            raise ValueError(
+                "lookback_intensity must be > 0 when adj_spread_intensity > 0"
+            )
+        if adj_spread_volatility > 1e-12 and self.name_volatility is not None:
             if self.lookback_volatility is None or int(self.lookback_volatility) <= 0:
-                raise ValueError("lookback_volatility must be > 0 when name_volatility is provided")
+                raise ValueError(
+                    "lookback_volatility must be > 0 when name_volatility is provided"
+                )
         if self.order_amt < 0:
             raise ValueError("order_amt must be >= 0")
         if self.max_position_usdt < 0:
@@ -370,10 +407,6 @@ class SimulationConfig:
         object.__setattr__(self, "boost_phase_change", boost_phase_change)
         if self.phase_mode not in ("market", "trade"):
             raise ValueError("phase_mode must be 'market' or 'trade'")
-        if self.adj_spread_intensity <= 0:
-            raise ValueError("adj_spread_intensity must be > 0")
-        if not math.isfinite(float(self.adj_spread_instructor)):
-            raise ValueError("adj_spread_instructor must be finite")
         if not isinstance(self.open_passive_only, bool):
             raise ValueError("open_passive_only must be boolean")
         try:
@@ -386,8 +419,6 @@ class SimulationConfig:
         ):
             raise ValueError("optimize_by_orderbook must be -1, 0, or a notional threshold")
         object.__setattr__(self, "optimize_by_orderbook", optimize_by_orderbook)
-        if self.adj_spread_volatility < 0:
-            raise ValueError("adj_spread_volatility must be >= 0")
         try:
             min_quote_distance_bps = float(self.min_quote_distance_bps)
         except (TypeError, ValueError):
@@ -445,6 +476,17 @@ class SimulationConfig:
     @property
     def step_size(self) -> float:
         return 10.0 ** (-self.qty_precision)
+
+    @property
+    def alpha_freq(self) -> int:
+        freqs: list[int] = []
+        if float(self.adj_spread_intensity) > 1e-12:
+            freqs.append(int(self.freq_ms_intensity))
+        if abs(float(self.adj_spread_instructor)) > 1e-12 and self.name_instructor is not None:
+            freqs.append(int(self.freq_ms_instructor))
+        if float(self.adj_spread_volatility) > 1e-12 and self.name_volatility is not None:
+            freqs.append(int(self.freq_ms_volatility))
+        return min(freqs) if freqs else int(self.freq)
 
 
 class SimpleMakerStrategy:
@@ -669,7 +711,7 @@ class SimpleMakerStrategy:
         for event in self.loader.iter_merged_alpha_trade_tuples(
             symbol=symbol,
             date=date,
-            freq=self.sim.freq,
+            freq=self.sim.alpha_freq,
             trade_intensity_spec=ti_spec,
             volatility_specs=vol_specs,
             instructor_spec=instructor_spec,
@@ -1794,13 +1836,18 @@ class SimpleMakerStrategy:
             return 0.0
         return v if math.isfinite(v) else 0.0
 
-    def _selected_intensity_spec(self) -> dict[str, int | str]:
+    def _selected_intensity_spec(self) -> dict[str, int | str] | None:
+        if float(self.sim.adj_spread_intensity) <= self.EPS:
+            return None
         return {
             "name": str(self.sim.name_intensity).strip().lower(),
             "lookback": int(self.sim.lookback_intensity),
+            "freq_ms": int(self.sim.freq_ms_intensity),
         }
 
     def _selected_instructor_spec(self) -> dict[str, int | str] | None:
+        if abs(float(self.sim.adj_spread_instructor)) <= self.EPS:
+            return None
         if self.sim.name_instructor is None:
             return None
         if self.sim.lookback_instructor is None:
@@ -1808,9 +1855,12 @@ class SimpleMakerStrategy:
         return {
             "name": str(self.sim.name_instructor).strip().lower(),
             "lookback": int(self.sim.lookback_instructor),
+            "freq_ms": int(self.sim.freq_ms_instructor),
         }
 
     def _selected_volatility_specs(self) -> list[dict[str, int | str]]:
+        if float(self.sim.adj_spread_volatility) <= self.EPS:
+            return []
         if self.sim.name_volatility is None:
             return []
         if self.sim.lookback_volatility is None:
@@ -1819,5 +1869,6 @@ class SimpleMakerStrategy:
             {
                 "name": str(self.sim.name_volatility).strip().lower(),
                 "lookback": int(self.sim.lookback_volatility),
+                "freq_ms": int(self.sim.freq_ms_volatility),
             }
         ]
