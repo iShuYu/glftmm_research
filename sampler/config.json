@@ -4,7 +4,7 @@
   "date_end": "2026-05-31",
   "input_path": "/data/users/data-helper/PROCESSED/TARDIS/BINANCE/UFUTURES",
   "input_backup_path": "/home/kang/data_helper/PROCESSED/DATA_RECORDER/BINANCE/UFUTURES",
-  "output_path": "/data/users/kang/backtest/glftmm/cached",
+  "output_path": "/data/users/kang/backtest/glftmm_tier/cached",
   "freq_ms": [1000],
   "scheme_shift": [0],
   "name_instructor": ["trade_imbalance"],

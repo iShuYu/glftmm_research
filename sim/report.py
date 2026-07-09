@@ -13,7 +13,10 @@ import pandas as pd
 
 
 _DATE_KEY_RE = re.compile(r"\d{4}-?\d{2}-?\d{2}")
-_MAX_POSITION_RE = re.compile(r"(?:^|__)mp([0-9]+(?:p[0-9]+)?(?:e[+-]?[0-9]+)?)(?:$|__)")
+_MAX_POSITION_RE = re.compile(
+    r"(?:^|__)mp([0-9]+(?:p[0-9]+)?(?:e[+-]?[0-9]+)?"
+    r"(?:x[0-9]+(?:p[0-9]+)?(?:e[+-]?[0-9]+)?)*)(?:$|__)"
+)
 _PNL_REPORT_COLUMNS = (
     "timestamp",
     "datetime",
@@ -295,7 +298,7 @@ def _parse_max_position_from_folder(folder: str | Path) -> float:
         match = _MAX_POSITION_RE.search(part.lower())
         if match is None:
             continue
-        token = match.group(1).replace("p", ".")
+        token = match.group(1).split("x")[-1].replace("p", ".")
         value = float(token)
         if value == 0.0:
             raise ValueError(f"parsed max_position is zero from folder name: {folder}")

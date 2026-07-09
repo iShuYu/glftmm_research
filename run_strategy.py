@@ -15,7 +15,7 @@ from typing import Any
 
 import pandas as pd
 
-from sim.loader import BinanceEventLoader, parse_orderbook_replay_config
+from sim.loader import BinanceEventLoader
 from sim.strategy import (
     SimulationConfig,
     SimpleMakerStrategy,
@@ -38,7 +38,7 @@ SIM_REQUIRED_KEYS = (
     "mode",
     "taker_fee",
     "maker_fee",
-    "max_position_usdt",
+    "max_position",
 )
 INTENSITY_PARAM_KEYS = ("name_intensity", "lookback_intensity")
 INSTRUCTOR_PARAM_KEYS = ("name_instructor", "lookback_instructor")
@@ -57,21 +57,21 @@ PARAM_KEY_ALIAS = {
     "lookback_volatility": "vlb",
     "lookback_instructor": "ilb",
     "lookback_intensity": "lbi",
+    "max_position": "mp",
     "max_position_usdt": "mp",
     "max_open_inventory_utilization": "moiu",
-    "phase_change_position": "pcp",
-    "boost_phase_change": "bpc",
-    "phase_mode": "phm",
+    "tier_jump_bps": "tjb",
+    "boost_tier": "bt",
     "max_holding_time": "mht",
     "freq": "fr",
     "adj_spread_intensity": "asi",
     "adj_spread_instructor": "asir",
     "passive_only": "po",
-    "optimize_by_orderbook": "obo",
     "adj_spread_volatility": "asv",
     "min_quote_distance_bps": "mqdb",
     "inventory_skew": "isk",
     "stoploss": "sl",
+    "takeprofit": "tp",
     "open_curve": "oc",
     "close_curve": "cc",
     "boost_underwater": "bu",
@@ -92,19 +92,18 @@ SIM_OPTIONAL_KEYS = (
     "lookback_volatility",
     "max_holding_time",
     "max_open_inventory_utilization",
-    "phase_change_position",
-    "boost_phase_change",
-    "phase_mode",
+    "tier_jump_bps",
+    "boost_tier",
     "adj_spread_intensity",
     "adj_spread_instructor",
     "passive_only",
-    "optimize_by_orderbook",
     "adj_spread_volatility",
     "min_quote_distance_bps",
     "inventory_skew",
     "min_order_qty",
     "min_order_notional",
     "stoploss",
+    "takeprofit",
     "open_curve",
     "close_curve",
     "boost_underwater",
@@ -153,6 +152,78 @@ def _normalize_ratio(value: Any, key: str) -> float:
     if not math.isfinite(value_float) or value_float < 0.0 or value_float > 1.0:
         raise ValueError(f"simulation.{key} must be finite and between 0 and 1")
     return value_float
+
+
+def _normalize_tier_values(value: Any, key: str) -> list[float]:
+    if _is_number(value):
+        values = [float(value)]
+    elif isinstance(value, (list, tuple)) and value:
+        values = [float(item) for item in value]
+    else:
+        raise ValueError(f"simulation.{key} must be a number or a non-empty tier list")
+    if any((not math.isfinite(item)) or item < 0.0 for item in values):
+        raise ValueError(f"simulation.{key} tiers must be finite and >= 0")
+    if len(values) > 1:
+        if values[0] <= 0.0:
+            raise ValueError(f"simulation.{key} tiers must be > 0 when tiered")
+        for prev, current in zip(values, values[1:]):
+            if current <= prev:
+                raise ValueError(f"simulation.{key} tiers must be strictly increasing")
+    return values
+
+
+def _normalize_max_position_rows(
+    value: Any,
+    key: str,
+    *,
+    scalar_grid: bool,
+) -> list[float | list[float]]:
+    if _is_number(value):
+        return [_normalize_non_negative_scalar(value, key)]
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"simulation.{key} must be a number or list of tiers")
+    if all(_is_number(item) for item in value):
+        if scalar_grid:
+            return [_normalize_non_negative_scalar(item, key) for item in value]
+        return [_normalize_tier_values(value, key)]
+    rows: list[float | list[float]] = []
+    for row in value:
+        tiers = _normalize_tier_values(row, key)
+        rows.append(tiers[0] if len(tiers) == 1 else tiers)
+    return rows
+
+
+def _normalize_tier_control_rows(value: Any, key: str) -> list[float | list[float]]:
+    if _is_number(value):
+        value_float = _normalize_non_negative_scalar(value, key)
+        return [value_float]
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"simulation.{key} must be a number or list of tier rows")
+    if all(_is_number(item) for item in value):
+        values = [float(item) for item in value]
+        if any((not math.isfinite(item)) or item < 0.0 for item in values):
+            raise ValueError(f"simulation.{key} values must be finite and >= 0")
+        return [values[0] if len(values) == 1 else values]
+    rows: list[float | list[float]] = []
+    for row in value:
+        if _is_number(row):
+            rows.append(_normalize_non_negative_scalar(row, key))
+            continue
+        if not isinstance(row, (list, tuple)) or not row:
+            raise ValueError(f"simulation.{key} rows must be non-empty")
+        values = [float(item) for item in row]
+        if any((not math.isfinite(item)) or item < 0.0 for item in values):
+            raise ValueError(f"simulation.{key} values must be finite and >= 0")
+        rows.append(values[0] if len(values) == 1 else values)
+    return rows
+
+
+def _normalize_tier_jump_rows(value: Any) -> list[float | list[float]]:
+    return _normalize_tier_control_rows(value, "tier_jump_bps")
+
+
+def _normalize_boost_tier_rows(value: Any) -> list[float | list[float]]:
+    return _normalize_tier_control_rows(value, "boost_tier")
 
 
 def _normalize_open_close_pair(value: Any, key: str, *, positive: bool) -> list[float]:
@@ -226,9 +297,10 @@ def _normalize_toxic_lock_rows(value: Any) -> list[list[int]]:
 
 def _max_position_total(value: Any) -> float | None:
     try:
-        max_position_usdt = _normalize_non_negative_scalar(value, "max_position_usdt")
+        tiers = _normalize_tier_values(value, "max_position")
     except (TypeError, ValueError):
         return None
+    max_position_usdt = float(tiers[-1])
     return max_position_usdt if max_position_usdt > 0.0 else None
 
 
@@ -285,18 +357,6 @@ def _parse_bool(raw: Any, key: str) -> bool:
         if value in {"false", "0", "no", "n"}:
             return False
     raise ValueError(f"simulation.{key} must be boolean")
-
-
-def _parse_orderbook_optimizer_threshold(raw: Any) -> float:
-    if isinstance(raw, bool):
-        raise ValueError("simulation.optimize_by_orderbook must be -1, 0, or a notional threshold")
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        raise ValueError("simulation.optimize_by_orderbook must be -1, 0, or a notional threshold") from None
-    if not math.isfinite(value) or (value < 0.0 and abs(value + 1.0) > 1e-12):
-        raise ValueError("simulation.optimize_by_orderbook must be -1, 0, or a notional threshold")
-    return value
 
 
 def _safe_dir_segment(prefix: str, body: str) -> str:
@@ -362,6 +422,22 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
         )
 
     sim_map = ensure_list_map(sim_raw)
+    if "max_position" in sim_raw and "max_position_usdt" in sim_raw:
+        raise ValueError("simulation.max_position_usdt has been replaced by simulation.max_position")
+    if "max_position" in sim_raw:
+        sim_map["max_position"] = _normalize_max_position_rows(
+            sim_raw["max_position"],
+            "max_position",
+            scalar_grid=False,
+        )
+    elif "max_position_usdt" in sim_raw:
+        sim_map.pop("max_position_usdt", None)
+        sim_map["max_position"] = _normalize_max_position_rows(
+            sim_raw["max_position_usdt"],
+            "max_position_usdt",
+            scalar_grid=True,
+        )
+
     if "inventory_skew" in sim_raw:
         skew_rows = ensure_list_map({"inventory_skew": sim_raw["inventory_skew"]})[
             "inventory_skew"
@@ -375,29 +451,16 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
             normalized_rows.append([float(row[0]), float(row[1])])
         sim_map["inventory_skew"] = normalized_rows
 
-    if "max_position_usdt" in sim_map:
-        sim_map["max_position_usdt"] = [
-            _normalize_non_negative_scalar(row, "max_position_usdt")
-            for row in sim_map["max_position_usdt"]
-        ]
-
     if "max_open_inventory_utilization" in sim_map:
         sim_map["max_open_inventory_utilization"] = [
             _normalize_ratio(row, "max_open_inventory_utilization")
             for row in sim_map["max_open_inventory_utilization"]
         ]
 
-    if "phase_change_position" in sim_map:
-        sim_map["phase_change_position"] = [
-            _normalize_non_negative_scalar(row, "phase_change_position")
-            for row in sim_map["phase_change_position"]
-        ]
-
-    if "boost_phase_change" in sim_map:
-        sim_map["boost_phase_change"] = [
-            _normalize_non_negative_scalar(row, "boost_phase_change")
-            for row in sim_map["boost_phase_change"]
-        ]
+    if "tier_jump_bps" in sim_raw:
+        sim_map["tier_jump_bps"] = _normalize_tier_jump_rows(sim_raw["tier_jump_bps"])
+    if "boost_tier" in sim_raw:
+        sim_map["boost_tier"] = _normalize_boost_tier_rows(sim_raw["boost_tier"])
 
     if "stoploss" in sim_map:
         sim_map["stoploss"] = [
@@ -405,14 +468,14 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
             for row in sim_map["stoploss"]
         ]
 
+    if "takeprofit" in sim_map:
+        sim_map["takeprofit"] = [
+            _normalize_non_negative_scalar(row, "takeprofit")
+            for row in sim_map["takeprofit"]
+        ]
+
     if "toxic_lock" in sim_raw:
         sim_map["toxic_lock"] = _normalize_toxic_lock_rows(sim_raw["toxic_lock"])
-
-    if "optimize_by_orderbook" in sim_map:
-        sim_map["optimize_by_orderbook"] = [
-            _parse_orderbook_optimizer_threshold(row)
-            for row in sim_map["optimize_by_orderbook"]
-        ]
 
     if "min_quote_distance_bps" in sim_map:
         sim_map["min_quote_distance_bps"] = [
@@ -479,6 +542,12 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
             "simulation.min_quote_distance_ticks has been replaced by "
             "simulation.min_quote_distance_bps"
         )
+    if "max_position" in raw and "max_position_usdt" in raw:
+        raise ValueError("simulation.max_position_usdt has been replaced by simulation.max_position")
+    raw_allowed_keys = SIM_ALLOWED_KEYS | {"max_position_usdt"}
+    unknown = sorted(set(raw) - raw_allowed_keys)
+    if unknown:
+        raise ValueError(f"unknown simulation keys: {unknown}")
 
     adj_spread_intensity = raw.get("adj_spread_intensity", [1.0, 1.0])
     lookback_intensity_raw = raw.get("lookback_intensity")
@@ -569,30 +638,17 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
             None if name_volatility is None else str(name_volatility).strip().lower()
         ),
         lookback_volatility=lookback_volatility,
-        max_position_usdt=_normalize_non_negative_scalar(
-            raw["max_position_usdt"],
-            "max_position_usdt",
-        ),
+        max_position_usdt=raw.get("max_position", raw.get("max_position_usdt")),
         max_open_inventory_utilization=_normalize_ratio(
             raw.get("max_open_inventory_utilization", 1.0),
             "max_open_inventory_utilization",
         ),
-        phase_change_position=_normalize_non_negative_scalar(
-            raw.get("phase_change_position", 0.0),
-            "phase_change_position",
-        ),
-        boost_phase_change=_normalize_non_negative_scalar(
-            raw.get("boost_phase_change", 1.0),
-            "boost_phase_change",
-        ),
-        phase_mode=str(raw.get("phase_mode", "market")).strip().lower(),
+        tier_jump_bps=raw.get("tier_jump_bps", 0.0),
+        boost_tier=raw.get("boost_tier", 1.0),
         max_holding_time=int(raw.get("max_holding_time", 0)),
         adj_spread_intensity=adj_spread_intensity,
         adj_spread_instructor=float(raw.get("adj_spread_instructor", 0.0)),
         passive_only=_parse_bool(raw.get("passive_only", False), "passive_only"),
-        optimize_by_orderbook=_parse_orderbook_optimizer_threshold(
-            raw.get("optimize_by_orderbook", -1)
-        ),
         adj_spread_volatility=raw.get("adj_spread_volatility", [0.0, 0.0]),
         min_quote_distance_bps=_normalize_non_negative_scalar(
             raw.get("min_quote_distance_bps", 0.0),
@@ -602,6 +658,10 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
         min_order_qty=float(raw.get("min_order_qty", 0.0)),
         min_order_notional=float(raw.get("min_order_notional", 0.0)),
         stoploss=_normalize_non_negative_scalar(raw.get("stoploss", 0.0), "stoploss"),
+        takeprofit=_normalize_non_negative_scalar(
+            raw.get("takeprofit", 0.0),
+            "takeprofit",
+        ),
         open_curve=open_curve,
         close_curve=close_curve,
         boost_underwater=raw.get("boost_underwater", [1.0, 1.0]),
@@ -663,6 +723,7 @@ def _build_loader(
     simulation: SimulationConfig | None = None,
     require_volatility_cache: bool = False,
 ) -> BinanceEventLoader:
+    del simulation, require_volatility_cache
     paths = _config_paths(cfg)
     sampler_output_root = _path_value(paths, "output_path", required=True)
     assert sampler_output_root is not None
@@ -671,27 +732,11 @@ def _build_loader(
         paths,
         category=trade_category,
     )
-    orderbook_replay_config = None
-    if simulation is not None and float(simulation.optimize_by_orderbook) >= 0.0:
-        orderbook_replay_config = parse_orderbook_replay_config(cfg)
-        if abs(float(orderbook_replay_config.tick_size) - float(simulation.tick_size)) > 1e-12:
-            raise ValueError(
-                "orderbook_replay.tick_size must match simulation tick size "
-                f"({orderbook_replay_config.tick_size} != {simulation.tick_size})"
-            )
-        replay_interval_ms = int(orderbook_replay_config.sample_interval_ms)
-        sim_freq_ms = int(simulation.freq)
-        if replay_interval_ms > sim_freq_ms or sim_freq_ms % replay_interval_ms != 0:
-            raise ValueError(
-                "orderbook_replay.sample_interval_ms must divide simulation.freq "
-                f"and be no larger than it ({replay_interval_ms} vs {sim_freq_ms})"
-            )
     return BinanceEventLoader(
         trade_roots=trade_roots,
         cache_root=sampler_output_root,
         trade_category=trade_category,
         scheme_shift=int(paths.get("scheme_shift", 0)),
-        orderbook_replay_config=orderbook_replay_config,
     )
 
 
@@ -1069,6 +1114,33 @@ def _run_daily_incremental(
     return _metrics_from_saved(out_dir=out_dir, dates=dates)
 
 
+def _build_tier_param_rows(sim_map: dict[str, list[Any]]) -> list[dict[str, Any]]:
+    max_position_rows = sim_map.get("max_position")
+    if max_position_rows is None:
+        return [{}]
+
+    paired_keys = ("tier_jump_bps", "boost_tier")
+    paired_rows = {
+        key: sim_map[key]
+        for key in paired_keys
+        if key in sim_map
+    }
+    for key, rows in paired_rows.items():
+        if len(max_position_rows) != len(rows):
+            raise ValueError(
+                "simulation.max_position, simulation.tier_jump_bps, and "
+                "simulation.boost_tier must have the same number of rows"
+            )
+
+    result: list[dict[str, Any]] = []
+    for idx, max_position in enumerate(max_position_rows):
+        row = {"max_position": max_position}
+        for key, rows in paired_rows.items():
+            row[key] = rows[idx]
+        result.append(row)
+    return result
+
+
 def _build_tasks(cfg: dict[str, Any]) -> list[Task]:
     symbols = cfg.get("symbols")
     if not isinstance(symbols, list) or not symbols:
@@ -1077,27 +1149,36 @@ def _build_tasks(cfg: dict[str, Any]) -> list[Task]:
     dates = generate_dates(cfg["date_start"], cfg["date_end"])
     sim_map = _normalize_sim_param_map(cfg)
 
-    sim_keys = sorted(sim_map.keys())
-    sim_lists = [sim_map[k] for k in sim_keys]
+    tier_rows = _build_tier_param_rows(sim_map)
+    tier_paired_keys = {"max_position", "tier_jump_bps", "boost_tier"}
+    outer_sim_map = {
+        key: value
+        for key, value in sim_map.items()
+        if key not in tier_paired_keys
+    }
+    sim_keys = sorted(outer_sim_map.keys())
+    sim_lists = [outer_sim_map[k] for k in sim_keys]
     tasks: list[Task] = []
     for symbol in symbols:
-        combos = itertools.product(*sim_lists) if sim_lists else [()]
         seen_params: set[str] = set()
-        for combo in combos:
-            sim_params = {k: combo[i] for i, k in enumerate(sim_keys)}
-            sim_params = _effective_sim_params(sim_params)
-            dedupe_key = _sim_params_dedupe_key(sim_params)
-            if dedupe_key in seen_params:
-                continue
-            seen_params.add(dedupe_key)
-            tasks.append(
-                Task(
-                    symbol=str(symbol),
-                    dates=dates,
-                    sim_params=sim_params,
-                    cfg=cfg,
+        for tier_row in tier_rows:
+            combos = itertools.product(*sim_lists) if sim_lists else [()]
+            for combo in combos:
+                sim_params = {k: combo[i] for i, k in enumerate(sim_keys)}
+                sim_params.update(tier_row)
+                sim_params = _effective_sim_params(sim_params)
+                dedupe_key = _sim_params_dedupe_key(sim_params)
+                if dedupe_key in seen_params:
+                    continue
+                seen_params.add(dedupe_key)
+                tasks.append(
+                    Task(
+                        symbol=str(symbol),
+                        dates=dates,
+                        sim_params=sim_params,
+                        cfg=cfg,
+                    )
                 )
-            )
     return tasks
 
 

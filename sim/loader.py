@@ -62,7 +62,7 @@ INTENSITY_COLUMN_ALIASES = {
     "intensity_positive": ("intensity_positive", "kw_vol_positive"),
     "intensity_negative": ("intensity_negative", "kw_vol_negative"),
 }
-DEFAULT_CACHE_ROOT = Path("/data/users/kang/backtest/glftmm/cached")
+DEFAULT_CACHE_ROOT = Path("/data/users/kang/backtest/glftmm_tier/cached")
 DEFAULT_DATA_ROOT = Path("/data/users/data-helper/PROCESSED/TARDIS/BINANCE/UFUTURES")
 DEFAULT_BACKUP_DATA_ROOT = Path("/home/kang/data_helper/PROCESSED/DATA_RECORDER/BINANCE/UFUTURES")
 DEFAULT_ORDERBOOK_REPLAY_ROOT = Path("/home/kang/data/wallmaker/cached")
@@ -121,7 +121,7 @@ def _path_safe_value(value: object) -> str:
 
 def parse_orderbook_replay_config(raw: dict[str, Any] | None) -> OrderBookReplayConfig:
     if raw is None:
-        raise ValueError("orderbook_path config is required when optimize_by_orderbook is enabled")
+        raise ValueError("orderbook_path config is required for orderbook replay")
     if not isinstance(raw, dict):
         raise ValueError("orderbook config must be an object")
 
@@ -135,7 +135,7 @@ def parse_orderbook_replay_config(raw: dict[str, Any] | None) -> OrderBookReplay
     if root_raw in (None, "", []):
         root_raw = replay_raw.get("root") or replay_raw.get("output_path") or replay_raw.get("cache_root")
     if root_raw in (None, "", []):
-        raise ValueError("orderbook_path config is required when optimize_by_orderbook is enabled")
+        raise ValueError("orderbook_path config is required for orderbook replay")
 
     cfg = OrderBookReplayConfig(
         root=Path(root_raw),

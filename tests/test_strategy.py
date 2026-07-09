@@ -34,20 +34,19 @@ def make_config(**overrides):
         "lookback_volatility": 300,
         "max_position_usdt": 100000.0,
         "max_open_inventory_utilization": 1.0,
-        "phase_change_position": 0.0,
-        "boost_phase_change": 1.0,
-        "phase_mode": "market",
+        "tier_jump_bps": 0.0,
+        "boost_tier": 1.0,
         "max_holding_time": -1,
         "adj_spread_intensity": (1.0, 1.0),
         "adj_spread_instructor": 0.0,
         "passive_only": False,
-        "optimize_by_orderbook": -1,
         "adj_spread_volatility": (0.0, 0.0),
         "min_quote_distance_bps": 0.0,
         "inventory_skew": (0.0, 1.0),
         "min_order_qty": 0.0,
         "min_order_notional": 0.0,
         "stoploss": 0.0,
+        "takeprofit": 0.0,
         "open_curve": (1000.0, 1000.0, 1.0),
         "close_curve": (1000.0, 1000.0, 1.0),
         "boost_underwater": (1.0, 1.0),
@@ -73,21 +72,19 @@ def raw_config(**overrides):
         "lookback_intensity": 300,
         "name_volatility": "sigma",
         "lookback_volatility": 300,
-        "max_position_usdt": 100000.0,
+        "max_position": 100000.0,
         "max_open_inventory_utilization": 1.0,
-        "phase_change_position": 0.0,
-        "boost_phase_change": 1.0,
-        "phase_mode": "market",
+        "tier_jump_bps": 0.0,
         "max_holding_time": -1,
         "adj_spread_intensity": [1.0, 1.0],
         "adj_spread_instructor": 0.0,
         "passive_only": False,
-        "optimize_by_orderbook": -1,
         "adj_spread_volatility": [0.0, 0.0],
         "min_quote_distance_bps": 0.0,
         "min_order_qty": 0.0,
         "min_order_notional": 0.0,
         "stoploss": 0.0,
+        "takeprofit": 0.0,
         "boost_underwater": [1.0, 1.0],
         "boost_profitzone": [1.0, 1.0],
         "toxic_lock": [[0, 0]],
@@ -203,52 +200,71 @@ class PositionNotionalTest(unittest.TestCase):
 
 
 class StrategyConfigTest(unittest.TestCase):
-    def test_build_config_accepts_single_max_position_and_stoploss(self):
+    def test_build_config_accepts_single_max_position_stoploss_and_takeprofit(self):
         cfg = _build_simulation_config(
             raw_config(
-                max_position_usdt=250.0,
+                max_position=250.0,
                 stoploss=25.0,
+                takeprofit=40.0,
             )["simulation"]
         )
 
         self.assertEqual(cfg.max_position_usdt, 250.0)
+        self.assertEqual(cfg.max_position_tiers, (250.0,))
         self.assertEqual(cfg.total_max_position_usdt, 250.0)
         self.assertEqual(cfg.stoploss, 25.0)
+        self.assertEqual(cfg.takeprofit, 40.0)
 
-    def test_rejects_lot_shaped_max_position_and_stoploss(self):
-        with self.assertRaisesRegex(ValueError, "max_position_usdt must be a number"):
-            _build_simulation_config(
-                raw_config(
-                    max_position_usdt=[250.0, 750.0],
-                    stoploss=25.0,
-                )["simulation"]
-            )
+    def test_build_config_accepts_tiered_max_position(self):
+        cfg = _build_simulation_config(
+            raw_config(
+                max_position=[250.0, 750.0],
+                tier_jump_bps=[0.0, 100.0],
+                boost_tier=[1.0, 2.0],
+            )["simulation"]
+        )
 
+        self.assertEqual(cfg.max_position_usdt, 750.0)
+        self.assertEqual(cfg.max_position_tiers, (250.0, 750.0))
+        self.assertEqual(cfg.tier_jump_bps_tuple, (0.0, 100.0))
+        self.assertEqual(cfg.boost_tier_tuple, (1.0, 2.0))
+
+    def test_rejects_lot_shaped_stoploss_and_takeprofit(self):
         with self.assertRaisesRegex(ValueError, "stoploss must be a number"):
             _build_simulation_config(
                 raw_config(
-                    max_position_usdt=250.0,
+                    max_position=250.0,
                     stoploss=[25.0, 75.0],
                 )["simulation"]
             )
 
-    def test_normalizes_max_position_and_stoploss_as_parameter_grids(self):
+        with self.assertRaisesRegex(ValueError, "takeprofit must be a number"):
+            _build_simulation_config(
+                raw_config(
+                    max_position=250.0,
+                    takeprofit=[25.0, 75.0],
+                )["simulation"]
+            )
+
+    def test_normalizes_max_position_stoploss_and_takeprofit_as_parameter_grids(self):
         sim_map = _normalize_sim_param_map(
             raw_config(
-                max_position_usdt=[250.0, 750.0],
+                max_position=[[250.0], [750.0]],
                 max_open_inventory_utilization=[0.5, 0.8],
-                phase_change_position=[100.0, 200.0],
-                boost_phase_change=[1.0, 2.0],
+                tier_jump_bps=[[0.0], [100.0]],
+                boost_tier=[[1.0], [2.0]],
                 stoploss=[25.0, 75.0],
+                takeprofit=[40.0, 80.0],
                 toxic_lock=[[20, 15]],
             )
         )
 
-        self.assertEqual(sim_map["max_position_usdt"], [250.0, 750.0])
+        self.assertEqual(sim_map["max_position"], [250.0, 750.0])
         self.assertEqual(sim_map["max_open_inventory_utilization"], [0.5, 0.8])
-        self.assertEqual(sim_map["phase_change_position"], [100.0, 200.0])
-        self.assertEqual(sim_map["boost_phase_change"], [1.0, 2.0])
+        self.assertEqual(sim_map["tier_jump_bps"], [0.0, 100.0])
+        self.assertEqual(sim_map["boost_tier"], [1.0, 2.0])
         self.assertEqual(sim_map["stoploss"], [25.0, 75.0])
+        self.assertEqual(sim_map["takeprofit"], [40.0, 80.0])
         self.assertEqual(sim_map["toxic_lock"], [[20, 15]])
 
     def test_rejects_bare_toxic_lock_pair_in_parameter_grid(self):
@@ -276,6 +292,16 @@ class StrategyConfigTest(unittest.TestCase):
             _build_simulation_config(raw)
 
         with self.assertRaisesRegex(ValueError, "toxic_lock"):
+            _normalize_sim_param_map({"simulation": raw})
+
+    def test_build_config_rejects_removed_orderbook_snap_key(self):
+        raw = raw_config()["simulation"]
+        raw["optimi" + "ze_by_orderbook"] = -1
+
+        with self.assertRaisesRegex(ValueError, "unknown simulation keys"):
+            _build_simulation_config(raw)
+
+        with self.assertRaisesRegex(ValueError, "unknown simulation keys"):
             _normalize_sim_param_map({"simulation": raw})
 
     def test_build_config_parses_max_open_inventory_utilization(self):
@@ -324,13 +350,6 @@ class StrategyConfigTest(unittest.TestCase):
 
         self.assertFalse(cfg.strict_mode)
 
-    def test_build_config_parses_optimize_by_orderbook(self):
-        cfg = _build_simulation_config(
-            raw_config(optimize_by_orderbook=1000)["simulation"]
-        )
-
-        self.assertEqual(cfg.optimize_by_orderbook, 1000.0)
-
     def test_build_config_parses_min_quote_distance_bps(self):
         cfg = _build_simulation_config(
             raw_config(min_quote_distance_bps=20.5)["simulation"]
@@ -338,24 +357,18 @@ class StrategyConfigTest(unittest.TestCase):
 
         self.assertEqual(cfg.min_quote_distance_bps, 20.5)
 
-    def test_build_config_parses_phase_change_controls(self):
+    def test_build_config_parses_tier_jump_controls(self):
         cfg = _build_simulation_config(
             raw_config(
-                phase_change_position=250.0,
-                boost_phase_change=2.5,
-                phase_mode="trade",
+                max_position=[100.0, 200.0, 500.0],
+                tier_jump_bps=[0.0, 100.0, 150.0],
+                boost_tier=[1.0, 2.0, 5.0],
             )["simulation"]
         )
 
-        self.assertEqual(cfg.phase_change_position, 250.0)
-        self.assertEqual(cfg.boost_phase_change, 2.5)
-        self.assertEqual(cfg.phase_mode, "trade")
-
-    def test_build_config_rejects_boolean_optimize_by_orderbook(self):
-        with self.assertRaisesRegex(ValueError, "optimize_by_orderbook"):
-            _build_simulation_config(
-                raw_config(optimize_by_orderbook=True)["simulation"]
-            )
+        self.assertEqual(cfg.max_position_tiers, (100.0, 200.0, 500.0))
+        self.assertEqual(cfg.tier_jump_bps_tuple, (0.0, 100.0, 150.0))
+        self.assertEqual(cfg.boost_tier_tuple, (1.0, 2.0, 5.0))
 
     def test_build_config_rejects_negative_min_quote_distance_bps(self):
         with self.assertRaisesRegex(ValueError, "min_quote_distance_bps"):
@@ -363,15 +376,25 @@ class StrategyConfigTest(unittest.TestCase):
                 raw_config(min_quote_distance_bps=-0.1)["simulation"]
             )
 
-    def test_build_config_rejects_invalid_phase_change_controls(self):
-        with self.assertRaisesRegex(ValueError, "phase_change_position"):
+    def test_build_config_rejects_invalid_tier_controls(self):
+        with self.assertRaisesRegex(ValueError, "strictly increasing"):
             _build_simulation_config(
-                raw_config(phase_change_position=-1.0)["simulation"]
+                raw_config(max_position=[100.0, 100.0])["simulation"]
             )
-        with self.assertRaisesRegex(ValueError, "boost_phase_change"):
-            _build_simulation_config(raw_config(boost_phase_change=-1.0)["simulation"])
-        with self.assertRaisesRegex(ValueError, "phase_mode"):
-            _build_simulation_config(raw_config(phase_mode="last_open")["simulation"])
+        with self.assertRaisesRegex(ValueError, "tier_jump_bps"):
+            _build_simulation_config(
+                raw_config(
+                    max_position=[100.0, 200.0],
+                    tier_jump_bps=[0.0, 100.0, 200.0],
+                )["simulation"]
+            )
+        with self.assertRaisesRegex(ValueError, "boost_tier"):
+            _build_simulation_config(
+                raw_config(
+                    max_position=[100.0, 200.0],
+                    boost_tier=[1.0, 2.0, 5.0],
+                )["simulation"]
+            )
 
     def test_build_config_rejects_legacy_min_quote_distance_ticks(self):
         with self.assertRaisesRegex(ValueError, "min_quote_distance_bps"):
@@ -423,18 +446,12 @@ class StrategyConfigTest(unittest.TestCase):
             [[0.5, 2.0], [0.25, 3.0]],
         )
 
-    def test_normalizes_optimize_by_orderbook_rows(self):
-        sim_map = _normalize_sim_param_map(
-            raw_config(optimize_by_orderbook=[-1, 0, 1000])
-        )
-
-        self.assertEqual(sim_map["optimize_by_orderbook"], [-1.0, 0.0, 1000.0])
-
     def test_build_tasks_crosses_max_position_and_stoploss_grids(self):
         tasks = _build_tasks(
             raw_task_config(
                 mode=[0, 1],
-                max_position_usdt=[250.0, 500.0],
+                max_position=[[250.0], [500.0]],
+                tier_jump_bps=[[0.0], [100.0]],
                 stoploss=[50.0, 100.0],
             )
         )
@@ -442,7 +459,7 @@ class StrategyConfigTest(unittest.TestCase):
         self.assertEqual(len(tasks), 8)
         pairs = {
             (
-                task.sim_params["max_position_usdt"],
+                task.sim_params["max_position"],
                 task.sim_params["stoploss"],
             )
             for task in tasks
@@ -458,6 +475,58 @@ class StrategyConfigTest(unittest.TestCase):
         )
         self.assertEqual([task.sim_params["mode"] for task in tasks].count(0), 4)
         self.assertEqual([task.sim_params["mode"] for task in tasks].count(1), 4)
+
+    def test_build_tasks_pairs_max_position_and_tier_jump_rows(self):
+        tasks = _build_tasks(
+            raw_task_config(
+                mode=[0, 1],
+                max_position=[[250.0], [500.0]],
+                tier_jump_bps=[[0.0], [100.0]],
+                boost_tier=[[1.0], [2.0]],
+                stoploss=50.0,
+            )
+        )
+
+        self.assertEqual(len(tasks), 4)
+        pairs = {
+            (
+                task.sim_params["max_position"],
+                task.sim_params["tier_jump_bps"],
+                task.sim_params["boost_tier"],
+            )
+            for task in tasks
+        }
+        self.assertEqual(pairs, {(250.0, 0.0, 1.0), (500.0, 100.0, 2.0)})
+
+    def test_build_tasks_rejects_unpaired_tier_rows(self):
+        with self.assertRaisesRegex(ValueError, "same number of rows"):
+            _build_tasks(
+                raw_task_config(
+                    max_position=[[250.0], [500.0]],
+                    tier_jump_bps=[[0.0]],
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "same number of rows"):
+            _build_tasks(
+                raw_task_config(
+                    max_position=[[250.0], [500.0]],
+                    boost_tier=[[1.0]],
+                )
+            )
+
+    def test_build_tasks_crosses_takeprofit_grid(self):
+        tasks = _build_tasks(
+            raw_task_config(
+                mode=[0, 1],
+                takeprofit=[50.0, 100.0],
+            )
+        )
+
+        self.assertEqual(len(tasks), 4)
+        self.assertEqual(
+            sorted(task.sim_params["takeprofit"] for task in tasks),
+            [50.0, 50.0, 100.0, 100.0],
+        )
 
     def test_build_config_parses_instructor_alpha_adjustment(self):
         cfg = _build_simulation_config(
@@ -866,101 +935,6 @@ class StrategyQuoteTest(unittest.TestCase):
             [(99.9, 3.0)],
         )
 
-    def test_open_liquidity_snap_moves_flat_open_quotes_to_wall_front(self):
-        engine = SimpleMakerStrategy(make_config(optimize_by_orderbook=0))
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.8,
-            best_ask=100.2,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-            replay_bid_ticks=[995],
-            replay_ask_ticks=[1005],
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.4, 1.0)])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.6, 1.0)])
-        state = engine.snapshot_state()
-        self.assertEqual(state["open_liquidity_snap_adjusted"], 2)
-        self.assertEqual(state["open_liquidity_snap_moved_ticks"], 4)
-        self.assertEqual(state["open_liquidity_snap_max_move_ticks"], 2)
-
-    def test_open_liquidity_snap_ignores_thin_levels_by_notional_threshold(self):
-        engine = SimpleMakerStrategy(make_config(optimize_by_orderbook=1000))
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.8,
-            best_ask=100.2,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-            replay_bid_ticks=[995, 992],
-            replay_ask_ticks=[1005, 1008],
-            replay_bid_notional=[500.0, 2000.0],
-            replay_ask_notional=[500.0, 2000.0],
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.7, 1.0)])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.3, 1.0)])
-
-    def test_open_liquidity_snap_cancels_when_only_thin_levels_exist(self):
-        engine = SimpleMakerStrategy(make_config(optimize_by_orderbook=1000))
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.8,
-            best_ask=100.2,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-            replay_bid_ticks=[995],
-            replay_ask_ticks=[1005],
-            replay_bid_notional=[500.0],
-            replay_ask_notional=[500.0],
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
-        self.assertEqual(engine.snapshot_state()["open_liquidity_snap_cancelled"], 2)
-
-    def test_open_liquidity_snap_only_moves_long_underwater_bid_add(self):
-        engine = SimpleMakerStrategy(
-            make_config(optimize_by_orderbook=0, strict_mode=False)
-        )
-        set_position(engine, qty=1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=98.9,
-            best_ask=99.1,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-            replay_bid_ticks=[985],
-            replay_ask_ticks=[1005],
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(99.1, 1.0)])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(98.6, 1.0)])
-        self.assertEqual(engine.snapshot_state()["open_liquidity_snap_adjusted"], 1)
-
-    def test_open_liquidity_snap_does_not_move_close_only_quote(self):
-        engine = SimpleMakerStrategy(make_config(optimize_by_orderbook=0))
-        set_position(engine, qty=1.0, cost=100.0)
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=100.4,
-            best_ask=100.6,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-            replay_bid_ticks=[995],
-            replay_ask_ticks=[1010],
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.6, 1.0)])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
-        self.assertEqual(engine.snapshot_state()["open_liquidity_snap_adjusted"], 0)
-
     def test_close_curve_units_use_gross_cost_notional_and_floor(self):
         engine = SimpleMakerStrategy(
             make_config(
@@ -1002,6 +976,18 @@ class StrategyQuoteTest(unittest.TestCase):
         self.assertFalse(engine._should_activate_stoploss(mid=75.1))
         self.assertTrue(engine._should_activate_stoploss(mid=75.0))
 
+    def test_takeprofit_is_absolute_usdt_for_long_and_short(self):
+        engine = SimpleMakerStrategy(make_config(max_position_usdt=100.0, takeprofit=25.0))
+        set_position(engine, qty=1.0, cost=100.0)
+
+        self.assertFalse(engine._should_activate_takeprofit(mid=124.9))
+        self.assertTrue(engine._should_activate_takeprofit(mid=125.0))
+
+        set_position(engine, qty=-1.0, cost=100.0)
+
+        self.assertFalse(engine._should_activate_takeprofit(mid=75.1))
+        self.assertTrue(engine._should_activate_takeprofit(mid=75.0))
+
     def test_long_under_cost_only_places_open_bid(self):
         engine = SimpleMakerStrategy(make_config())
         set_position(engine, qty=1.0, cost=100.0)
@@ -1039,106 +1025,19 @@ class StrategyQuoteTest(unittest.TestCase):
         self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
         self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(98.9, 2.024)])
 
-    def test_phase_change_anchors_and_boosts_simple_long_add(self):
+    def test_current_tier_boosts_long_open_size(self):
         engine = SimpleMakerStrategy(
             make_config(
-                phase_change_position=50.0,
-                boost_phase_change=2.0,
+                max_position_usdt=[50.0, 150.0],
+                tier_jump_bps=[0.0, 0.0],
+                boost_tier=[1.0, 2.0],
+                min_order_notional=100.0,
+                open_curve=(1.0, 1.0, 1.0),
+                boost_underwater=(1.0, 1.0),
+                boost_profitzone=(1.0, 1.0),
             )
         )
         set_position(engine, qty=1.0, cost=100.0)
-        engine._phase_side = 1
-        engine._phase_best_mid = 99.0
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.9,
-            best_ask=100.1,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.0, 2.0)])
-
-    def test_phase_change_anchors_and_boosts_level_long_add(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                phase_change_position=50.0,
-                boost_phase_change=2.0,
-                simple_mode=False,
-            )
-        )
-        set_position(engine, qty=1.0, cost=100.0)
-        engine._phase_side = 1
-        engine._phase_best_mid = 99.0
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.9,
-            best_ask=100.1,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.0, 2.0)])
-
-    def test_phase_change_anchors_and_boosts_simple_short_add(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                phase_change_position=50.0,
-                boost_phase_change=2.0,
-            )
-        )
-        set_position(engine, qty=-1.0, cost=100.0)
-        engine._phase_side = -1
-        engine._phase_best_mid = 101.0
-
-        engine._on_ticker_event(
-            timestamp=1,
-            best_bid=99.9,
-            best_ask=100.1,
-            intensity_value=0.0,
-            volatility_scalar=0.0,
-        )
-
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(101.0, 2.0)])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
-
-    def test_phase_change_trade_mode_uses_own_fill_price_for_add(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                phase_change_position=50.0,
-                phase_mode="trade",
-            )
-        )
-        set_position(engine, qty=1.0, cost=100.0)
-        engine._phase_side = 1
-        engine._phase_best_mid = 101.0
-        engine.manager.books.bid_maker.merge([(1000, 200)])
-
-        engine._on_trade_event(
-            trade_time=1,
-            is_buyer_maker=True,
-            trade_price=99.9,
-            trade_qty=0.2,
-        )
-
-        self.assertAlmostEqual(engine.manager.position.qty, 1.2)
-        self.assertEqual(engine._phase_side, 1)
-        self.assertEqual(engine._phase_best_mid, 100.0)
-
-    def test_phase_change_trade_mode_ignores_market_best_without_fill(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                phase_change_position=50.0,
-                phase_mode="trade",
-            )
-        )
-        set_position(engine, qty=1.0, cost=100.0)
-        engine._phase_side = 1
-        engine._phase_best_mid = 99.0
 
         engine._on_ticker_event(
             timestamp=1,
@@ -1148,8 +1047,148 @@ class StrategyQuoteTest(unittest.TestCase):
             volatility_scalar=0.0,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(98.9, 1.0)])
-        self.assertEqual(engine._phase_best_mid, 99.0)
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(98.9, 2.024)])
+
+    def test_current_tier_boosts_long_close_size(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                max_position_usdt=[50.0, 500.0],
+                tier_jump_bps=[0.0, 0.0],
+                boost_tier=[1.0, 2.0],
+                min_order_notional=100.0,
+                close_curve=(1.0, 1.0, 1.0),
+                boost_underwater=(1.0, 1.0),
+                boost_profitzone=(1.0, 1.0),
+            )
+        )
+        set_position(engine, qty=3.0, cost=100.0)
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=100.4,
+            best_ask=100.6,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.6, 1.99)])
+
+    def test_tier_gate_adjusts_simple_long_add_price(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                max_position_usdt=[50.0, 150.0],
+                tier_jump_bps=[0.0, 100.0],
+            )
+        )
+        set_position(engine, qty=1.0, cost=105.0)
+        engine._tier_anchor_side = 1
+        engine._tier_price_anchor = 100.0
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=99.9,
+            best_ask=100.1,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.0, 1.0)])
+
+    def test_tier_gate_adjusts_level_long_add_price(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                max_position_usdt=[50.0, 150.0],
+                tier_jump_bps=[0.0, 100.0],
+                simple_mode=False,
+            )
+        )
+        set_position(engine, qty=1.0, cost=105.0)
+        engine._tier_anchor_side = 1
+        engine._tier_price_anchor = 100.0
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=99.9,
+            best_ask=100.1,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.0, 1.0)])
+
+    def test_tier_gate_adjusts_simple_short_add_price(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                max_position_usdt=[50.0, 150.0],
+                tier_jump_bps=[0.0, 100.0],
+            )
+        )
+        set_position(engine, qty=-1.0, cost=95.0)
+        engine._tier_anchor_side = -1
+        engine._tier_price_anchor = 100.0
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=99.9,
+            best_ask=100.1,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(101.0, 1.0)])
+        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+
+    def test_tier_price_anchor_records_first_open_fill_price(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                max_position_usdt=[50.0, 150.0],
+                tier_jump_bps=[0.0, 100.0],
+            )
+        )
+        engine.manager.books.bid_maker.merge([(1000, 100), (990, 100)])
+
+        engine._on_trade_event(
+            trade_time=1,
+            is_buyer_maker=True,
+            trade_price=98.9,
+            trade_qty=0.2,
+        )
+
+        self.assertAlmostEqual(engine.manager.position.qty, 0.2)
+        self.assertAlmostEqual(engine.manager.position.cost, 99.5)
+        self.assertEqual(engine._tier_anchor_side, 1)
+        self.assertAlmostEqual(engine._tier_price_anchor, 100.0)
+
+    def test_tier_price_anchor_survives_same_side_add(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                max_position_usdt=[50.0, 150.0],
+                tier_jump_bps=[0.0, 100.0],
+            )
+        )
+        set_position(engine, qty=0.6, cost=100.0)
+        engine._tier_anchor_side = 1
+        engine._tier_price_anchor = 100.0
+        engine.manager.books.bid_maker.merge([(900, 200)])
+
+        engine._on_trade_event(
+            trade_time=1,
+            is_buyer_maker=True,
+            trade_price=89.9,
+            trade_qty=0.2,
+        )
+
+        self.assertAlmostEqual(engine.manager.position.qty, 0.8)
+        self.assertAlmostEqual(
+            engine.manager.position.cost,
+            (0.6 * 100.0 + 0.2 * 90.0) / 0.8,
+        )
+        self.assertEqual(engine._tier_anchor_side, 1)
+        self.assertAlmostEqual(engine._tier_price_anchor, 100.0)
 
     def test_toxic_lock_mutes_long_open_bid_until_slip_count_recovers(self):
         engine = SimpleMakerStrategy(
@@ -1259,7 +1298,7 @@ class StrategyQuoteTest(unittest.TestCase):
         self.assertFalse(engine.snapshot_state()["toxic_lock_active"])
         self.assertGreater(len(price_levels(engine, engine.manager.books.ask_maker)), 0)
 
-    def test_long_above_cost_places_glftmm_close_ask_only(self):
+    def test_long_above_cost_places_tier_close_ask_only(self):
         engine = SimpleMakerStrategy(make_config())
         set_position(engine, qty=1.0, cost=100.0)
 
@@ -1535,7 +1574,7 @@ class StrategyQuoteTest(unittest.TestCase):
         self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
         self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(102.6, 1.0)])
 
-    def test_long_far_above_cost_still_uses_glftmm_close_ask(self):
+    def test_long_far_above_cost_still_uses_tier_close_ask(self):
         engine = SimpleMakerStrategy(make_config())
         set_position(engine, qty=1.0, cost=100.0)
 
@@ -1644,7 +1683,7 @@ class StrategyQuoteTest(unittest.TestCase):
 
         self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), before)
 
-    def test_short_below_cost_places_glftmm_close_bid_only(self):
+    def test_short_below_cost_places_tier_close_bid_only(self):
         engine = SimpleMakerStrategy(make_config())
         set_position(engine, qty=-1.0, cost=100.0)
 
@@ -1689,6 +1728,7 @@ class StrategyQuoteTest(unittest.TestCase):
         self.assertNotIn("lots", state)
         self.assertNotIn("max_position_lots", state)
         self.assertNotIn("stoploss_lots", state)
+        self.assertEqual(state["takeprofit_usdt"], 0.0)
         self.assertFalse(hasattr(engine, "_lot_strategies"))
         self.assertLessEqual(len(engine.manager.books.ask_maker.snapshot()), 1)
         self.assertLessEqual(len(engine.manager.books.bid_maker.snapshot()), 1)
@@ -1719,15 +1759,9 @@ class StrategyQuoteTest(unittest.TestCase):
         self.assertNotEqual(price_levels(engine, engine.manager.books.ask_maker), first_ask)
         self.assertNotEqual(price_levels(engine, engine.manager.books.bid_maker), first_bid)
 
-    def test_rejects_multi_position_config_at_strategy_boundary(self):
-        with self.assertRaisesRegex(ValueError, "max_position_usdt must be a single number"):
-            SimpleMakerStrategy(
-                make_config(max_position_usdt=[150.0, 300.0], stoploss=0.0),
-            )
-
     def test_flat_strategy_run_uses_one_position_book(self):
         engine = SimpleMakerStrategy(
-            make_config(max_position_usdt=150.0, stoploss=0.0),
+            make_config(max_position_usdt=[50.0, 150.0], tier_jump_bps=[0.0, 100.0], stoploss=0.0),
             loader=StaticEventLoader(
                 [
                     ("ticker", 1, 99.9, 100.1, 0.0, 0.0, 0.0),
@@ -1745,6 +1779,7 @@ class StrategyQuoteTest(unittest.TestCase):
         state = engine.snapshot_state()
 
         self.assertEqual(state["max_position_usdt"], 150.0)
+        self.assertEqual(state["max_position_tiers"], [50.0, 150.0])
         self.assertGreaterEqual(state["position"]["gross_cost_notional_usdt"], 150.0)
         self.assertEqual(float(df.iloc[1]["position"]), 1.0)
         self.assertAlmostEqual(float(df.iloc[-1]["position"]), state["position"]["qty"])

@@ -8,18 +8,9 @@
     "input_path": "/data/users/data-helper/PROCESSED/TARDIS/BINANCE/UFUTURES",
     "input_backup_path": "/home/kang/data_helper/PROCESSED/DATA_RECORDER/BINANCE/UFUTURES",
     "output_path": "/data/users/kang/backtest/glftmm/cached",
-    "output_dir": "/data/users/kang/backtest/glftmm/result",
+    "output_dir": "/data/users/kang/backtest/glftmm_tier/result",
     "trade_category": "TRADE",
     "scheme_shift": 0
-  },
-  "orderbook_path": "/home/kang/data/wallmaker/cached",
-  "orderbook_replay": {
-    "replay_levels": 1000,
-    "sample_interval_ms": 1000,
-    "tick_size": 0.1,
-    "depth_price_min": 20000.0,
-    "depth_price_max": 200000.0,
-    "raw_quantity_max": 10000.0
   },
   "simulation": {
     "mode": [
@@ -54,7 +45,7 @@
       "sigma"
     ],
     "name_instructor": [
-      "bbo_imbalance"
+      "trade_imbalance"
     ],
     "lookback_volatility": [
       300
@@ -68,19 +59,119 @@
     "max_holding_time": [
       -1
     ],
-    "max_position_usdt": [
-      1000000
+    "max_position": [
+      [
+        500000,
+        550000,
+        600000,
+        650000,
+        700000,
+        750000,
+        800000,
+        850000,
+        900000,
+        950000,
+        1000000,
+        1050000,
+        1100000,
+        1150000,
+        1200000,
+        1250000,
+        1300000,
+        1400000,
+        1450000,
+        1500000
+      ],
+      [
+        500000,
+        600000,
+        700000,
+        800000,
+        900000,
+        1000000,
+        1100000,
+        1200000,
+        1300000,
+        1500000
+      ]
     ],
-    "phase_change_position": [
-      1000000
+    "tier_jump_bps": [
+      [
+        50,
+        100,
+        150,
+        200,
+        250,
+        300,
+        350,
+        400,
+        450,
+        500,
+        550,
+        600,
+        650,
+        700,
+        750,
+        800,
+        850,
+        900,
+        950,
+        1000
+      ],
+      [
+        100,
+        200,
+        300,
+        400,
+        500,
+        600,
+        700,
+        800,
+        900,
+        1000
+      ]
     ],
-    "boost_phase_change": [
-      1.0
-    ],
-    "phase_mode": [
-      "market"
+    "boost_tier": [
+      [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+       [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ]
     ],
     "stoploss": [
+      100000,
+      200000
+    ],
+    "takeprofit": [
       100000
     ],
     "min_order_qty": [
@@ -88,8 +179,12 @@
     ],
     "adj_spread_intensity": [
       [
-        1.0,
-        1.0
+        1,
+        1
+      ],
+      [
+        1.2,
+        1.2
       ],
       [
         1.5,
@@ -103,17 +198,13 @@
       ]
     ],
     "min_quote_distance_bps": [
-      0.2,
-      0.5
+      0.2
     ],
     "adj_spread_instructor": [
       0
     ],
     "passive_only": [
       true
-    ],
-    "optimize_by_orderbook": [
-      -1
     ],
     "inventory_skew": [
       [
@@ -137,6 +228,10 @@
     ],
     "boost_underwater": [
       [
+        1,
+        0
+      ],
+      [
         5,
         0
       ]
@@ -144,21 +239,17 @@
     "boost_profitzone": [
       [
         0,
+        1
+      ],
+      [
+        0,
         5
       ]
     ],
     "toxic_lock": [
       [
-        20,
-        15
-      ],
-      [
-        15,
-        10
-      ],
-      [
-        10,
-        7
+        0,
+        0
       ]
     ],
     "strict_mode": [
