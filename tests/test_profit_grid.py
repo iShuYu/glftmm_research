@@ -400,6 +400,43 @@ class ProfitGridConfigTest(unittest.TestCase):
         self.assertNotIn("freq_ms_instructor", tasks[0].sim_params)
         self.assertNotIn("freq_ms_volatility", tasks[0].sim_params)
 
+    def test_instructor_task_expansion_skips_invalid_indicator_lookbacks(self):
+        cfg = raw_config(
+            name_instructor=["bbo_imbalance", "trade_imbalance"],
+            lookback_instructor=[0, 5],
+            adj_spread_instructor=[-1000.0, 0.0, 1000.0],
+            freq_ms_instructor=[60000],
+        )
+        cfg["symbols"] = ["BTCUSDT"]
+        cfg["date_start"] = "2025-01-02"
+        cfg["date_end"] = "2025-01-02"
+
+        tasks = _build_tasks(cfg)
+        active_pairs = sorted(
+            {
+                (
+                    task.sim_params.get("adj_spread_instructor"),
+                    task.sim_params.get("name_instructor"),
+                    task.sim_params.get("lookback_instructor"),
+                )
+                for task in tasks
+                if "name_instructor" in task.sim_params
+            }
+        )
+        inactive = [task for task in tasks if "name_instructor" not in task.sim_params]
+
+        self.assertEqual(len(tasks), 5)
+        self.assertEqual(len(inactive), 1)
+        self.assertEqual(
+            active_pairs,
+            [
+                (-1000.0, "bbo_imbalance", 0),
+                (-1000.0, "trade_imbalance", 5),
+                (1000.0, "bbo_imbalance", 0),
+                (1000.0, "trade_imbalance", 5),
+            ],
+        )
+
     def test_zero_spread_adjustments_skip_feature_specs(self):
         engine = SimpleMakerStrategy(
             make_config(

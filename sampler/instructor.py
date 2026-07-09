@@ -174,10 +174,10 @@ def read_sampled_ticker_frame(
 
 def lookback_periods(lookback: int, freq_ms: int) -> int:
     if lookback <= 0:
-        raise ValueError(f"lookback must be positive integer seconds, got {lookback}")
+        raise ValueError(f"lookback must be positive integer bars, got {lookback}")
     if freq_ms <= 0:
         raise ValueError(f"freq_ms must be positive integer ms, got {freq_ms}")
-    return max(1, int(np.ceil(float(lookback) * 1000.0 / float(freq_ms))))
+    return int(lookback)
 
 
 def warmup_timestamp_grid(
@@ -461,6 +461,31 @@ def normalize_instructor_lookbacks(indicator: str, raw_lookbacks: Any) -> list[i
     return lookbacks
 
 
+def split_indicator_lookbacks(
+    indicators: Any,
+    raw_lookbacks: Any,
+) -> dict[str, dict[str, list[int]]]:
+    lookbacks = [int(x) for x in ensure_list(raw_lookbacks)]
+    indicator_lbs: dict[str, dict[str, list[int]]] = {}
+    for raw_name in ensure_list(indicators):
+        name = str(raw_name).strip().lower()
+        if not name:
+            continue
+        if name not in SUPPORTED_INSTRUCTORS:
+            raise ValueError(
+                f"unsupported instructor indicator: {name}, "
+                f"supported={SUPPORTED_INSTRUCTORS}"
+            )
+        if name == "bbo_imbalance":
+            indicator_lbs[name] = {"lookback": [0]}
+        else:
+            positives = [value for value in lookbacks if value > 0]
+            if not positives:
+                raise ValueError(f"indicator {name} requires positive lookback list")
+            indicator_lbs[name] = {"lookback": positives}
+    return indicator_lbs
+
+
 def parse_indicator_lookbacks(instructor_cfg: dict[str, Any]) -> dict[str, list[int]]:
     indicators_raw = instructor_cfg.get("indicators")
     if isinstance(indicators_raw, dict) and indicators_raw:
@@ -713,14 +738,52 @@ def build_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
         cfg["paths"]["output_root"] = args.output_root
     if args.ticker_cache_root is not None:
         cfg["paths"]["ticker_cache_root"] = args.ticker_cache_root
+    if args.output_root is None and cfg.get("output_path") is not None:
+        cfg["paths"].setdefault("output_root", cfg["output_path"])
+        cfg["paths"].setdefault("ticker_cache_root", cfg["output_path"])
+    if not any(
+        key in cfg["paths"] or key in cfg
+        for key in ("trade_roots", "trade_root", "trades_root")
+    ):
+        input_root = cfg.get("input_path")
+        if input_root is not None:
+            trade_category = normalize_category(
+                cfg.get("trade_category", "TRADE"),
+                default="TRADE",
+            )
+            roots = [Path(input_root) / trade_category]
+            input_backup_root = cfg.get("input_backup_path")
+            if input_backup_root is not None:
+                roots.append(Path(input_backup_root) / trade_category)
+            cfg["paths"]["trade_roots"] = [str(path) for path in roots]
 
     cfg.setdefault("instructor", {})
     if "freq" not in cfg["instructor"]:
         raw_freq = cfg.get("freq_ms_instructor", cfg.get("freq_ms"))
         if not _is_empty_config_value(raw_freq):
             cfg["instructor"]["freq"] = raw_freq
+    if "scheme_shift" not in cfg["instructor"] and not _is_empty_config_value(
+        cfg.get("scheme_shift")
+    ):
+        cfg["instructor"]["scheme_shift"] = cfg["scheme_shift"]
+    if not any(key in cfg["instructor"] for key in ("indicator", "indicators")):
+        raw_indicators = cfg.get("name_instructor")
+        raw_lookbacks = cfg.get("lookback_instructor")
+        if not _is_empty_config_value(raw_indicators):
+            if _is_empty_config_value(raw_lookbacks):
+                cfg["instructor"]["indicator"] = raw_indicators
+            else:
+                cfg["instructor"]["indicators"] = split_indicator_lookbacks(
+                    raw_indicators,
+                    raw_lookbacks,
+                )
     if args.trade_category is not None:
         cfg["instructor"]["trade_category"] = args.trade_category
+    elif (
+        "trade_category" not in cfg["instructor"]
+        and cfg.get("trade_category") is not None
+    ):
+        cfg["instructor"]["trade_category"] = cfg["trade_category"]
     if raw_scheme_shift is not None:
         cfg["instructor"]["scheme_shift"] = raw_scheme_shift
     if args.overwrite:

@@ -297,6 +297,23 @@ def _effective_sim_params(sim_params: dict[str, Any]) -> dict[str, Any]:
     return effective
 
 
+def _valid_instructor_param_combo(sim_params: dict[str, Any]) -> bool:
+    name = sim_params.get("name_instructor")
+    if name in (None, ""):
+        return True
+    if "lookback_instructor" not in sim_params:
+        return True
+    try:
+        lookback = int(sim_params["lookback_instructor"])
+    except (TypeError, ValueError):
+        return True
+
+    name = str(name).strip().lower()
+    if name == "bbo_imbalance":
+        return lookback == 0
+    return lookback > 0
+
+
 def _sim_params_dedupe_key(sim_params: dict[str, Any]) -> str:
     return json.dumps(sim_params, sort_keys=True, separators=(",", ":"))
 
@@ -1189,6 +1206,8 @@ def _build_tasks(cfg: dict[str, Any]) -> list[Task]:
         for combo in combos:
             sim_params = {k: combo[i] for i, k in enumerate(sim_keys)}
             sim_params = _effective_sim_params(sim_params)
+            if not _valid_instructor_param_combo(sim_params):
+                continue
             dedupe_key = _sim_params_dedupe_key(sim_params)
             if dedupe_key in seen_params:
                 continue

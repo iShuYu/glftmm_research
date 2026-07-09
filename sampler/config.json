@@ -10,7 +10,7 @@
   "freq_ms_volatility": [1000],
   "scheme_shift": [0],
   "name_instructor": ["trade_imbalance"],
-  "lookback_instructor": [1, 5, 10],
+  "lookback_instructor": [0, 1, 5, 10],
   "name_intensity": ["k"],
   "lookback_intensity": [300, 600],
   "name_volatility": ["sigma"],

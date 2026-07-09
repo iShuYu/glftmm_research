@@ -1,3 +1,5 @@
+import argparse
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +9,8 @@ import pandas as pd
 from sampler.intensity import build_tasks as build_intensity_tasks
 from sampler.intensity import intensity_output_path
 from sampler.instructor import (
+    build_config_from_args as build_instructor_config_from_args,
+    build_tasks as build_instructor_tasks,
     build_trade_instructor_frame,
     instructor_output_path,
     validate_instructor_frame,
@@ -89,6 +93,44 @@ class SamplerInstructorTest(unittest.TestCase):
             self.assertAlmostEqual(out.loc[2, "instructor"], -0.6)
             self.assertAlmostEqual(out.loc[3, "instructor"], 0.5)
             validate_instructor_frame(out, date_str=date, freq_ms=1000)
+
+    def test_trade_imbalance_lookback_is_bar_count(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "TRADE"
+            symbol = "BTCUSDT"
+            date = "2025-01-01"
+            freq_ms = 60000
+            day_start = int(day_timestamp_grid(date, freq_ms)[0])
+            trade_dir = root / symbol
+            trade_dir.mkdir(parents=True)
+            pd.DataFrame(
+                {
+                    "exchange_timestamp": [
+                        day_start,
+                        day_start + freq_ms,
+                        day_start + 2 * freq_ms,
+                    ],
+                    "price": [100.0, 99.9, 100.1],
+                    "volume": [3.0, 1.0, 2.0],
+                    "is_buyer_maker": [False, True, True],
+                }
+            ).to_parquet(trade_dir / f"{symbol}--TRADE--{date}.parquet")
+
+            out = build_trade_instructor_frame(
+                symbol=symbol,
+                date=date,
+                freq_ms=freq_ms,
+                lookback=2,
+                indicator="trade_imbalance",
+                trade_roots=(root,),
+            )
+
+            self.assertEqual(len(out), 1440)
+            self.assertEqual(out.loc[0, "instructor"], 0.0)
+            self.assertAlmostEqual(out.loc[1, "instructor"], -1.0)
+            self.assertAlmostEqual(out.loc[2, "instructor"], -0.5)
+            self.assertAlmostEqual(out.loc[3, "instructor"], 1.0)
+            validate_instructor_frame(out, date_str=date, freq_ms=freq_ms)
 
     def test_bbo_imbalance_uses_sampled_ticker_quantities(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -428,6 +470,95 @@ class SamplerInstructorTest(unittest.TestCase):
         bad_cfg["scheme_shift"] = [0, 1000]
         with self.assertRaisesRegex(ValueError, "scheme_shift"):
             build_stage_configs(bad_cfg)
+
+    def test_build_stage_configs_splits_mixed_instructor_lookbacks(self):
+        cfg = {
+            "symbols": ["BTCUSDT"],
+            "date_start": "2025-01-01",
+            "input_path": "/tmp/input",
+            "output_path": "/tmp/output",
+            "freq_ms_instructor": [60000],
+            "freq_ms_intensity": [1000],
+            "scheme_shift": [0],
+            "name_instructor": ["bbo_imbalance", "trade_imbalance"],
+            "lookback_instructor": [0, 1, 5],
+            "name_intensity": ["k"],
+            "lookback_intensity": [300],
+        }
+
+        _, instructor_cfg, _, _ = build_stage_configs(cfg)
+        tasks = build_instructor_tasks(instructor_cfg)
+
+        self.assertEqual(
+            instructor_cfg["instructor"]["indicators"],
+            {
+                "bbo_imbalance": {"lookback": [0]},
+                "trade_imbalance": {"lookback": [1, 5]},
+            },
+        )
+        self.assertEqual(
+            sorted({(task.indicator, task.lookback) for task in tasks}),
+            [
+                ("bbo_imbalance", 0),
+                ("trade_imbalance", 1),
+                ("trade_imbalance", 5),
+            ],
+        )
+
+    def test_direct_instructor_config_inherits_top_level_sampler_keys(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "symbols": ["BTCUSDT"],
+                        "date_start": "2025-01-01",
+                        "input_path": "/tmp/input",
+                        "input_backup_path": "/tmp/backup",
+                        "output_path": "/tmp/output",
+                        "trade_category": "TRADE",
+                        "freq_ms_instructor": [60000],
+                        "scheme_shift": [0],
+                        "name_instructor": ["bbo_imbalance", "trade_imbalance"],
+                        "lookback_instructor": [0, 1, 5],
+                    }
+                )
+            )
+            args = argparse.Namespace(
+                config=str(config_path),
+                trade_root=None,
+                trade_backup_root=None,
+                output_root=None,
+                ticker_cache_root=None,
+                trade_category=None,
+                scheme_shift=None,
+                overwrite=False,
+            )
+
+            cfg = build_instructor_config_from_args(args)
+            tasks = build_instructor_tasks(cfg)
+
+            self.assertEqual(
+                cfg["instructor"]["indicators"],
+                {
+                    "bbo_imbalance": {"lookback": [0]},
+                    "trade_imbalance": {"lookback": [1, 5]},
+                },
+            )
+            self.assertEqual(cfg["paths"]["output_root"], "/tmp/output")
+            self.assertEqual(cfg["paths"]["ticker_cache_root"], "/tmp/output")
+            self.assertEqual(
+                cfg["paths"]["trade_roots"],
+                ["/tmp/input/TRADE", "/tmp/backup/TRADE"],
+            )
+            self.assertEqual(
+                sorted({(task.indicator, task.lookback) for task in tasks}),
+                [
+                    ("bbo_imbalance", 0),
+                    ("trade_imbalance", 1),
+                    ("trade_imbalance", 5),
+                ],
+            )
 
     def test_build_stage_configs_only_requires_active_stage_frequencies(self):
         cfg = {

@@ -3,7 +3,7 @@
     "BTCUSDT"
   ],
   "date_start": "2025-01-02",
-  "date_end": "2026-06-01",
+  "date_end": "2026-05-31",
   "input_path": "/data/users/data-helper/PROCESSED/TARDIS/BINANCE/UFUTURES",
   "input_backup_path": "/home/kang/data_helper/PROCESSED/DATA_RECORDER/BINANCE/UFUTURES",
   "output_path": "/data/users/kang/backtest/glftmm/cached",
@@ -60,8 +60,14 @@
     "name_intensity": [
       "k"
     ],
+    "name_instructor": [
+      "trade_imbalance"
+    ],
     "name_volatility": [
       "sigma"
+    ],
+    "lookback_instructor": [
+      1
     ],
     "lookback_volatility": [
       300
@@ -88,19 +94,19 @@
       0.1
     ],
     "order_amt": [
-      1000
+      1000,
+      2000
     ],
     "min_order_qty": [
       0.0
     ],
     "adj_spread_intensity": [
-      1.0,
-      1.2,
-      1.4
+      1.5
     ],
     "adj_spread_instructor": [
+      1,
       0,
-      -1000
+      -1
     ],
     "open_passive_only": [
       true
@@ -109,11 +115,9 @@
       -1
     ],
     "adj_spread_volatility": [
-      0,
-      0.5
+      0
     ],
     "min_quote_distance_bps": [
-      0.1,
       0.2
     ],
     "inventory_skew": [
@@ -124,18 +128,22 @@
     ],
     "profit_grid": [
       [
-        20,
-        120,
         10,
-        "exponential",
-        0.2
+        20,
+        10,
+        "equal"
       ],
       [
+        5,
         10,
-        120,
-        20,
-        "exponential",
-        0.2
+        5,
+        "equal"
+      ],
+      [
+        5,
+        25,
+        5,
+        "equal"
       ]
     ],
     "open_curve_underwater": [

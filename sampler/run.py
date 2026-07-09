@@ -152,6 +152,29 @@ def positive_int_list(
     return values
 
 
+def instructor_lookback_map(
+    indicators: list[str],
+    lookbacks: list[int],
+) -> dict[str, list[int]]:
+    indicator_lbs: dict[str, list[int]] = {}
+    for indicator in indicators:
+        name = str(indicator).strip().lower()
+        if name not in instructor.SUPPORTED_INSTRUCTORS:
+            raise ValueError(
+                f"unsupported instructor indicator: {name}, "
+                f"supported={instructor.SUPPORTED_INSTRUCTORS}"
+            )
+        if name == "bbo_imbalance":
+            indicator_lbs[name] = [0]
+            continue
+
+        positive_lookbacks = [int(v) for v in lookbacks if int(v) > 0]
+        if not positive_lookbacks:
+            raise ValueError(f"indicator {name} requires positive lookback list")
+        indicator_lbs[name] = positive_lookbacks
+    return indicator_lbs
+
+
 def _is_empty_config_value(value: Any) -> bool:
     return value in (None, "", [])
 
@@ -270,6 +293,10 @@ def build_stage_configs(
     strict_validate = bool(cfg.get("strict_validate", True))
     compression = str(cfg.get("compression", "snappy"))
     parallel = parallel_config(cfg)
+    instructor_indicator_lbs = instructor_lookback_map(
+        name_instructor,
+        lookback_instructor,
+    )
 
     resample_cfg = {
         **common,
@@ -288,6 +315,25 @@ def build_stage_configs(
         "parallel": parallel,
     }
 
+    instructor_section = {
+        "freq": instructor_freqs,
+        "scheme_shift": scheme_shift,
+        "indicator": name_instructor,
+        "lookback": lookback_instructor,
+        "trade_category": input_paths.trade_category,
+        "overwrite": overwrite,
+        "strict_validate": strict_validate,
+        "compression": compression,
+    }
+    if any(
+        instructor_indicator_lbs[name] != lookback_instructor
+        for name in instructor_indicator_lbs
+    ):
+        instructor_section["indicators"] = {
+            name: {"lookback": lookbacks}
+            for name, lookbacks in instructor_indicator_lbs.items()
+        }
+
     instructor_cfg = {
         **common,
         "paths": {
@@ -295,16 +341,7 @@ def build_stage_configs(
             "ticker_cache_root": str(output_root),
             "output_root": str(output_root),
         },
-        "instructor": {
-            "freq": instructor_freqs,
-            "scheme_shift": scheme_shift,
-            "indicator": name_instructor,
-            "lookback": lookback_instructor,
-            "trade_category": input_paths.trade_category,
-            "overwrite": overwrite,
-            "strict_validate": strict_validate,
-            "compression": compression,
-        },
+        "instructor": instructor_section,
         "parallel": parallel,
     }
 
