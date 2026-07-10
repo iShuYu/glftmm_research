@@ -30,11 +30,13 @@ AlphaTuple: TypeAlias = tuple[
 MergedEventTuple: TypeAlias = TradeTuple | AlphaTuple
 
 RAW_TRADE_TIME_COLUMN = "exchange_timestamp"
+TRADE_TYPE_COLUMN = "trade_type"
 RAW_TRADE_COLUMNS = (
     RAW_TRADE_TIME_COLUMN,
     "price",
     "volume",
     "is_buyer_maker",
+    TRADE_TYPE_COLUMN,
 )
 TICKER_COLUMNS = (
     "timestamp",
@@ -414,6 +416,7 @@ class BinanceEventLoader:
         missing = set(RAW_TRADE_COLUMNS) - set(raw.columns)
         if missing:
             raise ValueError(f"trade frame missing columns: {sorted(missing)}")
+        raw = raw.loc[raw[TRADE_TYPE_COLUMN] == 0]
 
         frame = raw.rename(columns={RAW_TRADE_TIME_COLUMN: "timestamp"})
         frame = frame.dropna(subset=["timestamp", "price", "volume", "is_buyer_maker"])
