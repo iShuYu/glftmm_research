@@ -74,6 +74,7 @@ class SamplerInstructorTest(unittest.TestCase):
                     "price": [100.0, 99.9, 100.1, 99.8],
                     "volume": [3.0, 1.0, 1.0, 2.0],
                     "is_buyer_maker": [False, True, False, True],
+                    "trade_type": 0,
                 }
             ).to_parquet(trade_dir / f"{symbol}--TRADE--{date}.parquet")
 
@@ -113,6 +114,7 @@ class SamplerInstructorTest(unittest.TestCase):
                     "price": [100.0, 99.9, 100.1],
                     "volume": [3.0, 1.0, 2.0],
                     "is_buyer_maker": [False, True, True],
+                    "trade_type": 0,
                 }
             ).to_parquet(trade_dir / f"{symbol}--TRADE--{date}.parquet")
 
