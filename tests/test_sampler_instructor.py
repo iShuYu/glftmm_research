@@ -43,6 +43,7 @@ class SamplerInstructorTest(unittest.TestCase):
                     "price": [100.0, 99.9, 100.1, 99.8],
                     "volume": [3.0, 1.0, 1.0, 2.0],
                     "is_buyer_maker": [False, True, False, True],
+                    "trade_type": 0,
                 }
             ).to_parquet(trade_dir / f"{symbol}--TRADE--{date}.parquet")
 
@@ -197,6 +198,7 @@ class SamplerInstructorTest(unittest.TestCase):
                     "exchange_timestamp": [timestamps[0]],
                     "price": [103.0],
                     "volume": [1.0],
+                    "trade_type": 0,
                 }
             ).to_parquet(trade_dir / f"{symbol}--TRADE--{date}.parquet", index=False)
 
@@ -241,6 +243,7 @@ class SamplerInstructorTest(unittest.TestCase):
                     "exchange_timestamp": [timestamps[0], timestamps[1], timestamps[2]],
                     "price": [103.0, 95.0, 104.0],
                     "volume": [1.0, 3.0, 2.0],
+                    "trade_type": 0,
                 }
             ).to_parquet(trade_dir / f"{symbol}--TRADE--{date}.parquet", index=False)
 
