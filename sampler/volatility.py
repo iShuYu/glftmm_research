@@ -46,6 +46,8 @@ DEFAULT_VOLATILITY_ROOT = DEFAULT_DATA_ROOT / "VOLATILITY"
 SUPPORTED_INDICATORS = ("sigma", "atr", "rv", "bv", "parkinson", "gk")
 RAW_TRADE_TIME_COLUMN = "exchange_timestamp"
 RAW_TRADE_COLUMNS = (RAW_TRADE_TIME_COLUMN, "price", "volume")
+TRADE_TYPE_COLUMN = "trade_type"
+RAW_TRADE_READ_COLUMNS = (*RAW_TRADE_COLUMNS, TRADE_TYPE_COLUMN)
 TICKER_COLUMNS = ("timestamp", "best_bid_price", "best_ask_price")
 BASE_FRAME_CACHE: dict[tuple[Any, ...], pd.DataFrame] = {}
 
@@ -158,8 +160,11 @@ def read_trade_frame(
         date_str=date_str,
         category=category,
     )
-    raw_df = pd.read_parquet(path, columns=list(RAW_TRADE_COLUMNS))
-    return normalize_trade_frame(raw_df)
+    raw_df = pd.read_parquet(path, columns=list(RAW_TRADE_READ_COLUMNS))
+    missing = set(RAW_TRADE_READ_COLUMNS) - set(raw_df.columns)
+    if missing:
+        raise ValueError(f"trade frame missing columns: {sorted(missing)}")
+    return normalize_trade_frame(raw_df.loc[raw_df[TRADE_TYPE_COLUMN] == 0])
 
 
 def read_sampled_ticker(
