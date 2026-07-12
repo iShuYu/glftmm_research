@@ -48,6 +48,8 @@ def make_config(**overrides):
         "min_order_qty": 0.0,
         "min_order_notional": 0.0,
         "stoploss": 0.0,
+        "takeprofit": 0.0,
+        "hold_since": 0.0,
         "open_curve": (1000.0, 1000.0, 1.0),
         "close_curve": (1000.0, 1000.0, 1.0),
         "boost_underwater": (1.0, 1.0),
@@ -88,6 +90,8 @@ def raw_config(**overrides):
         "min_order_qty": 0.0,
         "min_order_notional": 0.0,
         "stoploss": 0.0,
+        "takeprofit": 0.0,
+        "hold_since": 0.0,
         "boost_underwater": [1.0, 1.0],
         "boost_profitzone": [1.0, 1.0],
         "toxic_lock": [[0, 0]],
@@ -203,19 +207,40 @@ class PositionNotionalTest(unittest.TestCase):
 
 
 class StrategyConfigTest(unittest.TestCase):
-    def test_build_config_accepts_single_max_position_and_stoploss(self):
+    def test_kls_pair_lookback_reaches_strategy_loader_spec(self):
+        simulation = _build_simulation_config(
+            raw_config(name_intensity="kls", lookback_intensity=[120, 12])["simulation"]
+        )
+        engine = SimpleMakerStrategy(simulation)
+
+        self.assertEqual(simulation.lookback_intensity, "12_120")
+        self.assertEqual(
+            engine._selected_intensity_spec(),
+            {"name": "kls", "lookback": "12_120"},
+        )
+
+        sim_map = _normalize_sim_param_map(
+            raw_config(name_intensity="kls", lookback_intensity=[120, 12])
+        )
+        self.assertEqual(sim_map["lookback_intensity"], ["12_120"])
+
+    def test_build_config_accepts_single_max_position_stoploss_takeprofit_and_hold_since(self):
         cfg = _build_simulation_config(
             raw_config(
                 max_position_usdt=250.0,
                 stoploss=25.0,
+                takeprofit=40.0,
+                hold_since=15.0,
             )["simulation"]
         )
 
         self.assertEqual(cfg.max_position_usdt, 250.0)
         self.assertEqual(cfg.total_max_position_usdt, 250.0)
         self.assertEqual(cfg.stoploss, 25.0)
+        self.assertEqual(cfg.takeprofit, 40.0)
+        self.assertEqual(cfg.hold_since, 15.0)
 
-    def test_rejects_lot_shaped_max_position_and_stoploss(self):
+    def test_rejects_lot_shaped_max_position_stoploss_takeprofit_and_hold_since(self):
         with self.assertRaisesRegex(ValueError, "max_position_usdt must be a number"):
             _build_simulation_config(
                 raw_config(
@@ -232,7 +257,23 @@ class StrategyConfigTest(unittest.TestCase):
                 )["simulation"]
             )
 
-    def test_normalizes_max_position_and_stoploss_as_parameter_grids(self):
+        with self.assertRaisesRegex(ValueError, "takeprofit must be a number"):
+            _build_simulation_config(
+                raw_config(
+                    max_position_usdt=250.0,
+                    takeprofit=[25.0, 75.0],
+                )["simulation"]
+            )
+
+        with self.assertRaisesRegex(ValueError, "hold_since must be a number"):
+            _build_simulation_config(
+                raw_config(
+                    max_position_usdt=250.0,
+                    hold_since=[25.0, 75.0],
+                )["simulation"]
+            )
+
+    def test_normalizes_max_position_stoploss_and_takeprofit_as_parameter_grids(self):
         sim_map = _normalize_sim_param_map(
             raw_config(
                 max_position_usdt=[250.0, 750.0],
@@ -240,6 +281,8 @@ class StrategyConfigTest(unittest.TestCase):
                 phase_change_position=[100.0, 200.0],
                 boost_phase_change=[1.0, 2.0],
                 stoploss=[25.0, 75.0],
+                takeprofit=[40.0, 80.0],
+                hold_since=[15.0, 30.0],
                 toxic_lock=[[20, 15]],
             )
         )
@@ -249,6 +292,8 @@ class StrategyConfigTest(unittest.TestCase):
         self.assertEqual(sim_map["phase_change_position"], [100.0, 200.0])
         self.assertEqual(sim_map["boost_phase_change"], [1.0, 2.0])
         self.assertEqual(sim_map["stoploss"], [25.0, 75.0])
+        self.assertEqual(sim_map["takeprofit"], [40.0, 80.0])
+        self.assertEqual(sim_map["hold_since"], [15.0, 30.0])
         self.assertEqual(sim_map["toxic_lock"], [[20, 15]])
 
     def test_rejects_bare_toxic_lock_pair_in_parameter_grid(self):
@@ -458,6 +503,20 @@ class StrategyConfigTest(unittest.TestCase):
         )
         self.assertEqual([task.sim_params["mode"] for task in tasks].count(0), 4)
         self.assertEqual([task.sim_params["mode"] for task in tasks].count(1), 4)
+
+    def test_build_tasks_crosses_takeprofit_grid(self):
+        tasks = _build_tasks(
+            raw_task_config(
+                mode=[0, 1],
+                takeprofit=[50.0, 100.0],
+            )
+        )
+
+        self.assertEqual(len(tasks), 4)
+        self.assertEqual(
+            sorted(task.sim_params["takeprofit"] for task in tasks),
+            [50.0, 50.0, 100.0, 100.0],
+        )
 
     def test_build_config_parses_instructor_alpha_adjustment(self):
         cfg = _build_simulation_config(
@@ -1002,6 +1061,18 @@ class StrategyQuoteTest(unittest.TestCase):
         self.assertFalse(engine._should_activate_stoploss(mid=75.1))
         self.assertTrue(engine._should_activate_stoploss(mid=75.0))
 
+    def test_takeprofit_is_absolute_usdt_for_long_and_short(self):
+        engine = SimpleMakerStrategy(make_config(max_position_usdt=100.0, takeprofit=25.0))
+        set_position(engine, qty=1.0, cost=100.0)
+
+        self.assertFalse(engine._should_activate_takeprofit(mid=124.9))
+        self.assertTrue(engine._should_activate_takeprofit(mid=125.0))
+
+        set_position(engine, qty=-1.0, cost=100.0)
+
+        self.assertFalse(engine._should_activate_takeprofit(mid=75.1))
+        self.assertTrue(engine._should_activate_takeprofit(mid=75.0))
+
     def test_long_under_cost_only_places_open_bid(self):
         engine = SimpleMakerStrategy(make_config())
         set_position(engine, qty=1.0, cost=100.0)
@@ -1428,6 +1499,119 @@ class StrategyQuoteTest(unittest.TestCase):
         self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.6, 0.995)])
         self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(100.4, 0.997)])
 
+    def test_hold_since_blocks_underwater_close_at_position_threshold_but_keeps_open_side(self):
+        for simple_mode in (True, False):
+            with self.subTest(simple_mode=simple_mode, position="long"):
+                engine = SimpleMakerStrategy(
+                    make_config(
+                        simple_mode=simple_mode,
+                        strict_mode=False,
+                        hold_since=10.0,
+                        open_curve=(1.0, 1.0, 1.0),
+                        close_curve=(1.0, 20.0, 1.0),
+                    )
+                )
+                set_position(engine, qty=0.2, cost=100.0)
+
+                engine._on_ticker_event(
+                    timestamp=1,
+                    best_bid=89.7,
+                    best_ask=89.9,
+                    intensity_value=0.0,
+                    volatility_scalar=0.0,
+                )
+
+                self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+                self.assertGreater(len(price_levels(engine, engine.manager.books.bid_maker)), 0)
+
+            with self.subTest(simple_mode=simple_mode, position="short"):
+                engine = SimpleMakerStrategy(
+                    make_config(
+                        simple_mode=simple_mode,
+                        strict_mode=False,
+                        hold_since=10.0,
+                        open_curve=(1.0, 1.0, 1.0),
+                        close_curve=(1.0, 20.0, 1.0),
+                    )
+                )
+                set_position(engine, qty=-0.2, cost=100.0)
+
+                engine._on_ticker_event(
+                    timestamp=1,
+                    best_bid=110.1,
+                    best_ask=110.3,
+                    intensity_value=0.0,
+                    volatility_scalar=0.0,
+                )
+
+                self.assertGreater(len(price_levels(engine, engine.manager.books.ask_maker)), 0)
+                self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+
+    def test_hold_since_blocks_close_at_exact_position_threshold(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                strict_mode=False,
+                hold_since=100.0,
+                open_curve=(1.0, 1.0, 1.0),
+                close_curve=(1.0, 20.0, 1.0),
+            )
+        )
+        set_position(engine, qty=1.0, cost=100.0)
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=89.9,
+            best_ask=90.1,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.bid_maker)), 0)
+
+    def test_hold_since_does_not_block_underwater_close_below_position_threshold(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                strict_mode=False,
+                hold_since=101.0,
+                open_curve=(1.0, 1.0, 1.0),
+                close_curve=(1.0, 20.0, 1.0),
+            )
+        )
+        set_position(engine, qty=1.0, cost=100.0)
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=89.9,
+            best_ask=90.1,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+
+        self.assertGreater(len(price_levels(engine, engine.manager.books.ask_maker)), 0)
+        self.assertGreater(len(price_levels(engine, engine.manager.books.bid_maker)), 0)
+
+    def test_hold_since_keeps_profitzone_close_active(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                strict_mode=False,
+                hold_since=10.0,
+                open_curve=(1.0, 1.0, 1.0),
+                close_curve=(1.0, 20.0, 1.0),
+            )
+        )
+        set_position(engine, qty=1.0, cost=100.0)
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=109.9,
+            best_ask=110.1,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+
+        self.assertGreater(len(price_levels(engine, engine.manager.books.ask_maker)), 0)
+
     def test_flat_open_quote_uses_open_spread_adjustments(self):
         engine = SimpleMakerStrategy(
             make_config(
@@ -1689,6 +1873,7 @@ class StrategyQuoteTest(unittest.TestCase):
         self.assertNotIn("lots", state)
         self.assertNotIn("max_position_lots", state)
         self.assertNotIn("stoploss_lots", state)
+        self.assertEqual(state["takeprofit_usdt"], 0.0)
         self.assertFalse(hasattr(engine, "_lot_strategies"))
         self.assertLessEqual(len(engine.manager.books.ask_maker.snapshot()), 1)
         self.assertLessEqual(len(engine.manager.books.bid_maker.snapshot()), 1)

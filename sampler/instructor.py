@@ -40,7 +40,7 @@ from sampler.resample import (
 DEFAULT_DATA_ROOT = DEFAULT_BOOKTICKER_ROOT.parent
 DEFAULT_TRADE_ROOT = DEFAULT_DATA_ROOT / "TRADE"
 DEFAULT_INSTRUCTOR_ROOT = DEFAULT_DATA_ROOT / "INSTRUCTOR"
-SUPPORTED_INSTRUCTORS = ("trade_imbalance", "bbo_imbalance")
+SUPPORTED_INSTRUCTORS = ("trade_imbalance", "bbo_imbalance", "volume_zscore")
 RAW_TRADE_TIME_COLUMN = "exchange_timestamp"
 RAW_TRADE_COLUMNS = (RAW_TRADE_TIME_COLUMN, "price", "volume", "is_buyer_maker")
 TRADE_TYPE_COLUMN = "trade_type"
@@ -316,6 +316,93 @@ def build_bbo_imbalance_frame(
     return out.loc[:, ["timestamp", "instructor"]]
 
 
+def build_volume_zscore_frame(
+    symbol: str,
+    date: str,
+    freq_ms: int,
+    lookback: int,
+    trade_roots: Any,
+    trade_category: str = "TRADE",
+    scheme_shift_ms: int = 0,
+) -> pd.DataFrame:
+    lookback = int(lookback)
+    if lookback < 2:
+        raise ValueError("volume_zscore requires lookback >= 2")
+    if freq_ms <= 0:
+        raise ValueError(f"freq_ms must be positive integer ms, got {freq_ms}")
+
+    scheme_shift_ms = normalize_scheme_shift(scheme_shift_ms, freq_ms)
+    date_list = [previous_date_str(date), date]
+    trade_frames: list[pd.DataFrame] = []
+    for one_date in date_list:
+        try:
+            trades = read_trade_frame(
+                root=trade_roots,
+                symbol=symbol,
+                date_str=one_date,
+                category=trade_category,
+            )
+        except FileNotFoundError:
+            if one_date == date:
+                raise
+            continue
+        if not trades.empty:
+            trade_frames.append(trades)
+
+    grid = warmup_timestamp_grid(date, freq_ms, lookback, scheme_shift_ms)
+    out = pd.DataFrame({"timestamp": grid})
+    out["trade_volume"] = 0.0
+
+    if trade_frames:
+        trades = pd.concat(trade_frames, ignore_index=True)
+        trades["bucket_ts"] = shifted_bucket_timestamps(
+            trades["timestamp"],
+            freq_ms=freq_ms,
+            scheme_shift_ms=scheme_shift_ms,
+        )
+        trades = trades[
+            (trades["bucket_ts"] >= int(grid[0]))
+            & (trades["bucket_ts"] <= int(grid[-1]))
+        ]
+        if not trades.empty:
+            bucket = (
+                trades.groupby("bucket_ts", as_index=False, sort=True)
+                .agg(trade_volume=("volume", "sum"))
+                .rename(columns={"bucket_ts": "timestamp"})
+            )
+            out = out.drop(columns=["trade_volume"]).merge(
+                bucket,
+                on="timestamp",
+                how="left",
+            )
+            out["trade_volume"] = out["trade_volume"].fillna(0.0)
+
+    current_volume = out["trade_volume"].shift(1)
+    history_volume = out["trade_volume"].shift(2)
+    history_window = lookback - 1
+    history_mean = history_volume.rolling(
+        window=history_window,
+        min_periods=history_window,
+    ).mean()
+    history_std = history_volume.rolling(
+        window=history_window,
+        min_periods=history_window,
+    ).std()
+    zscore = (current_volume - history_mean) / history_std
+    zscore = zscore.where(history_std > EPS, 0.0).fillna(0.0)
+
+    out["instructor"] = zscore
+    day_grid = day_timestamp_grid(date, freq_ms, scheme_shift_ms)
+    out = out[out["timestamp"].isin(day_grid)].sort_values(
+        "timestamp",
+        kind="mergesort",
+        ignore_index=True,
+    )
+    out["timestamp"] = out["timestamp"].astype("int64")
+    out["instructor"] = out["instructor"].astype("float64")
+    return out.loc[:, ["timestamp", "instructor"]]
+
+
 def build_trade_instructor_frame(
     symbol: str,
     date: str,
@@ -349,6 +436,16 @@ def build_trade_instructor_frame(
             ticker_cache_root=ticker_cache_root,
             scheme_shift_ms=scheme_shift_ms,
         )
+    if indicator == "volume_zscore":
+        return build_volume_zscore_frame(
+            symbol=symbol,
+            date=date,
+            freq_ms=freq_ms,
+            lookback=lookback,
+            trade_roots=trade_roots,
+            trade_category=trade_category,
+            scheme_shift_ms=scheme_shift_ms,
+        )
     raise ValueError(f"unsupported instructor indicator: {indicator}")
 
 
@@ -357,6 +454,7 @@ def validate_instructor_frame(
     date_str: str,
     freq_ms: int,
     scheme_shift_ms: int = 0,
+    indicator: str | None = None,
 ) -> None:
     required = {"timestamp", "instructor"}
     missing = required - set(df.columns)
@@ -387,7 +485,8 @@ def validate_instructor_frame(
     values = df["instructor"].to_numpy(dtype="float64")
     if not np.isfinite(values).all():
         raise ValueError("instructor frame contains non-finite values")
-    if (np.abs(values) > 1.0 + 1e-9).any():
+    bounded = indicator not in {"volume_zscore"}
+    if bounded and (np.abs(values) > 1.0 + 1e-9).any():
         raise ValueError("instructor must be inside [-1, 1]")
 
 
@@ -427,6 +526,7 @@ def run_one(task: Task) -> str:
                 date_str=task.date,
                 freq_ms=task.freq_ms,
                 scheme_shift_ms=task.scheme_shift_ms,
+                indicator=task.indicator,
             )
 
         atomic_write_parquet(frame, path, compression=task.compression)
@@ -455,6 +555,11 @@ def normalize_instructor_lookbacks(indicator: str, raw_lookbacks: Any) -> list[i
         if any(x != 0 for x in lookbacks):
             raise ValueError("indicator bbo_imbalance only supports lookback 0")
         return [0]
+    if indicator == "volume_zscore":
+        lookbacks = [x for x in lookbacks if x >= 2]
+        if not lookbacks:
+            raise ValueError("indicator volume_zscore requires lookback >= 2")
+        return lookbacks
 
     lookbacks = [x for x in lookbacks if x > 0]
     if not lookbacks:

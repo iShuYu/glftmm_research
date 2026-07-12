@@ -15,6 +15,7 @@ from typing import Any
 
 import pandas as pd
 
+from sampler.intensity import normalize_indicator_lookbacks
 from sim.loader import BinanceEventLoader, parse_orderbook_replay_config
 from sim.strategy import (
     SimulationConfig,
@@ -72,6 +73,8 @@ PARAM_KEY_ALIAS = {
     "min_quote_distance_bps": "mqdb",
     "inventory_skew": "isk",
     "stoploss": "sl",
+    "takeprofit": "tp",
+    "hold_since": "hs",
     "open_curve": "oc",
     "close_curve": "cc",
     "boost_underwater": "bu",
@@ -105,6 +108,8 @@ SIM_OPTIONAL_KEYS = (
     "min_order_qty",
     "min_order_notional",
     "stoploss",
+    "takeprofit",
+    "hold_since",
     "open_curve",
     "close_curve",
     "boost_underwater",
@@ -131,6 +136,32 @@ def load_config(path: str) -> dict[str, Any]:
 
 def ensure_list_map(d: dict[str, Any]) -> dict[str, list[Any]]:
     return {k: v if isinstance(v, list) else [v] for k, v in d.items()}
+
+
+def _is_two_scalar_sequence(value: Any) -> bool:
+    return (
+        isinstance(value, (list, tuple))
+        and len(value) == 2
+        and not any(isinstance(item, (list, tuple, dict)) for item in value)
+    )
+
+
+def _raw_names(raw: Any) -> list[str]:
+    return [
+        str(item).strip().lower()
+        for item in (raw if isinstance(raw, list) else [raw])
+        if str(item).strip()
+    ]
+
+
+def _normalize_intensity_lookback_value(name: Any, value: Any) -> int | str:
+    indicator = str(name if name not in (None, "") else "k").strip().lower()
+    lookbacks = normalize_indicator_lookbacks(indicator, value)
+    if len(lookbacks) != 1:
+        raise ValueError(
+            f"simulation.lookback_intensity for {indicator} must resolve to one value"
+        )
+    return lookbacks[0]
 
 
 def _is_number(value: Any) -> bool:
@@ -361,7 +392,40 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
             "simulation.cooldown_time has been replaced by simulation.toxic_lock"
         )
 
+    raw_intensity_names = _raw_names(sim_raw.get("name_intensity", "k"))
+    if (
+        raw_intensity_names == ["kls"]
+        and _is_two_scalar_sequence(sim_raw.get("lookback_intensity"))
+    ):
+        sim_raw = dict(sim_raw)
+        sim_raw["lookback_intensity"] = [sim_raw["lookback_intensity"]]
+
     sim_map = ensure_list_map(sim_raw)
+    if "lookback_intensity" in sim_map:
+        names = sim_map.get("name_intensity", [sim_raw.get("name_intensity", "k")])
+        name_values = [str(name).strip().lower() for name in names]
+        name_for_lookback = name_values[0] if len(set(name_values)) == 1 else None
+        normalized_lookbacks: list[Any] = []
+        for value in sim_map["lookback_intensity"]:
+            if name_for_lookback is not None:
+                try:
+                    normalized_lookbacks.append(
+                        _normalize_intensity_lookback_value(name_for_lookback, value)
+                    )
+                    continue
+                except ValueError:
+                    pass
+            if _is_two_scalar_sequence(value):
+                try:
+                    normalized_lookbacks.append(
+                        _normalize_intensity_lookback_value("kls", value)
+                    )
+                    continue
+                except ValueError:
+                    pass
+            normalized_lookbacks.append(value)
+        sim_map["lookback_intensity"] = normalized_lookbacks
+
     if "inventory_skew" in sim_raw:
         skew_rows = ensure_list_map({"inventory_skew": sim_raw["inventory_skew"]})[
             "inventory_skew"
@@ -403,6 +467,18 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
         sim_map["stoploss"] = [
             _normalize_non_negative_scalar(row, "stoploss")
             for row in sim_map["stoploss"]
+        ]
+
+    if "takeprofit" in sim_map:
+        sim_map["takeprofit"] = [
+            _normalize_non_negative_scalar(row, "takeprofit")
+            for row in sim_map["takeprofit"]
+        ]
+
+    if "hold_since" in sim_map:
+        sim_map["hold_since"] = [
+            _normalize_non_negative_scalar(row, "hold_since")
+            for row in sim_map["hold_since"]
         ]
 
     if "toxic_lock" in sim_raw:
@@ -490,7 +566,10 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
             )
         lookback_intensity = 100
     else:
-        lookback_intensity = int(lookback_intensity_raw)
+        lookback_intensity = _normalize_intensity_lookback_value(
+            raw.get("name_intensity", "k"),
+            lookback_intensity_raw,
+        )
 
     name_instructor = raw.get("name_instructor")
     if name_instructor is not None:
@@ -602,6 +681,14 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
         min_order_qty=float(raw.get("min_order_qty", 0.0)),
         min_order_notional=float(raw.get("min_order_notional", 0.0)),
         stoploss=_normalize_non_negative_scalar(raw.get("stoploss", 0.0), "stoploss"),
+        takeprofit=_normalize_non_negative_scalar(
+            raw.get("takeprofit", 0.0),
+            "takeprofit",
+        ),
+        hold_since=_normalize_non_negative_scalar(
+            raw.get("hold_since", 0.0),
+            "hold_since",
+        ),
         open_curve=open_curve,
         close_curve=close_curve,
         boost_underwater=raw.get("boost_underwater", [1.0, 1.0]),

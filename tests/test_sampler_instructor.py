@@ -6,8 +6,10 @@ import pandas as pd
 
 from sampler.intensity import build_tasks as build_intensity_tasks
 from sampler.intensity import build_trade_intensity_frame
+from sampler.intensity import compute_k_decay, compute_kls
 from sampler.intensity import intensity_output_path
 from sampler.instructor import (
+    build_tasks as build_instructor_tasks,
     build_trade_instructor_frame,
     instructor_output_path,
     validate_instructor_frame,
@@ -24,6 +26,20 @@ from sim.loader import BinanceEventLoader
 
 
 class SamplerInstructorTest(unittest.TestCase):
+    def test_kls_uses_larger_short_and_long_decay(self):
+        break_dist = pd.Series([0.0, 4.0, 0.0, 0.0, 1.0])
+
+        actual = compute_kls(break_dist, [3, 1])
+        expected = pd.concat(
+            [
+                compute_k_decay(break_dist, 1),
+                compute_k_decay(break_dist, 3),
+            ],
+            axis=1,
+        ).max(axis=1)
+
+        self.assertEqual(actual.tolist(), expected.tolist())
+
     def test_trade_imbalance_uses_prior_buckets_only(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / "TRADE"
@@ -63,6 +79,53 @@ class SamplerInstructorTest(unittest.TestCase):
             self.assertAlmostEqual(out.loc[2, "instructor"], -0.6)
             self.assertAlmostEqual(out.loc[3, "instructor"], 0.5)
             validate_instructor_frame(out, date_str=date, freq_ms=1000)
+
+    def test_volume_zscore_compares_previous_bar_to_older_history(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "TRADE"
+            symbol = "BTCUSDT"
+            date = "2025-01-01"
+            day_start = int(day_timestamp_grid(date, 1000)[0])
+            trade_dir = root / symbol
+            trade_dir.mkdir(parents=True)
+            pd.DataFrame(
+                {
+                    "exchange_timestamp": [
+                        day_start,
+                        day_start + 1000,
+                        day_start + 2000,
+                        day_start + 3000,
+                    ],
+                    "price": [100.0, 100.0, 100.0, 100.0],
+                    "volume": [1.0, 2.0, 3.0, 7.0],
+                    "is_buyer_maker": [True, True, True, True],
+                    "trade_type": 0,
+                }
+            ).to_parquet(trade_dir / f"{symbol}--TRADE--{date}.parquet")
+
+            out = build_trade_instructor_frame(
+                symbol=symbol,
+                date=date,
+                freq_ms=1000,
+                lookback=4,
+                indicator="volume_zscore",
+                trade_roots=(root,),
+            )
+
+            expected = (7.0 - 2.0) / 1.0
+            self.assertEqual(len(out), 86400)
+            self.assertEqual(out.columns.tolist(), ["timestamp", "instructor"])
+            self.assertEqual(out.loc[0, "instructor"], 0.0)
+            self.assertAlmostEqual(out.loc[4, "instructor"], expected)
+            self.assertGreater(abs(out.loc[4, "instructor"]), 1.0)
+            validate_instructor_frame(
+                out,
+                date_str=date,
+                freq_ms=1000,
+                indicator="volume_zscore",
+            )
+            with self.assertRaisesRegex(ValueError, "inside \\[-1, 1\\]"):
+                validate_instructor_frame(out, date_str=date, freq_ms=1000)
 
     def test_bbo_imbalance_uses_sampled_ticker_quantities(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -214,6 +277,20 @@ class SamplerInstructorTest(unittest.TestCase):
 
             self.assertEqual(float(out.loc[0, "intensity"]), 0.0)
             self.assertEqual(float(out.loc[1, "intensity"]), 2.0)
+
+            kls = build_trade_intensity_frame(
+                symbol=symbol,
+                date=date,
+                freq_ms=freq_ms,
+                lookback=[3, 1],
+                indicator="kls",
+                ticker_cache_root=cache_root,
+                trade_roots=(trade_root,),
+            )
+
+            self.assertEqual(kls.columns.tolist(), ["timestamp", "intensity"])
+            self.assertEqual(float(kls.loc[0, "intensity"]), 0.0)
+            self.assertEqual(float(kls.loc[1, "intensity"]), 1.0)
 
     def test_kw_vol_weights_nonzero_break_bins_by_bucket_volume(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -395,6 +472,53 @@ class SamplerInstructorTest(unittest.TestCase):
             self.assertEqual(alpha["intensity_positive"].tolist(), [1.5, 2.5])
             self.assertEqual(alpha["intensity_negative"].tolist(), [1.5, 2.5])
 
+    def test_loader_reads_kls_pair_lookback_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "cache"
+            symbol = "BTCUSDT"
+            date = "2025-01-01"
+            freq_ms = 1000
+            ts0 = int(day_timestamp_grid(date, freq_ms)[0])
+            timestamps = [ts0, ts0 + freq_ms]
+
+            ticker_path = sampled_ticker_path(root, symbol, freq_ms, date)
+            ticker_path.parent.mkdir(parents=True)
+            pd.DataFrame(
+                {
+                    "timestamp": timestamps,
+                    "best_bid_price": [100.0, 101.0],
+                    "best_ask_price": [100.5, 101.5],
+                    "best_bid_qty": [1.0, 1.0],
+                    "best_ask_qty": [1.0, 1.0],
+                }
+            ).to_parquet(ticker_path, index=False)
+
+            intensity_path = intensity_output_path(
+                root,
+                symbol,
+                "kls",
+                freq_ms,
+                "12_120",
+                date,
+            )
+            intensity_path.parent.mkdir(parents=True)
+            pd.DataFrame(
+                {"timestamp": timestamps, "intensity": [1.5, 2.5]}
+            ).to_parquet(intensity_path, index=False)
+
+            loader = BinanceEventLoader(cache_root=root, scheme_shift=0)
+            alpha = loader._read_alpha_frame(
+                symbol=symbol,
+                date=date,
+                freq_ms=freq_ms,
+                trade_intensity_spec={"name": "kls", "lookback": [120, 12]},
+                volatility_specs=[],
+                instructor_spec=None,
+            )
+
+            self.assertEqual(alpha["intensity_positive"].tolist(), [1.5, 2.5])
+            self.assertEqual(alpha["intensity_negative"].tolist(), [1.5, 2.5])
+
     def test_loader_maps_split_kw_vol_columns_into_directional_intensity(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / "cache"
@@ -496,6 +620,38 @@ class SamplerInstructorTest(unittest.TestCase):
                 {"name": "bbo_imbalance", "lookback": 1},
                 default_name="trade_imbalance",
             )
+        self.assertEqual(
+            BinanceEventLoader._parse_spec(
+                {"name": "volume_zscore", "lookback": 4},
+                default_name="trade_imbalance",
+            ),
+            ("volume_zscore", 4),
+        )
+        with self.assertRaisesRegex(ValueError, "volume_zscore lookback must be >= 2"):
+            BinanceEventLoader._parse_spec(
+                {"name": "volume_zscore", "lookback": 1},
+                default_name="trade_imbalance",
+            )
+
+    def test_build_stage_configs_accepts_volume_zscore_lookback(self):
+        cfg = {
+            "symbols": ["BTCUSDT"],
+            "date_start": "2025-01-01",
+            "input_path": "/tmp/input",
+            "output_path": "/tmp/output",
+            "freq_ms": [1000],
+            "name_instructor": ["volume_zscore"],
+            "lookback_instructor": [4],
+        }
+
+        _, instructor_cfg, _, _ = build_stage_configs(cfg)
+        tasks = build_instructor_tasks(instructor_cfg)
+
+        self.assertEqual(instructor_cfg["instructor"]["indicator"], ["volume_zscore"])
+        self.assertEqual(instructor_cfg["instructor"]["lookback"], [4])
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].indicator, "volume_zscore")
+        self.assertEqual(tasks[0].lookback, 4)
 
     def test_build_stage_configs_accepts_bbo_zero_lookback(self):
         cfg = {
@@ -552,6 +708,24 @@ class SamplerInstructorTest(unittest.TestCase):
         bad_cfg["scheme_shift"] = [0, 1000]
         with self.assertRaisesRegex(ValueError, "scheme_shift"):
             build_stage_configs(bad_cfg)
+
+    def test_build_stage_configs_accepts_kls_pair_lookback(self):
+        cfg = {
+            "symbols": ["BTCUSDT"],
+            "date_start": "2025-01-01",
+            "input_path": "/tmp/input",
+            "output_path": "/tmp/output",
+            "freq_ms": [1000],
+            "scheme_shift": [0],
+            "name_intensity": ["kls"],
+            "lookback_intensity": [[120, 12]],
+        }
+
+        _, _, intensity_cfg, _ = build_stage_configs(cfg)
+        tasks = build_intensity_tasks(intensity_cfg)
+
+        self.assertEqual(intensity_cfg["intensity"]["lookback"], ["12_120"])
+        self.assertEqual([(task.indicator, task.lookback) for task in tasks], [("kls", "12_120")])
 
 
 if __name__ == "__main__":

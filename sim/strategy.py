@@ -3,13 +3,14 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Iterable, Optional, Sequence
+from typing import Any, Iterable, Optional, Sequence
 
 import numpy as np
 import pandas as pd
 
 from core.manager import Manager as ValidatedManager
 from core.position import Position
+from sampler.intensity import normalize_kls_lookback
 from sim.loader import BinanceEventLoader, DateLike
 
 
@@ -99,7 +100,7 @@ class SimulationConfig:
     name_instructor: Optional[str] = None
     lookback_instructor: Optional[int] = None
     name_intensity: str = "k"
-    lookback_intensity: int = 100
+    lookback_intensity: int | str | Sequence[int] = 100
     name_volatility: Optional[str] = None
     lookback_volatility: Optional[int] = None
     max_position_usdt: float = 0.0
@@ -118,6 +119,8 @@ class SimulationConfig:
     min_order_qty: float = 0.0
     min_order_notional: float = 0.0
     stoploss: float = 0.0
+    takeprofit: float = 0.0
+    hold_since: float = 0.0
     open_curve: Optional[tuple[float, float, float]] = None
     close_curve: Optional[tuple[float, float, float]] = None
     boost_underwater: float | tuple[float, float] = (1.0, 1.0)
@@ -132,6 +135,8 @@ class SimulationConfig:
             "max_position_usdt",
         )
         stoploss = self._normalize_scalar(self.stoploss, "stoploss")
+        takeprofit = self._normalize_scalar(self.takeprofit, "takeprofit")
+        hold_since = self._normalize_scalar(self.hold_since, "hold_since")
         max_open_inventory_utilization = self._normalize_scalar(
             self.max_open_inventory_utilization,
             "max_open_inventory_utilization",
@@ -142,6 +147,8 @@ class SimulationConfig:
         )
         object.__setattr__(self, "max_position_usdt", max_position_usdt)
         object.__setattr__(self, "stoploss", stoploss)
+        object.__setattr__(self, "takeprofit", takeprofit)
+        object.__setattr__(self, "hold_since", hold_since)
         object.__setattr__(
             self,
             "max_open_inventory_utilization",
@@ -172,7 +179,13 @@ class SimulationConfig:
                 raise ValueError(
                     "lookback_instructor must be > 0 when name_instructor is provided"
                 )
-        if self.lookback_intensity <= 0:
+        if str(self.name_intensity).strip().lower() == "kls":
+            object.__setattr__(
+                self,
+                "lookback_intensity",
+                normalize_kls_lookback(self.lookback_intensity),
+            )
+        elif int(self.lookback_intensity) <= 0:
             raise ValueError("lookback_intensity must be > 0")
         if self.name_volatility is not None:
             if self.lookback_volatility is None or int(self.lookback_volatility) <= 0:
@@ -253,6 +266,10 @@ class SimulationConfig:
             raise ValueError("min_order_notional must be >= 0")
         if self.stoploss < 0:
             raise ValueError("stoploss must be >= 0")
+        if self.takeprofit < 0:
+            raise ValueError("takeprofit must be >= 0")
+        if self.hold_since < 0:
+            raise ValueError("hold_since must be >= 0")
         if not isinstance(self.simple_mode, bool):
             raise ValueError("simple_mode must be boolean")
         if self.open_curve is not None:
@@ -409,6 +426,8 @@ class SimpleMakerStrategy:
             "total_pnl": float(realized_pnl + unrealized_pnl),
             "max_position_usdt": float(self.cfg.max_position_usdt),
             "stoploss_usdt": float(self.cfg.stoploss),
+            "takeprofit_usdt": float(self.cfg.takeprofit),
+            "hold_since_position_usdt": float(self.cfg.hold_since),
             "traded_volume": float(self._traded_volume),
             "latest_best_ask": self._latest_best_ask,
             "latest_best_bid": self._latest_best_bid,
@@ -919,6 +938,8 @@ class SimpleMakerStrategy:
 
         if self._should_activate_stoploss(mid=mid):
             self._reach_and_release_active = True
+        if self._should_activate_takeprofit(mid=mid):
+            self._reach_and_release_active = True
         if self._should_activate_max_holding_timeout(timestamp=timestamp):
             self._reach_and_release_active = True
 
@@ -1107,6 +1128,43 @@ class SimpleMakerStrategy:
         floating_unrealized = pos_qty * (float(mid) - cost)
         floating_loss = max(0.0, -floating_unrealized)
         return floating_loss + self.EPS >= stoploss_usdt
+
+    def _should_activate_takeprofit(self, mid: float) -> bool:
+        takeprofit_usdt = float(self.cfg.takeprofit)
+        if takeprofit_usdt <= self.EPS:
+            return False
+
+        pos = self.manager.position
+        pos_qty = float(pos.qty)
+        if abs(pos_qty) <= self.EPS:
+            return False
+        cost = float(pos.cost)
+        if not math.isfinite(cost):
+            return False
+
+        floating_unrealized = pos_qty * (float(mid) - cost)
+        floating_profit = max(0.0, floating_unrealized)
+        return floating_profit + self.EPS >= takeprofit_usdt
+
+    def _should_hold_underwater_close(self, mid: float) -> bool:
+        hold_since_position_usdt = float(self.cfg.hold_since)
+        if hold_since_position_usdt <= self.EPS:
+            return False
+
+        pos = self.manager.position
+        pos_qty = float(pos.qty)
+        if abs(pos_qty) <= self.EPS:
+            return False
+        cost = float(pos.cost)
+        if not math.isfinite(cost):
+            return False
+
+        floating_unrealized = pos_qty * (float(mid) - cost)
+        if floating_unrealized >= -self.EPS:
+            return False
+
+        position_notional_usdt = abs(float(pos.cost_notional_usdt))
+        return position_notional_usdt + self.EPS >= hold_since_position_usdt
 
     def _should_activate_max_holding_timeout(self, timestamp: int) -> bool:
         max_holding_time = int(self.cfg.max_holding_time)
@@ -1545,6 +1603,8 @@ class SimpleMakerStrategy:
                     ),
                     self._close_steps_from_position(pos_qty),
                 )
+                if self._should_hold_underwater_close(mid):
+                    ask_steps = 0
                 bid_steps = self._boost_open_steps(
                     self._simple_open_steps(price_ticks=open_bid_price_ticks, mid=mid),
                     profitzone=profitzone,
@@ -1577,6 +1637,8 @@ class SimpleMakerStrategy:
                 ),
                 self._close_steps_from_position(pos_qty),
             )
+            if self._should_hold_underwater_close(mid):
+                bid_steps = 0
             ask_steps, _bid_open_steps = self._apply_inventory_limit_steps(
                 ask_steps=ask_steps,
                 bid_steps=0,
@@ -1991,6 +2053,8 @@ class SimpleMakerStrategy:
                     ),
                     self._close_qty_from_position(pos_qty),
                 )
+                if self._should_hold_underwater_close(mid):
+                    close_qty = 0.0
                 bid_qty = self._boost_open_qty(
                     self._grid_open_qty(mid=mid, base_open_qty=bid_qty),
                     profitzone=profitzone,
@@ -2020,6 +2084,8 @@ class SimpleMakerStrategy:
                 ),
                 self._close_qty_from_position(pos_qty),
             )
+            if self._should_hold_underwater_close(mid):
+                close_qty = 0.0
             ask_qty, _bid_open_qty = self._apply_inventory_limit(
                 mid=mid,
                 ask_qty=ask_qty,
@@ -2368,12 +2434,12 @@ class SimpleMakerStrategy:
             return 0.0
         return v if math.isfinite(v) else 0.0
 
-    def _selected_intensity_spec(self) -> dict[str, int | str] | None:
+    def _selected_intensity_spec(self) -> dict[str, Any] | None:
         if all(float(value) <= self.EPS for value in self.sim.adj_spread_intensity):
             return None
         return {
             "name": str(self.sim.name_intensity).strip().lower(),
-            "lookback": int(self.sim.lookback_intensity),
+            "lookback": self.sim.lookback_intensity,
         }
 
     def _selected_instructor_spec(self) -> dict[str, int | str] | None:

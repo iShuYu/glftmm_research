@@ -136,6 +136,20 @@ def positive_int_list(
     return values
 
 
+def intensity_lookback_map(
+    names: list[str],
+    raw_lookbacks: Any,
+) -> dict[str, list[int | str]]:
+    if not names:
+        return {}
+    if raw_lookbacks in (None, "", []):
+        raise ValueError("config requires lookback_intensity")
+    return {
+        name: intensity.normalize_indicator_lookbacks(name, raw_lookbacks)
+        for name in names
+    }
+
+
 def common_dates_and_symbols(cfg: dict[str, Any]) -> dict[str, Any]:
     return {
         "symbols": [
@@ -187,10 +201,17 @@ def build_stage_configs(
         required=bool(name_instructor),
         allow_zero=True,
     )
-    lookback_intensity = positive_int_list(
-        cfg,
-        "lookback_intensity",
-        required=bool(name_intensity),
+    intensity_indicator_lbs = intensity_lookback_map(
+        name_intensity,
+        cfg.get("lookback_intensity"),
+    )
+    lookback_intensity = sorted(
+        {
+            lookback
+            for lookbacks in intensity_indicator_lbs.values()
+            for lookback in lookbacks
+        },
+        key=lambda value: (isinstance(value, str), str(value)),
     )
     lookback_volatility = positive_int_list(
         cfg,
@@ -240,6 +261,27 @@ def build_stage_configs(
         "parallel": parallel,
     }
 
+    intensity_section = {
+        "freq": freqs,
+        "scheme_shift": scheme_shift,
+        "indicator": name_intensity,
+        "lookback": lookback_intensity,
+        "ticker_category": input_paths.ticker_category,
+        "trade_category": input_paths.trade_category,
+        "auto_resample": False,
+        "overwrite": overwrite,
+        "strict_validate": strict_validate,
+        "compression": compression,
+    }
+    if any(
+        intensity_indicator_lbs[name] != lookback_intensity
+        for name in intensity_indicator_lbs
+    ):
+        intensity_section["indicators"] = {
+            name: {"lookback": lookbacks}
+            for name, lookbacks in intensity_indicator_lbs.items()
+        }
+
     intensity_cfg = {
         **common,
         "paths": {
@@ -248,18 +290,7 @@ def build_stage_configs(
             "trade_roots": [str(path) for path in input_paths.trade_roots],
             "output_root": str(output_root),
         },
-        "intensity": {
-            "freq": freqs,
-            "scheme_shift": scheme_shift,
-            "indicator": name_intensity,
-            "lookback": lookback_intensity,
-            "ticker_category": input_paths.ticker_category,
-            "trade_category": input_paths.trade_category,
-            "auto_resample": False,
-            "overwrite": overwrite,
-            "strict_validate": strict_validate,
-            "compression": compression,
-        },
+        "intensity": intensity_section,
         "parallel": parallel,
     }
 

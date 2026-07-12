@@ -3,7 +3,7 @@
     "BTCUSDT"
   ],
   "date_start": "2025-01-02",
-  "date_end": "2026-06-01",
+  "date_end": "2026-05-31",
   "paths": {
     "input_path": "/data/users/data-helper/PROCESSED/TARDIS/BINANCE/UFUTURES",
     "input_backup_path": "/home/kang/data_helper/PROCESSED/DATA_RECORDER/BINANCE/UFUTURES",
@@ -48,13 +48,13 @@
       1000
     ],
     "name_intensity": [
-      "k"
+      "kls"
     ],
     "name_volatility": [
       "sigma"
     ],
     "name_instructor": [
-      "bbo_imbalance"
+      "trade_imbalance"
     ],
     "lookback_volatility": [
       300
@@ -63,16 +63,19 @@
       0
     ],
     "lookback_intensity": [
-      300
+      [120, 12]
     ],
     "max_holding_time": [
       -1
     ],
     "max_position_usdt": [
-      1000000
+      2000000
     ],
     "phase_change_position": [
-      1000000
+      1200000
+    ],
+    "hold_since": [
+      1200000
     ],
     "boost_phase_change": [
       1.0
@@ -81,6 +84,9 @@
       "market"
     ],
     "stoploss": [
+      200000
+    ],
+    "takeprofit": [
       100000
     ],
     "min_order_qty": [
@@ -94,6 +100,10 @@
       [
         1.5,
         1.5
+      ],
+      [
+        2.0,
+        2.0
       ]
     ],
     "adj_spread_volatility": [
@@ -103,8 +113,7 @@
       ]
     ],
     "min_quote_distance_bps": [
-      0.2,
-      0.5
+      0.05
     ],
     "adj_spread_instructor": [
       0
@@ -137,28 +146,28 @@
     ],
     "boost_underwater": [
       [
-        5,
-        0
+        50,
+        10
+      ],
+      [
+        50,
+        20
       ]
     ],
     "boost_profitzone": [
       [
         0,
-        5
+        50
+      ],
+      [
+        0,
+        100
       ]
     ],
     "toxic_lock": [
       [
-        20,
-        15
-      ],
-      [
-        15,
-        10
-      ],
-      [
-        10,
-        7
+        0,
+        0
       ]
     ],
     "strict_mode": [
@@ -176,6 +185,6 @@
     "summary_csv": "strategy_summary.csv"
   },
   "parallel": {
-    "num_workers": 48
+    "num_workers": 24
   }
 }

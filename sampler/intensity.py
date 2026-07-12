@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from itertools import product
@@ -53,6 +54,7 @@ SUPPORTED_INDICATORS = (
     "kw_vol_negative",
     "k_decay",
     "k_median",
+    "kls",
 )
 INTENSITY_COLUMN = "intensity"
 DIRECTIONAL_INTENSITY_COLUMNS = ("intensity_positive", "intensity_negative")
@@ -61,6 +63,7 @@ RAW_TRADE_TIME_COLUMN = "exchange_timestamp"
 RAW_TRADE_COLUMNS = (RAW_TRADE_TIME_COLUMN, "price", "volume")
 TRADE_TYPE_COLUMN = "trade_type"
 RAW_TRADE_READ_COLUMNS = (*RAW_TRADE_COLUMNS, TRADE_TYPE_COLUMN)
+LookbackValue = int | str
 
 
 @dataclass(frozen=True)
@@ -70,7 +73,7 @@ class Task:
     freq_ms: int
     scheme_shift_ms: int
     indicator: str
-    lookback: int
+    lookback: LookbackValue
     ticker_cache_root: Path
     trade_roots: tuple[Path, ...]
     output_root: Path
@@ -97,7 +100,7 @@ def intensity_output_path(
     symbol: str,
     indicator: str,
     freq_ms: int,
-    lookback: int,
+    lookback: LookbackValue,
     date_str: str,
     scheme_shift_ms: int = 0,
 ) -> Path:
@@ -261,6 +264,100 @@ def compute_k_decay(break_dist: pd.Series, lookback: int) -> pd.Series:
     return pd.Series(intensity, index=break_dist.index)
 
 
+def _positive_int(value: Any, label: str) -> int:
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} must be a positive integer") from None
+    if out <= 0:
+        raise ValueError(f"{label} must be a positive integer")
+    return out
+
+
+def _is_scalar(value: Any) -> bool:
+    return not isinstance(value, (list, tuple, dict))
+
+
+def _is_kls_pair(value: Any) -> bool:
+    return (
+        isinstance(value, (list, tuple))
+        and len(value) == 2
+        and all(_is_scalar(item) for item in value)
+    )
+
+
+def parse_kls_lookback(raw: Any) -> tuple[int, int]:
+    if isinstance(raw, str):
+        text = raw.strip().lower()
+        if text.startswith("lookback_"):
+            text = text[len("lookback_") :]
+        parts = [item for item in re.split(r"[_x,/:]+", text) if item]
+    elif _is_kls_pair(raw):
+        parts = list(raw)
+    else:
+        raise ValueError("kls lookback must be a [short, long] or [long, short] pair")
+
+    if len(parts) != 2:
+        raise ValueError("kls lookback must contain exactly two half-life values")
+    first = _positive_int(parts[0], "kls lookback")
+    second = _positive_int(parts[1], "kls lookback")
+    if first == second:
+        raise ValueError("kls short and long half-lives must be different")
+    short, long = sorted((first, second))
+    return short, long
+
+
+def normalize_kls_lookback(raw: Any) -> str:
+    short, long = parse_kls_lookback(raw)
+    return f"{short}_{long}"
+
+
+def normalize_indicator_lookbacks(
+    indicator: str,
+    raw_lookbacks: Any,
+) -> list[LookbackValue]:
+    name = str(indicator).strip().lower()
+    if name not in SUPPORTED_INDICATORS:
+        raise ValueError(
+            f"unsupported intensity indicator: {indicator}, "
+            f"supported={SUPPORTED_INDICATORS}"
+        )
+
+    if name == "kls":
+        raw_items = [raw_lookbacks] if _is_kls_pair(raw_lookbacks) else ensure_list(raw_lookbacks)
+        lookbacks: list[LookbackValue] = []
+        for item in raw_items:
+            try:
+                lookbacks.append(normalize_kls_lookback(item))
+            except ValueError:
+                continue
+        if not lookbacks:
+            raise ValueError("indicator kls requires [short, long] half-life pairs")
+        return sorted(set(str(item) for item in lookbacks))
+
+    lookbacks: list[LookbackValue] = []
+    for item in ensure_list(raw_lookbacks):
+        if _is_kls_pair(item):
+            continue
+        if isinstance(item, str) and re.search(r"[_x,/:]", item.strip()):
+            continue
+        lookbacks.append(_positive_int(item, f"indicator {name} lookback"))
+    if not lookbacks:
+        raise ValueError(f"indicator {name} requires positive integer lookback list")
+    return sorted(set(lookbacks))
+
+
+def compute_kls(break_dist: pd.Series, lookback: LookbackValue) -> pd.Series:
+    short, long = parse_kls_lookback(lookback)
+    short_intensity = compute_k_decay(break_dist=break_dist, lookback=short)
+    long_intensity = compute_k_decay(break_dist=break_dist, lookback=long)
+    values = np.maximum(
+        short_intensity.to_numpy(dtype="float64", copy=False),
+        long_intensity.to_numpy(dtype="float64", copy=False),
+    )
+    return pd.Series(values, index=break_dist.index)
+
+
 def rolling_mean_excluding_zeros(values: pd.Series, lookback: int) -> pd.Series:
     if lookback <= 0:
         raise ValueError(f"lookback must be positive integer, got {lookback}")
@@ -309,7 +406,7 @@ def build_trade_intensity_frame(
     symbol: str,
     date: str,
     freq_ms: int,
-    lookback: int,
+    lookback: LookbackValue,
     indicator: str,
     ticker_cache_root: Path,
     trade_roots: Any,
@@ -484,6 +581,11 @@ def build_trade_intensity_frame(
             values=out["bucket_break_dist_max"],
             lookback=lookback,
         )
+    elif indicator == "kls":
+        out[INTENSITY_COLUMN] = compute_kls(
+            break_dist=out["bucket_break_dist_max"],
+            lookback=lookback,
+        )
     else:
         raise ValueError(f"unsupported intensity indicator: {indicator}")
 
@@ -609,10 +711,12 @@ def config_path(cfg: dict[str, Any], key: str, default: Path) -> Path:
     return config_paths(cfg, key, default=default)[0]
 
 
-def parse_indicator_lookbacks(intensity_cfg: dict[str, Any]) -> dict[str, list[int]]:
+def parse_indicator_lookbacks(
+    intensity_cfg: dict[str, Any],
+) -> dict[str, list[LookbackValue]]:
     indicators_raw = intensity_cfg.get("indicators")
     if isinstance(indicators_raw, dict) and indicators_raw:
-        indicator_lbs: dict[str, list[int]] = {}
+        indicator_lbs: dict[str, list[LookbackValue]] = {}
         for name, item in indicators_raw.items():
             key = str(name).strip().lower()
             if key not in SUPPORTED_INDICATORS:
@@ -624,22 +728,16 @@ def parse_indicator_lookbacks(intensity_cfg: dict[str, Any]) -> dict[str, list[i
                 raise ValueError(f"indicator config must be object: {name}")
             if not bool(item.get("enabled", True)):
                 continue
-            lookbacks = [int(x) for x in ensure_list(item.get("lookback", []))]
-            lookbacks = [x for x in lookbacks if x > 0]
-            if not lookbacks:
-                raise ValueError(f"indicator {name} requires positive lookback list")
-            indicator_lbs[key] = lookbacks
+            indicator_lbs[key] = normalize_indicator_lookbacks(
+                key,
+                item.get("lookback", []),
+            )
         return indicator_lbs
 
     indicators = [
         str(x).strip().lower()
         for x in ensure_list(intensity_cfg.get("indicator", intensity_cfg.get("indicators", "k")))
     ]
-    lookbacks = [int(x) for x in ensure_list(intensity_cfg.get("lookback", 60))]
-    lookbacks = [x for x in lookbacks if x > 0]
-    if not lookbacks:
-        raise ValueError("intensity.lookback requires positive values")
-
     indicator_lbs = {}
     for indicator in indicators:
         if indicator not in SUPPORTED_INDICATORS:
@@ -647,7 +745,10 @@ def parse_indicator_lookbacks(intensity_cfg: dict[str, Any]) -> dict[str, list[i
                 f"unsupported intensity indicator: {indicator}, "
                 f"supported={SUPPORTED_INDICATORS}"
             )
-        indicator_lbs[indicator] = lookbacks
+        indicator_lbs[indicator] = normalize_indicator_lookbacks(
+            indicator,
+            intensity_cfg.get("lookback", 60),
+        )
     return indicator_lbs
 
 
@@ -906,7 +1007,7 @@ def main() -> None:
     parser.add_argument("--freq", nargs="+", type=int, default=[1000])
     parser.add_argument("--scheme-shift", nargs="+", type=int)
     parser.add_argument("--indicators", nargs="+", choices=SUPPORTED_INDICATORS, default=["k"])
-    parser.add_argument("--lookback", nargs="+", type=int, default=[60])
+    parser.add_argument("--lookback", nargs="+", default=["60"])
     parser.add_argument("--ticker-cache-root")
     parser.add_argument("--bookticker-root")
     parser.add_argument("--bookticker-backup-root")

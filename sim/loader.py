@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 from sampler.instructor import instructor_output_path
-from sampler.intensity import intensity_output_path
+from sampler.intensity import intensity_output_path, normalize_kls_lookback
 from sampler.resample import normalize_scheme_shift
 from sampler.resample import output_path as sampled_ticker_path
 from sampler.resample import resolve_existing_input_path
@@ -377,7 +377,7 @@ class BinanceEventLoader:
         symbol: str,
         date: str,
         freq_ms: int,
-        spec: dict[str, int | str],
+        spec: dict[str, Any],
     ) -> pd.DataFrame:
         name, lookback = self._parse_spec(spec=spec, default_name="k")
         path = intensity_output_path(
@@ -411,7 +411,7 @@ class BinanceEventLoader:
         date: str,
         freq_ms: int,
         name: str,
-        lookback: int,
+        lookback: int | str,
     ) -> pd.DataFrame | None:
         if name not in ("kw_vol", "kw_vol_positive", "kw_vol_negative"):
             return None
@@ -451,7 +451,7 @@ class BinanceEventLoader:
         date: str,
         freq_ms: int,
         name: str,
-        lookback: int,
+        lookback: int | str,
     ) -> pd.DataFrame | None:
         path = intensity_output_path(
             root=self.cache_root,
@@ -662,16 +662,25 @@ class BinanceEventLoader:
         )
 
     @staticmethod
-    def _parse_spec(spec: dict[str, int | str], default_name: str) -> tuple[str, int]:
+    def _parse_spec(spec: dict[str, Any], default_name: str) -> tuple[str, int | str]:
         name = str(spec.get("name", default_name)).strip().lower()
         if not name:
             raise ValueError("indicator name must not be empty")
-        lookback = int(spec.get("lookback", 0))
+        raw_lookback = spec.get("lookback", 0)
         if name == "bbo_imbalance":
+            lookback = int(raw_lookback)
             if lookback != 0:
                 raise ValueError("bbo_imbalance lookback must be 0")
-        elif lookback <= 0:
-            raise ValueError(f"{name} lookback must be > 0")
+        elif name == "volume_zscore":
+            lookback = int(raw_lookback)
+            if lookback < 2:
+                raise ValueError("volume_zscore lookback must be >= 2")
+        elif name == "kls":
+            lookback = normalize_kls_lookback(raw_lookback)
+        else:
+            lookback = int(raw_lookback)
+            if lookback <= 0:
+                raise ValueError(f"{name} lookback must be > 0")
         return name, lookback
 
     @staticmethod
