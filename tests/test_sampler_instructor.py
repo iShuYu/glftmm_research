@@ -6,7 +6,7 @@ import pandas as pd
 
 from sampler.intensity import build_tasks as build_intensity_tasks
 from sampler.intensity import build_trade_intensity_frame
-from sampler.intensity import compute_k_decay, compute_kls
+from sampler.intensity import compute_k_decay_excluding_leading_zeros, compute_kls
 from sampler.intensity import intensity_output_path
 from sampler.instructor import (
     build_tasks as build_instructor_tasks,
@@ -26,19 +26,21 @@ from sim.loader import BinanceEventLoader
 
 
 class SamplerInstructorTest(unittest.TestCase):
-    def test_kls_uses_larger_short_and_long_decay(self):
+    def test_kls_uses_larger_short_and_long_decay_without_zero_decay(self):
         break_dist = pd.Series([0.0, 4.0, 0.0, 0.0, 1.0])
 
         actual = compute_kls(break_dist, [3, 1])
         expected = pd.concat(
             [
-                compute_k_decay(break_dist, 1),
-                compute_k_decay(break_dist, 3),
+                compute_k_decay_excluding_leading_zeros(break_dist, 1),
+                compute_k_decay_excluding_leading_zeros(break_dist, 3),
             ],
             axis=1,
         ).max(axis=1)
 
         self.assertEqual(actual.tolist(), expected.tolist())
+        self.assertEqual(actual.iloc[2], actual.iloc[1])
+        self.assertEqual(actual.iloc[3], actual.iloc[1])
 
     def test_trade_imbalance_uses_prior_buckets_only(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -290,7 +292,7 @@ class SamplerInstructorTest(unittest.TestCase):
 
             self.assertEqual(kls.columns.tolist(), ["timestamp", "intensity"])
             self.assertEqual(float(kls.loc[0, "intensity"]), 0.0)
-            self.assertEqual(float(kls.loc[1, "intensity"]), 1.0)
+            self.assertEqual(float(kls.loc[1, "intensity"]), 2.0)
 
     def test_kw_vol_weights_nonzero_break_bins_by_bucket_volume(self):
         with tempfile.TemporaryDirectory() as tmpdir:

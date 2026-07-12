@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import datetime as dt
 import math
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Literal, NamedTuple, TypeAlias
 
@@ -37,10 +36,6 @@ class AlphaEvent(NamedTuple):
     intensity_positive: float | None
     intensity_negative: float | None
     volatility_scalar: float
-    replay_bid_ticks: Any
-    replay_ask_ticks: Any
-    replay_bid_notional: Any
-    replay_ask_notional: Any
 
 
 MergedEventTuple: TypeAlias = TradeEvent | AlphaEvent
@@ -67,34 +62,6 @@ INTENSITY_COLUMN_ALIASES = {
 DEFAULT_CACHE_ROOT = Path("/data/users/kang/backtest/glftmm/cached")
 DEFAULT_DATA_ROOT = Path("/data/users/data-helper/PROCESSED/TARDIS/BINANCE/UFUTURES")
 DEFAULT_BACKUP_DATA_ROOT = Path("/home/kang/data_helper/PROCESSED/DATA_RECORDER/BINANCE/UFUTURES")
-DEFAULT_ORDERBOOK_REPLAY_ROOT = Path("/home/kang/data/wallmaker/cached")
-
-
-@dataclass(frozen=True)
-class OrderBookReplayConfig:
-    root: Path
-    replay_levels: int = 1000
-    sample_interval_ms: int = 1000
-    tick_size: float = 0.1
-    depth_price_min: float = 20_000.0
-    depth_price_max: float = 200_000.0
-    raw_quantity_max: float = 10_000.0
-
-
-@dataclass(frozen=True)
-class OrderBookReplayFrame:
-    timestamps: np.ndarray
-    bid_ticks: np.ndarray
-    ask_ticks: np.ndarray
-    bid_notional: np.ndarray
-    ask_notional: np.ndarray
-
-
-_ORDERBOOK_REPLAY_CACHE: dict[tuple[object, ...], OrderBookReplayFrame] = {}
-_ORDERBOOK_REPLAY_CACHE_ORDER: list[tuple[object, ...]] = []
-_ORDERBOOK_REPLAY_CACHE_MAX_DAYS = 1
-
-
 def normalize_date(value: DateLike) -> str:
     if isinstance(value, pd.Timestamp):
         return value.date().isoformat()
@@ -109,79 +76,6 @@ def normalize_date(value: DateLike) -> str:
     if len(text) == 8 and text.isdigit():
         return dt.datetime.strptime(text, "%Y%m%d").date().isoformat()
     return dt.date.fromisoformat(text).isoformat()
-
-
-def _path_safe_value(value: object) -> str:
-    if isinstance(value, bool):
-        text = "true" if value else "false"
-    elif isinstance(value, float):
-        text = f"{value:.12g}"
-    else:
-        text = str(value)
-    return text.replace("-", "m").replace("+", "").replace(".", "p")
-
-
-def parse_orderbook_replay_config(raw: dict[str, Any] | None) -> OrderBookReplayConfig:
-    if raw is None:
-        raise ValueError("orderbook_path config is required when optimize_by_orderbook is enabled")
-    if not isinstance(raw, dict):
-        raise ValueError("orderbook config must be an object")
-
-    replay_raw = raw.get("orderbook_replay", {})
-    if replay_raw is None:
-        replay_raw = {}
-    if not isinstance(replay_raw, dict):
-        raise ValueError("orderbook_replay config must be an object")
-
-    root_raw = raw.get("orderbook_path")
-    if root_raw in (None, "", []):
-        root_raw = replay_raw.get("root") or replay_raw.get("output_path") or replay_raw.get("cache_root")
-    if root_raw in (None, "", []):
-        raise ValueError("orderbook_path config is required when optimize_by_orderbook is enabled")
-
-    cfg = OrderBookReplayConfig(
-        root=Path(root_raw),
-        replay_levels=int(replay_raw.get("replay_levels", 1000)),
-        sample_interval_ms=int(replay_raw.get("sample_interval_ms", 1000)),
-        tick_size=float(replay_raw.get("tick_size", 0.1)),
-        depth_price_min=float(replay_raw.get("depth_price_min", 20_000.0)),
-        depth_price_max=float(replay_raw.get("depth_price_max", 200_000.0)),
-        raw_quantity_max=float(replay_raw.get("raw_quantity_max", 10_000.0)),
-    )
-    validate_orderbook_replay_config(cfg)
-    return cfg
-
-
-def validate_orderbook_replay_config(cfg: OrderBookReplayConfig) -> None:
-    if cfg.replay_levels < 1:
-        raise ValueError("orderbook_replay.replay_levels must be >= 1")
-    if cfg.sample_interval_ms < 1:
-        raise ValueError("orderbook_replay.sample_interval_ms must be >= 1")
-    if cfg.tick_size <= 0.0:
-        raise ValueError("orderbook_replay.tick_size must be > 0")
-    if cfg.depth_price_max <= cfg.depth_price_min:
-        raise ValueError("orderbook_replay.depth_price_max must be > depth_price_min")
-    if cfg.raw_quantity_max <= 0.0:
-        raise ValueError("orderbook_replay.raw_quantity_max must be > 0")
-
-
-def orderbook_replay_path(
-    root: Path,
-    symbol: str,
-    date_str: str,
-    cfg: OrderBookReplayConfig,
-) -> Path:
-    path = root / "ORDERBOOK_REPLAY" / "depth_update" / symbol
-    for name in (
-        "replay_levels",
-        "sample_interval_ms",
-        "tick_size",
-        "depth_price_min",
-        "depth_price_max",
-        "raw_quantity_max",
-    ):
-        path = path / f"{name}-{_path_safe_value(getattr(cfg, name))}"
-    return path / f"{date_str}.parquet"
 
 
 class BinanceEventLoader:
@@ -201,7 +95,6 @@ class BinanceEventLoader:
         trade_roots: Iterable[str | Path] | None = None,
         trade_category: str | None = None,
         scheme_shift: int = 0,
-        orderbook_replay_config: OrderBookReplayConfig | dict[str, Any] | None = None,
     ) -> None:
         category = str(trade_category or "TRADE").strip().upper()
         if not category:
@@ -221,12 +114,6 @@ class BinanceEventLoader:
         else:
             roots = (DEFAULT_DATA_ROOT / category, DEFAULT_BACKUP_DATA_ROOT / category)
         self.trade_roots = roots
-        if isinstance(orderbook_replay_config, OrderBookReplayConfig):
-            self.orderbook_replay_config = orderbook_replay_config
-        elif orderbook_replay_config is None:
-            self.orderbook_replay_config = None
-        else:
-            self.orderbook_replay_config = parse_orderbook_replay_config(orderbook_replay_config)
 
     def iter_merged_alpha_trade_tuples(
         self,
@@ -251,17 +138,8 @@ class BinanceEventLoader:
             volatility_specs=volatility_specs,
             instructor_spec=instructor_spec,
         )
-        replay = self._read_orderbook_replay_frame(symbol=symbol, date=date_str)
-        if replay is not None:
-            alpha_ts = alpha["timestamp"].to_numpy(dtype="int64", copy=False)
-            replay = self._align_orderbook_replay_frame(
-                symbol=symbol,
-                date=date_str,
-                alpha_timestamps=alpha_ts,
-                replay=replay,
-            )
         trades = self._read_trade_frame(symbol=symbol, date=date_str)
-        yield from self._merge_sorted(alpha=alpha, trades=trades, replay=replay)
+        yield from self._merge_sorted(alpha=alpha, trades=trades)
 
     def _read_alpha_frame(
         self,
@@ -560,107 +438,6 @@ class BinanceEventLoader:
             ignore_index=True,
         )
 
-    def _read_orderbook_replay_frame(
-        self,
-        symbol: str,
-        date: str,
-    ) -> OrderBookReplayFrame | None:
-        cfg = self.orderbook_replay_config
-        if cfg is None:
-            return None
-
-        key = (
-            str(cfg.root),
-            symbol,
-            date,
-            cfg.replay_levels,
-            cfg.sample_interval_ms,
-            cfg.tick_size,
-            cfg.depth_price_min,
-            cfg.depth_price_max,
-            cfg.raw_quantity_max,
-        )
-        cached = _ORDERBOOK_REPLAY_CACHE.get(key)
-        if cached is not None:
-            return cached
-
-        path = orderbook_replay_path(root=cfg.root, symbol=symbol, date_str=date, cfg=cfg)
-        if not path.exists():
-            raise FileNotFoundError(f"missing orderbook replay snapshot: {path}")
-
-        columns = ["timestamp"]
-        for side in ("bid", "ask"):
-            for idx in range(cfg.replay_levels):
-                columns.append(f"{side}_price_{idx}")
-                columns.append(f"{side}_qty_{idx}")
-        frame = pd.read_parquet(path, columns=columns)
-        missing = set(columns) - set(frame.columns)
-        if missing:
-            raise ValueError(f"orderbook replay frame missing columns: {sorted(missing)}")
-
-        timestamps = frame["timestamp"].astype("int64").to_numpy(copy=True)
-
-        def read_side(side: str) -> tuple[np.ndarray, np.ndarray]:
-            price_cols = [f"{side}_price_{idx}" for idx in range(cfg.replay_levels)]
-            qty_cols = [f"{side}_qty_{idx}" for idx in range(cfg.replay_levels)]
-            prices = frame.loc[:, price_cols].to_numpy(dtype="float64", copy=False)
-            qtys = frame.loc[:, qty_cols].to_numpy(dtype="float64", copy=False)
-            valid = np.isfinite(prices) & np.isfinite(qtys) & (prices > 0.0) & (qtys > 0.0)
-            raw_ticks = np.rint(prices / cfg.tick_size)
-            ticks = np.where(valid, raw_ticks, -1).astype(np.int32, copy=False)
-            notional = np.where(valid, prices * qtys, 0.0).astype(np.float32, copy=False)
-            return np.ascontiguousarray(ticks), np.ascontiguousarray(notional)
-
-        bid_ticks, bid_notional = read_side("bid")
-        ask_ticks, ask_notional = read_side("ask")
-
-        replay = OrderBookReplayFrame(
-            timestamps=timestamps,
-            bid_ticks=bid_ticks,
-            ask_ticks=ask_ticks,
-            bid_notional=bid_notional,
-            ask_notional=ask_notional,
-        )
-        _ORDERBOOK_REPLAY_CACHE[key] = replay
-        _ORDERBOOK_REPLAY_CACHE_ORDER.append(key)
-        while len(_ORDERBOOK_REPLAY_CACHE_ORDER) > _ORDERBOOK_REPLAY_CACHE_MAX_DAYS:
-            old_key = _ORDERBOOK_REPLAY_CACHE_ORDER.pop(0)
-            if old_key != key:
-                _ORDERBOOK_REPLAY_CACHE.pop(old_key, None)
-        return replay
-
-    @staticmethod
-    def _align_orderbook_replay_frame(
-        *,
-        symbol: str,
-        date: str,
-        alpha_timestamps: np.ndarray,
-        replay: OrderBookReplayFrame,
-    ) -> OrderBookReplayFrame:
-        if len(alpha_timestamps) == len(replay.timestamps) and np.array_equal(
-            alpha_timestamps,
-            replay.timestamps,
-        ):
-            return replay
-
-        indices = np.searchsorted(replay.timestamps, alpha_timestamps)
-        if (
-            indices.shape[0] != alpha_timestamps.shape[0]
-            or np.any(indices >= len(replay.timestamps))
-            or not np.array_equal(replay.timestamps[indices], alpha_timestamps)
-        ):
-            raise ValueError(
-                "orderbook replay timestamp grid does not match sampled ticker "
-                f"for {symbol} {date}"
-            )
-        return OrderBookReplayFrame(
-            timestamps=np.array(alpha_timestamps, dtype=np.int64, copy=True),
-            bid_ticks=np.ascontiguousarray(replay.bid_ticks[indices]),
-            ask_ticks=np.ascontiguousarray(replay.ask_ticks[indices]),
-            bid_notional=np.ascontiguousarray(replay.bid_notional[indices]),
-            ask_notional=np.ascontiguousarray(replay.ask_notional[indices]),
-        )
-
     @staticmethod
     def _parse_spec(spec: dict[str, Any], default_name: str) -> tuple[str, int | str]:
         name = str(spec.get("name", default_name)).strip().lower()
@@ -687,7 +464,6 @@ class BinanceEventLoader:
     def _merge_sorted(
         alpha: pd.DataFrame,
         trades: pd.DataFrame,
-        replay: OrderBookReplayFrame | None = None,
     ) -> Iterator[MergedEventTuple]:
         alpha_iter = iter(
             alpha.loc[
@@ -711,7 +487,6 @@ class BinanceEventLoader:
         )
 
         alpha_row = next(alpha_iter, None)
-        alpha_idx = 0
         trade_row = next(trade_iter, None)
 
         while alpha_row is not None or trade_row is not None:
@@ -739,10 +514,6 @@ class BinanceEventLoader:
                 float(alpha_row[5]) if math.isfinite(float(alpha_row[5])) else 0.0
             )
             volatility = float(alpha_row[6]) if math.isfinite(float(alpha_row[6])) else 0.0
-            bid_replay_ticks = None if replay is None else replay.bid_ticks[alpha_idx]
-            ask_replay_ticks = None if replay is None else replay.ask_ticks[alpha_idx]
-            bid_replay_notional = None if replay is None else replay.bid_notional[alpha_idx]
-            ask_replay_notional = None if replay is None else replay.ask_notional[alpha_idx]
             yield AlphaEvent(
                 kind="ticker",
                 timestamp=int(alpha_row[0]),
@@ -752,10 +523,5 @@ class BinanceEventLoader:
                 intensity_positive=intensity_positive,
                 intensity_negative=intensity_negative,
                 volatility_scalar=volatility,
-                replay_bid_ticks=bid_replay_ticks,
-                replay_ask_ticks=ask_replay_ticks,
-                replay_bid_notional=bid_replay_notional,
-                replay_ask_notional=ask_replay_notional,
             )
             alpha_row = next(alpha_iter, None)
-            alpha_idx += 1

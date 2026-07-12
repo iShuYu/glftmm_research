@@ -16,7 +16,7 @@ from typing import Any
 import pandas as pd
 
 from sampler.intensity import normalize_indicator_lookbacks
-from sim.loader import BinanceEventLoader, parse_orderbook_replay_config
+from sim.loader import BinanceEventLoader
 from sim.strategy import (
     SimulationConfig,
     SimpleMakerStrategy,
@@ -68,7 +68,6 @@ PARAM_KEY_ALIAS = {
     "adj_spread_intensity": "asi",
     "adj_spread_instructor": "asir",
     "passive_only": "po",
-    "optimize_by_orderbook": "obo",
     "adj_spread_volatility": "asv",
     "min_quote_distance_bps": "mqdb",
     "inventory_skew": "isk",
@@ -101,7 +100,6 @@ SIM_OPTIONAL_KEYS = (
     "adj_spread_intensity",
     "adj_spread_instructor",
     "passive_only",
-    "optimize_by_orderbook",
     "adj_spread_volatility",
     "min_quote_distance_bps",
     "inventory_skew",
@@ -318,18 +316,6 @@ def _parse_bool(raw: Any, key: str) -> bool:
     raise ValueError(f"simulation.{key} must be boolean")
 
 
-def _parse_orderbook_optimizer_threshold(raw: Any) -> float:
-    if isinstance(raw, bool):
-        raise ValueError("simulation.optimize_by_orderbook must be -1, 0, or a notional threshold")
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        raise ValueError("simulation.optimize_by_orderbook must be -1, 0, or a notional threshold") from None
-    if not math.isfinite(value) or (value < 0.0 and abs(value + 1.0) > 1e-12):
-        raise ValueError("simulation.optimize_by_orderbook must be -1, 0, or a notional threshold")
-    return value
-
-
 def _safe_dir_segment(prefix: str, body: str) -> str:
     segment = f"{prefix}{body}" if body else f"{prefix}none"
     if len(segment) <= MAX_DIR_SEGMENT_LEN:
@@ -484,12 +470,6 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
     if "toxic_lock" in sim_raw:
         sim_map["toxic_lock"] = _normalize_toxic_lock_rows(sim_raw["toxic_lock"])
 
-    if "optimize_by_orderbook" in sim_map:
-        sim_map["optimize_by_orderbook"] = [
-            _parse_orderbook_optimizer_threshold(row)
-            for row in sim_map["optimize_by_orderbook"]
-        ]
-
     if "min_quote_distance_bps" in sim_map:
         sim_map["min_quote_distance_bps"] = [
             _normalize_non_negative_scalar(row, "min_quote_distance_bps")
@@ -546,6 +526,8 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
 
 
 def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
+    if "optimize_by_orderbook" in raw:
+        raise ValueError("simulation.optimize_by_orderbook has been removed")
     if "cooldown_time" in raw:
         raise ValueError(
             "simulation.cooldown_time has been replaced by simulation.toxic_lock"
@@ -669,9 +651,6 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
         adj_spread_intensity=adj_spread_intensity,
         adj_spread_instructor=float(raw.get("adj_spread_instructor", 0.0)),
         passive_only=_parse_bool(raw.get("passive_only", False), "passive_only"),
-        optimize_by_orderbook=_parse_orderbook_optimizer_threshold(
-            raw.get("optimize_by_orderbook", -1)
-        ),
         adj_spread_volatility=raw.get("adj_spread_volatility", [0.0, 0.0]),
         min_quote_distance_bps=_normalize_non_negative_scalar(
             raw.get("min_quote_distance_bps", 0.0),
@@ -745,11 +724,7 @@ def _output_dir_from_cfg(cfg: dict[str, Any]) -> str:
     return out_dir
 
 
-def _build_loader(
-    cfg: dict[str, Any],
-    simulation: SimulationConfig | None = None,
-    require_volatility_cache: bool = False,
-) -> BinanceEventLoader:
+def _build_loader(cfg: dict[str, Any]) -> BinanceEventLoader:
     paths = _config_paths(cfg)
     sampler_output_root = _path_value(paths, "output_path", required=True)
     assert sampler_output_root is not None
@@ -758,27 +733,11 @@ def _build_loader(
         paths,
         category=trade_category,
     )
-    orderbook_replay_config = None
-    if simulation is not None and float(simulation.optimize_by_orderbook) >= 0.0:
-        orderbook_replay_config = parse_orderbook_replay_config(cfg)
-        if abs(float(orderbook_replay_config.tick_size) - float(simulation.tick_size)) > 1e-12:
-            raise ValueError(
-                "orderbook_replay.tick_size must match simulation tick size "
-                f"({orderbook_replay_config.tick_size} != {simulation.tick_size})"
-            )
-        replay_interval_ms = int(orderbook_replay_config.sample_interval_ms)
-        sim_freq_ms = int(simulation.freq)
-        if replay_interval_ms > sim_freq_ms or sim_freq_ms % replay_interval_ms != 0:
-            raise ValueError(
-                "orderbook_replay.sample_interval_ms must divide simulation.freq "
-                f"and be no larger than it ({replay_interval_ms} vs {sim_freq_ms})"
-            )
     return BinanceEventLoader(
         trade_roots=trade_roots,
         cache_root=sampler_output_root,
         trade_category=trade_category,
         scheme_shift=int(paths.get("scheme_shift", 0)),
-        orderbook_replay_config=orderbook_replay_config,
     )
 
 
@@ -1193,11 +1152,7 @@ def _run_strategy_task(task: Task) -> dict[str, Any]:
     out_root = _output_dir_from_cfg(cfg)
 
     simulation = _build_simulation_config(task.sim_params)
-    loader = _build_loader(
-        cfg=cfg,
-        simulation=simulation,
-        require_volatility_cache=simulation.name_volatility is not None,
-    )
+    loader = _build_loader(cfg=cfg)
 
     sim_dir, strat_dir = build_param_path_parts(task.sim_params)
     out_dir = os.path.join(out_root, task.symbol, sim_dir, strat_dir)

@@ -264,6 +264,41 @@ def compute_k_decay(break_dist: pd.Series, lookback: int) -> pd.Series:
     return pd.Series(intensity, index=break_dist.index)
 
 
+def compute_k_decay_excluding_leading_zeros(
+    break_dist: pd.Series,
+    lookback: int,
+) -> pd.Series:
+    """Compute a half-life EWMA that advances only on observed breakouts.
+
+    Zero buckets mean no new breakout observation, rather than an observed
+    zero-intensity sample. Before the first breakout the curve remains zero.
+    Afterwards, zero buckets carry the latest intensity forward; only a
+    nonzero breakout advances the short/long half-life EWMA.
+    """
+    if lookback <= 0:
+        raise ValueError(f"lookback must be positive integer, got {lookback}")
+
+    values = np.abs(break_dist.to_numpy(dtype="float64", copy=False))
+    intensity = np.zeros(len(values), dtype="float64")
+    nonzero_indices = np.flatnonzero(values > 0.0)
+    if len(nonzero_indices) == 0:
+        return pd.Series(intensity, index=break_dist.index)
+
+    carry = 0.5 ** (1.0 / lookback)
+    alpha = 1.0 - carry
+    first_nonzero = int(nonzero_indices[0])
+    prev = float(values[first_nonzero])
+    intensity[first_nonzero] = prev
+
+    for idx in range(first_nonzero + 1, len(values)):
+        value = float(values[idx])
+        if value > 0.0:
+            prev = alpha * value + carry * prev
+        intensity[idx] = prev
+
+    return pd.Series(intensity, index=break_dist.index)
+
+
 def _positive_int(value: Any, label: str) -> int:
     try:
         out = int(value)
@@ -349,8 +384,14 @@ def normalize_indicator_lookbacks(
 
 def compute_kls(break_dist: pd.Series, lookback: LookbackValue) -> pd.Series:
     short, long = parse_kls_lookback(lookback)
-    short_intensity = compute_k_decay(break_dist=break_dist, lookback=short)
-    long_intensity = compute_k_decay(break_dist=break_dist, lookback=long)
+    short_intensity = compute_k_decay_excluding_leading_zeros(
+        break_dist=break_dist,
+        lookback=short,
+    )
+    long_intensity = compute_k_decay_excluding_leading_zeros(
+        break_dist=break_dist,
+        lookback=long,
+    )
     values = np.maximum(
         short_intensity.to_numpy(dtype="float64", copy=False),
         long_intensity.to_numpy(dtype="float64", copy=False),

@@ -9,8 +9,8 @@
   "scheme_shift": [0],
   "name_instructor": ["trade_imbalance"],
   "lookback_instructor": [1, 5, 10, 30],
-  "name_intensity": ["kw_vol"],
-  "lookback_intensity": [300, 600],
+  "name_intensity": ["kw_vol", "kls"],
+  "lookback_intensity": [300, 600, [12, 120]],
   "name_volatility": ["sigma"],
   "lookback_volatility": [300, 600],
  

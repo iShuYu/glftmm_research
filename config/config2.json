@@ -12,15 +12,6 @@
     "trade_category": "TRADE",
     "scheme_shift": 0
   },
-  "orderbook_path": "/home/kang/data/wallmaker/cached",
-  "orderbook_replay": {
-    "replay_levels": 1000,
-    "sample_interval_ms": 1000,
-    "tick_size": 0.1,
-    "depth_price_min": 20000.0,
-    "depth_price_max": 200000.0,
-    "raw_quantity_max": 10000.0
-  },
   "simulation": {
     "mode": [
       1,
@@ -120,9 +111,6 @@
     ],
     "passive_only": [
       true
-    ],
-    "optimize_by_orderbook": [
-      -1
     ],
     "inventory_skew": [
       [

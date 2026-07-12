@@ -5,7 +5,6 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Sequence
 
-import numpy as np
 import pandas as pd
 
 from core.manager import Manager as ValidatedManager
@@ -112,7 +111,6 @@ class SimulationConfig:
     adj_spread_intensity: float | tuple[float, float] = 1.0
     adj_spread_instructor: float = 0.0
     passive_only: bool = False
-    optimize_by_orderbook: float = -1.0
     adj_spread_volatility: float | tuple[float, float] = 0.0
     min_quote_distance_bps: float = 0.0
     inventory_skew: Optional[tuple[float, float]] = None
@@ -221,16 +219,6 @@ class SimulationConfig:
             raise ValueError("adj_spread_instructor must be finite")
         if not isinstance(self.passive_only, bool):
             raise ValueError("passive_only must be boolean")
-        try:
-            optimize_by_orderbook = float(self.optimize_by_orderbook)
-        except (TypeError, ValueError):
-            raise ValueError("optimize_by_orderbook must be -1, 0, or a notional threshold") from None
-        if (
-            not math.isfinite(optimize_by_orderbook)
-            or (optimize_by_orderbook < 0.0 and abs(optimize_by_orderbook + 1.0) > 1e-12)
-        ):
-            raise ValueError("optimize_by_orderbook must be -1, 0, or a notional threshold")
-        object.__setattr__(self, "optimize_by_orderbook", optimize_by_orderbook)
         object.__setattr__(
             self,
             "adj_spread_volatility",
@@ -401,10 +389,6 @@ class SimpleMakerStrategy:
         self._toxic_lock_mid_moves: deque[int] = self._new_toxic_lock_mid_moves()
         self._phase_best_mid: Optional[float] = None
         self._phase_side: int = 0
-        self._open_liquidity_snap_adjusted: int = 0
-        self._open_liquidity_snap_cancelled: int = 0
-        self._open_liquidity_snap_moved_ticks: int = 0
-        self._open_liquidity_snap_max_move_ticks: int = 0
 
     def snapshot_state(self) -> dict:
         pos = self.manager.position
@@ -440,10 +424,6 @@ class SimpleMakerStrategy:
             "toxic_lock_active": self._toxic_lock_active(),
             "phase_best_mid": self._phase_best_mid,
             "phase_side": int(self._phase_side),
-            "open_liquidity_snap_adjusted": int(self._open_liquidity_snap_adjusted),
-            "open_liquidity_snap_cancelled": int(self._open_liquidity_snap_cancelled),
-            "open_liquidity_snap_moved_ticks": int(self._open_liquidity_snap_moved_ticks),
-            "open_liquidity_snap_max_move_ticks": int(self._open_liquidity_snap_max_move_ticks),
             "pending_maker_quotes": [
                 {
                     "active_ts": int(active_ts),
@@ -533,18 +513,6 @@ class SimpleMakerStrategy:
             None if phase_best_mid_raw is None else float(phase_best_mid_raw)
         )
         self._phase_side = int(state.get("phase_side", 0))
-        self._open_liquidity_snap_adjusted = int(
-            state.get("open_liquidity_snap_adjusted", 0)
-        )
-        self._open_liquidity_snap_cancelled = int(
-            state.get("open_liquidity_snap_cancelled", 0)
-        )
-        self._open_liquidity_snap_moved_ticks = int(
-            state.get("open_liquidity_snap_moved_ticks", 0)
-        )
-        self._open_liquidity_snap_max_move_ticks = int(
-            state.get("open_liquidity_snap_max_move_ticks", 0)
-        )
         self._pending_maker_quotes = deque()
         self._pending_simple_maker_quotes = deque()
         pending_quotes = state.get("pending_maker_quotes", [])
@@ -616,7 +584,6 @@ class SimpleMakerStrategy:
 
     def run_day(self, symbol: str, date: DateLike) -> pd.DataFrame:
         self._records = []
-        self._reset_open_liquidity_snap_stats()
         vol_specs = self._selected_volatility_specs()
         ti_spec = self._selected_intensity_spec()
         instructor_spec = self._selected_instructor_spec()
@@ -644,26 +611,14 @@ class SimpleMakerStrategy:
                     intensity_positive = event.intensity_positive
                     intensity_negative = event.intensity_negative
                     volatility_scalar = float(event.volatility_scalar)
-                    replay_bid_ticks = event.replay_bid_ticks
-                    replay_ask_ticks = event.replay_ask_ticks
-                    replay_bid_notional = event.replay_bid_notional
-                    replay_ask_notional = event.replay_ask_notional
-                elif len(event) >= 12:
+                elif len(event) >= 8:
                     intensity_positive = event[5]
                     intensity_negative = event[6]
                     volatility_scalar = float(event[7])
-                    replay_bid_ticks = event[8] if len(event) > 8 else None
-                    replay_ask_ticks = event[9] if len(event) > 9 else None
-                    replay_bid_notional = event[10] if len(event) > 10 else None
-                    replay_ask_notional = event[11] if len(event) > 11 else None
                 else:
                     intensity_positive = event[5]
                     intensity_negative = event[5]
                     volatility_scalar = float(event[6])
-                    replay_bid_ticks = event[7] if len(event) > 7 else None
-                    replay_ask_ticks = event[8] if len(event) > 8 else None
-                    replay_bid_notional = event[9] if len(event) > 9 else None
-                    replay_ask_notional = event[10] if len(event) > 10 else None
                 self._on_ticker_event(
                     timestamp=ts,
                     best_bid=float(event[2]),
@@ -672,10 +627,6 @@ class SimpleMakerStrategy:
                     intensity_positive=intensity_positive,
                     intensity_negative=intensity_negative,
                     volatility_scalar=volatility_scalar,
-                    replay_bid_ticks=replay_bid_ticks,
-                    replay_ask_ticks=replay_ask_ticks,
-                    replay_bid_notional=replay_bid_notional,
-                    replay_ask_notional=replay_ask_notional,
                 )
         return pd.DataFrame(
             self._records,
@@ -845,10 +796,6 @@ class SimpleMakerStrategy:
         intensity_value: Optional[float] = None,
         volatility_scalar: float = 0.0,
         instructor_value: Optional[float] = None,
-        replay_bid_ticks: object = None,
-        replay_ask_ticks: object = None,
-        replay_bid_notional: object = None,
-        replay_ask_notional: object = None,
         intensity_positive: Optional[float] = None,
         intensity_negative: Optional[float] = None,
     ) -> None:
@@ -1000,22 +947,6 @@ class SimpleMakerStrategy:
                 ask_qty_steps,
                 quote_bid_price_ticks,
                 bid_qty_steps,
-            ) = self._apply_open_liquidity_snap_steps(
-                ask_price_ticks=quote_ask_price_ticks,
-                ask_qty_steps=ask_qty_steps,
-                bid_price_ticks=quote_bid_price_ticks,
-                bid_qty_steps=bid_qty_steps,
-                close_only=quote_close_only,
-                replay_ask_ticks=replay_ask_ticks,
-                replay_bid_ticks=replay_bid_ticks,
-                replay_ask_notional=replay_ask_notional,
-                replay_bid_notional=replay_bid_notional,
-            )
-            (
-                quote_ask_price_ticks,
-                ask_qty_steps,
-                quote_bid_price_ticks,
-                bid_qty_steps,
             ) = self._clip_simple_quote_steps_to_bbo_distance(
                 ask_price_ticks=quote_ask_price_ticks,
                 ask_qty_steps=ask_qty_steps,
@@ -1060,15 +991,6 @@ class SimpleMakerStrategy:
                 ask_levels=ask_levels,
                 bid_levels=bid_levels,
                 close_only=quote_close_only,
-            )
-            ask_levels, bid_levels = self._apply_open_liquidity_snap(
-                ask_levels=ask_levels,
-                bid_levels=bid_levels,
-                close_only=quote_close_only,
-                replay_ask_ticks=replay_ask_ticks,
-                replay_bid_ticks=replay_bid_ticks,
-                replay_ask_notional=replay_ask_notional,
-                replay_bid_notional=replay_bid_notional,
             )
             ask_levels, bid_levels = self._clip_quote_levels_to_bbo_distance(
                 ask_levels=ask_levels,
@@ -1714,213 +1636,6 @@ class SimpleMakerStrategy:
             close_bid_price_ticks if bid_steps > 0 else None,
             bid_steps,
             bid_steps > 0,
-        )
-
-    def _reset_open_liquidity_snap_stats(self) -> None:
-        self._open_liquidity_snap_adjusted = 0
-        self._open_liquidity_snap_cancelled = 0
-        self._open_liquidity_snap_moved_ticks = 0
-        self._open_liquidity_snap_max_move_ticks = 0
-
-    def _apply_open_liquidity_snap_steps(
-        self,
-        *,
-        ask_price_ticks: Optional[int],
-        ask_qty_steps: int,
-        bid_price_ticks: Optional[int],
-        bid_qty_steps: int,
-        close_only: bool,
-        replay_ask_ticks: object,
-        replay_bid_ticks: object,
-        replay_ask_notional: object,
-        replay_bid_notional: object,
-    ) -> tuple[Optional[int], int, Optional[int], int]:
-        notional_threshold = float(self.cfg.optimize_by_orderbook)
-        if notional_threshold < 0.0 or close_only:
-            return ask_price_ticks, ask_qty_steps, bid_price_ticks, bid_qty_steps
-
-        pos_qty = float(self.manager.position.qty)
-        if pos_qty <= self.EPS:
-            ask_price_ticks, ask_qty_steps = self._snap_open_side_steps(
-                price_ticks=ask_price_ticks,
-                qty_steps=ask_qty_steps,
-                is_ask=True,
-                replay_ticks=replay_ask_ticks,
-                replay_notional=replay_ask_notional,
-                notional_threshold=notional_threshold,
-            )
-        if pos_qty >= -self.EPS:
-            bid_price_ticks, bid_qty_steps = self._snap_open_side_steps(
-                price_ticks=bid_price_ticks,
-                qty_steps=bid_qty_steps,
-                is_ask=False,
-                replay_ticks=replay_bid_ticks,
-                replay_notional=replay_bid_notional,
-                notional_threshold=notional_threshold,
-            )
-        return ask_price_ticks, ask_qty_steps, bid_price_ticks, bid_qty_steps
-
-    def _snap_open_side_steps(
-        self,
-        *,
-        price_ticks: Optional[int],
-        qty_steps: int,
-        is_ask: bool,
-        replay_ticks: object,
-        replay_notional: object,
-        notional_threshold: float,
-    ) -> tuple[Optional[int], int]:
-        if price_ticks is None or qty_steps <= 0:
-            return None, 0
-        if replay_ticks is None:
-            return price_ticks, qty_steps
-
-        target_tick = int(price_ticks)
-        snapped_tick = self._snap_open_price_tick(
-            target_tick=target_tick,
-            is_ask=is_ask,
-            replay_ticks=replay_ticks,
-            replay_notional=replay_notional,
-            notional_threshold=notional_threshold,
-        )
-        if snapped_tick is None:
-            self._open_liquidity_snap_cancelled += 1
-            return None, 0
-        if snapped_tick != target_tick:
-            self._record_open_liquidity_snap_move(target_tick=target_tick, snapped_tick=snapped_tick)
-        return int(snapped_tick), int(qty_steps)
-
-    def _apply_open_liquidity_snap(
-        self,
-        *,
-        ask_levels: Sequence[MakerLevel],
-        bid_levels: Sequence[MakerLevel],
-        close_only: bool,
-        replay_ask_ticks: object,
-        replay_bid_ticks: object,
-        replay_ask_notional: object,
-        replay_bid_notional: object,
-    ) -> tuple[list[MakerLevel], list[MakerLevel]]:
-        notional_threshold = float(self.cfg.optimize_by_orderbook)
-        if notional_threshold < 0.0 or close_only:
-            return list(ask_levels), list(bid_levels)
-
-        pos_qty = float(self.manager.position.qty)
-        adjusted_ask = (
-            self._snap_open_side_levels(
-                levels=ask_levels,
-                is_ask=True,
-                replay_ticks=replay_ask_ticks,
-                replay_notional=replay_ask_notional,
-                notional_threshold=notional_threshold,
-            )
-            if pos_qty <= self.EPS
-            else list(ask_levels)
-        )
-        adjusted_bid = (
-            self._snap_open_side_levels(
-                levels=bid_levels,
-                is_ask=False,
-                replay_ticks=replay_bid_ticks,
-                replay_notional=replay_bid_notional,
-                notional_threshold=notional_threshold,
-            )
-            if pos_qty >= -self.EPS
-            else list(bid_levels)
-        )
-        return adjusted_ask, adjusted_bid
-
-    def _snap_open_side_levels(
-        self,
-        *,
-        levels: Sequence[MakerLevel],
-        is_ask: bool,
-        replay_ticks: object,
-        replay_notional: object,
-        notional_threshold: float,
-    ) -> list[MakerLevel]:
-        if not levels:
-            return []
-        if replay_ticks is None:
-            return list(levels)
-
-        adjusted: list[MakerLevel] = []
-        for price, qty in levels:
-            price = float(price)
-            qty = float(qty)
-            if qty <= self.EPS:
-                continue
-            target_tick = self.manager.converter.to_ticks(price)
-            snapped_tick = self._snap_open_price_tick(
-                target_tick=target_tick,
-                is_ask=is_ask,
-                replay_ticks=replay_ticks,
-                replay_notional=replay_notional,
-                notional_threshold=notional_threshold,
-            )
-            if snapped_tick is None:
-                self._open_liquidity_snap_cancelled += 1
-                continue
-            if snapped_tick != target_tick:
-                self._record_open_liquidity_snap_move(
-                    target_tick=target_tick,
-                    snapped_tick=snapped_tick,
-                )
-                price = self._round_to_precision(
-                    self.manager.converter.from_ticks(int(snapped_tick)),
-                    self.sim.price_precision,
-                )
-            adjusted.append((price, qty))
-        return adjusted
-
-    def _snap_open_price_tick(
-        self,
-        *,
-        target_tick: int,
-        is_ask: bool,
-        replay_ticks: object,
-        replay_notional: object,
-        notional_threshold: float,
-    ) -> int | None:
-        ticks = np.asarray(replay_ticks)
-        if ticks.ndim != 1:
-            ticks = ticks.reshape(-1)
-        valid = ticks > 0
-        if notional_threshold > 0.0:
-            if replay_notional is None:
-                return None
-            notionals = np.asarray(replay_notional)
-            if notionals.ndim != 1:
-                notionals = notionals.reshape(-1)
-            if notionals.shape[0] != ticks.shape[0]:
-                return None
-            valid = valid & (notionals > notional_threshold)
-        ticks = ticks[valid]
-        if ticks.size == 0:
-            return None
-        if bool(np.any(ticks == int(target_tick))):
-            return int(target_tick)
-
-        if is_ask:
-            candidates = ticks[ticks > int(target_tick)]
-            if candidates.size == 0:
-                return None
-            snapped = int(candidates[0]) - 1
-            return snapped if snapped > 0 else None
-
-        candidates = ticks[ticks < int(target_tick)]
-        if candidates.size == 0:
-            return None
-        snapped = int(candidates[0]) + 1
-        return snapped if snapped > 0 else None
-
-    def _record_open_liquidity_snap_move(self, *, target_tick: int, snapped_tick: int) -> None:
-        moved_ticks = abs(int(snapped_tick) - int(target_tick))
-        self._open_liquidity_snap_adjusted += 1
-        self._open_liquidity_snap_moved_ticks += moved_ticks
-        self._open_liquidity_snap_max_move_ticks = max(
-            self._open_liquidity_snap_max_move_ticks,
-            moved_ticks,
         )
 
     def _quote_distance(
