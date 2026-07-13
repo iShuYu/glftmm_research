@@ -5,10 +5,12 @@
   "date_start": "2025-01-02",
   "date_end": "2026-05-31",
   "paths": {
-    "input_path": "/data/users/data-helper/PROCESSED/TARDIS/BINANCE/UFUTURES",
-    "input_backup_path": "/home/kang/data_helper/PROCESSED/DATA_RECORDER/BINANCE/UFUTURES",
-    "output_path": "/data/users/kang/backtest/glftmm/cached",
-    "output_dir": "/data/users/kang/backtest/glftmm/result",
+    "root_path": "/data/users/data-helper",
+    "user_path": "/data/users/kang",
+    "input_path": "PROCESSED/TARDIS/BINANCE/UFUTURES",
+    "input_backup_path": "PROCESSED/TARDIS/BINANCE/UFUTURES",
+    "output_path": "backtest/glftmm/cached",
+    "output_dir": "backtest/glftmm/result",
     "trade_category": "TRADE",
     "scheme_shift": 0,
     "simple_mode": [

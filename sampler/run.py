@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,10 +78,28 @@ def resolve_category_roots(
     return unique_paths(roots)
 
 
+def _resolve_root(cfg: dict[str, Any], key: str) -> Path:
+    value = str(require_non_empty(cfg, key))
+    if not os.path.isabs(value):
+        base = cfg.get("root_path" if key in ("input_path", "input_backup_path") else "user_path", "")
+        value = os.path.join(str(base), value)
+    return Path(value)
+
+
+def _resolve_root_optional(cfg: dict[str, Any], key: str) -> Path | None:
+    value = cfg.get(key)
+    if value in (None, "", []):
+        return None
+    value = str(value)
+    if not os.path.isabs(value):
+        base = cfg.get("root_path" if key in ("input_path", "input_backup_path") else "user_path", "")
+        value = os.path.join(str(base), value)
+    return Path(value)
+
+
 def resolve_input_paths(cfg: dict[str, Any]) -> InputPaths:
-    input_root = Path(require_non_empty(cfg, "input_path"))
-    raw_backup_root = cfg.get("input_backup_path")
-    backup_root = None if raw_backup_root in (None, "", []) else Path(raw_backup_root)
+    input_root = _resolve_root(cfg, "input_path")
+    backup_root = _resolve_root_optional(cfg, "input_backup_path")
 
     ticker_category = normalize_category(cfg.get("ticker_category"), "BOOKTICKER")
     trade_category = normalize_category(cfg.get("trade_category"), "TRADE")
@@ -167,7 +186,7 @@ def build_stage_configs(
     common = common_dates_and_symbols(cfg)
     input_paths = resolve_input_paths(cfg)
 
-    output_root = Path(require_non_empty(cfg, "output_path"))
+    output_root = Path(_resolve_root(cfg, "output_path"))
 
     freqs = [int(freq) for freq in ensure_list(require_non_empty(cfg, "freq_ms"))]
     if not freqs:

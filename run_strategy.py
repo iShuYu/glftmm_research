@@ -699,7 +699,18 @@ def _config_paths(cfg: dict[str, Any]) -> dict[str, Any]:
     paths = cfg.get("paths")
     if not isinstance(paths, dict):
         raise ValueError("config requires paths object")
-    return dict(paths)
+    paths = dict(paths)
+    root_path = paths.get("root_path", "")
+    user_path = paths.get("user_path", "")
+    for key in ("input_path", "input_backup_path"):
+        val = paths.get(key)
+        if val and not os.path.isabs(str(val)):
+            paths[key] = os.path.join(root_path, str(val))
+    for key in ("output_path", "output_dir"):
+        val = paths.get(key)
+        if val and not os.path.isabs(str(val)):
+            paths[key] = os.path.join(user_path, str(val))
+    return paths
 
 
 def _normalize_category(value: Any, default: str) -> str:
