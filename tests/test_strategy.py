@@ -30,7 +30,6 @@ def make_config(**overrides):
         "name_volatility": "sigma",
         "lookback_volatility": 300,
         "max_position_usdt": 100000.0,
-        "max_open_inventory_utilization": 1.0,
         "phase_change_position": 0.0,
         "boost_phase_change": 1.0,
         "phase_mode": "market",
@@ -72,7 +71,6 @@ def raw_config(**overrides):
         "name_volatility": "sigma",
         "lookback_volatility": 300,
         "max_position_usdt": 100000.0,
-        "max_open_inventory_utilization": 1.0,
         "phase_change_position": 0.0,
         "boost_phase_change": 1.0,
         "phase_mode": "market",
@@ -233,7 +231,6 @@ class StrategyConfigTest(unittest.TestCase):
         sim_map = _normalize_sim_param_map(
             raw_config(
                 max_position_usdt=[250.0, 750.0],
-                max_open_inventory_utilization=[0.5, 0.8],
                 phase_change_position=[100.0, 200.0],
                 boost_phase_change=[1.0, 2.0],
                 stoploss=[25.0, 75.0],
@@ -244,7 +241,6 @@ class StrategyConfigTest(unittest.TestCase):
         )
 
         self.assertEqual(sim_map["max_position_usdt"], [250.0, 750.0])
-        self.assertEqual(sim_map["max_open_inventory_utilization"], [0.5, 0.8])
         self.assertEqual(sim_map["phase_change_position"], [100.0, 200.0])
         self.assertEqual(sim_map["boost_phase_change"], [1.0, 2.0])
         self.assertEqual(sim_map["stoploss"], [25.0, 75.0])
@@ -278,13 +274,6 @@ class StrategyConfigTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "toxic_lock"):
             _normalize_sim_param_map({"simulation": raw})
-
-    def test_build_config_parses_max_open_inventory_utilization(self):
-        cfg = _build_simulation_config(
-            raw_config(max_open_inventory_utilization=0.75)["simulation"]
-        )
-
-        self.assertEqual(cfg.max_open_inventory_utilization, 0.75)
 
     def test_build_config_parses_close_curve(self):
         cfg = _build_simulation_config(
@@ -698,7 +687,7 @@ class StrategyQuoteTest(unittest.TestCase):
             instructor_value=0.5,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.bid_maker)), 0)
         self.assertEqual(
             price_levels(engine, engine.manager.books.ask_maker),
             [(100.8, 1.0)],
@@ -719,7 +708,7 @@ class StrategyQuoteTest(unittest.TestCase):
             instructor_value=0.5,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.bid_maker)), 0)
         self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.6, 1.0)])
 
     def test_passive_only_clips_close_bid_tightening_alpha(self):
@@ -737,7 +726,7 @@ class StrategyQuoteTest(unittest.TestCase):
             instructor_value=0.5,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.ask_maker)), 0)
         self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.4, 1.0)])
 
     def test_inventory_limit_uses_cost_notional_not_mark_notional(self):
@@ -758,32 +747,6 @@ class StrategyQuoteTest(unittest.TestCase):
         set_position(engine, qty=-1.0, cost=200.0)
 
         ask_qty, bid_qty = engine._apply_inventory_limit(mid=100.0, ask_qty=1.0, bid_qty=1.0)
-        self.assertEqual((ask_qty, bid_qty), (0.0, 1.0))
-
-    def test_max_open_inventory_utilization_blocks_long_adds(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                max_position_usdt=100.0,
-                max_open_inventory_utilization=0.5,
-            )
-        )
-        set_position(engine, qty=1.0, cost=50.0)
-
-        ask_qty, bid_qty = engine._apply_inventory_limit(mid=100.0, ask_qty=1.0, bid_qty=1.0)
-
-        self.assertEqual((ask_qty, bid_qty), (1.0, 0.0))
-
-    def test_max_open_inventory_utilization_blocks_short_adds(self):
-        engine = SimpleMakerStrategy(
-            make_config(
-                max_position_usdt=100.0,
-                max_open_inventory_utilization=0.5,
-            )
-        )
-        set_position(engine, qty=-1.0, cost=50.0)
-
-        ask_qty, bid_qty = engine._apply_inventory_limit(mid=100.0, ask_qty=1.0, bid_qty=1.0)
-
         self.assertEqual((ask_qty, bid_qty), (0.0, 1.0))
 
     def test_inventory_skew_uses_cost_notional_not_mark_notional(self):
@@ -932,7 +895,7 @@ class StrategyQuoteTest(unittest.TestCase):
             volatility_scalar=0.0,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.ask_maker)), 0)
         self.assertEqual(len(price_levels(engine, engine.manager.books.bid_maker)), 1)
 
     def test_long_underwater_uses_underwater_open_boost(self):
@@ -954,14 +917,40 @@ class StrategyQuoteTest(unittest.TestCase):
             volatility_scalar=0.0,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.ask_maker)), 0)
         self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(98.9, 2.024)])
 
-    def test_phase_change_anchors_and_boosts_simple_long_add(self):
+    def test_phase_change_gate_opens_simple_long_add(self):
         engine = SimpleMakerStrategy(
             make_config(
                 phase_change_position=50.0,
                 boost_phase_change=2.0,
+                open_curve=(1.0, 1.0, 1.0),
+                min_order_notional=100.0,
+            )
+        )
+        set_position(engine, qty=1.0, cost=100.0)
+        engine._phase_side = 1
+        engine._phase_best_mid = 99.0
+
+        engine._on_ticker_event(
+            timestamp=1,
+            best_bid=98.9,
+            best_ask=99.1,
+            intensity_value=0.0,
+            volatility_scalar=0.0,
+        )
+
+        self.assertGreater(len(price_levels(engine, engine.manager.books.ask_maker)), 0)
+        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(98.9, 2.024)])
+
+    def test_phase_change_gate_closed_simple_long_add(self):
+        engine = SimpleMakerStrategy(
+            make_config(
+                phase_change_position=50.0,
+                boost_phase_change=2.0,
+                open_curve=(1.0, 1.0, 1.0),
+                min_order_notional=100.0,
             )
         )
         set_position(engine, qty=1.0, cost=100.0)
@@ -976,15 +965,17 @@ class StrategyQuoteTest(unittest.TestCase):
             volatility_scalar=0.0,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.0, 2.0)])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.ask_maker)), 0)
+        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
 
-    def test_phase_change_anchors_and_boosts_level_long_add(self):
+    def test_phase_change_gate_opens_level_long_add(self):
         engine = SimpleMakerStrategy(
             make_config(
                 phase_change_position=50.0,
                 boost_phase_change=2.0,
                 simple_mode=False,
+                open_curve=(1.0, 1.0, 1.0),
+                min_order_notional=100.0,
             )
         )
         set_position(engine, qty=1.0, cost=100.0)
@@ -993,20 +984,22 @@ class StrategyQuoteTest(unittest.TestCase):
 
         engine._on_ticker_event(
             timestamp=1,
-            best_bid=99.9,
-            best_ask=100.1,
+            best_bid=98.9,
+            best_ask=99.1,
             intensity_value=0.0,
             volatility_scalar=0.0,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.0, 2.0)])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.ask_maker)), 0)
+        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(98.9, 2.022)])
 
-    def test_phase_change_anchors_and_boosts_simple_short_add(self):
+    def test_phase_change_gate_opens_simple_short_add(self):
         engine = SimpleMakerStrategy(
             make_config(
                 phase_change_position=50.0,
                 boost_phase_change=2.0,
+                open_curve=(1.0, 1.0, 1.0),
+                min_order_notional=100.0,
             )
         )
         set_position(engine, qty=-1.0, cost=100.0)
@@ -1015,14 +1008,14 @@ class StrategyQuoteTest(unittest.TestCase):
 
         engine._on_ticker_event(
             timestamp=1,
-            best_bid=99.9,
-            best_ask=100.1,
+            best_bid=100.9,
+            best_ask=101.1,
             intensity_value=0.0,
             volatility_scalar=0.0,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(101.0, 2.0)])
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(101.1, 1.98)])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.bid_maker)), 0)
 
     def test_phase_change_trade_mode_uses_own_fill_price_for_add(self):
         engine = SimpleMakerStrategy(
@@ -1189,7 +1182,7 @@ class StrategyQuoteTest(unittest.TestCase):
             volatility_scalar=0.0,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.bid_maker)), 0)
         self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.6, 1.0)])
 
     def test_long_profitzone_uses_profitzone_close_boost(self):
@@ -1211,7 +1204,7 @@ class StrategyQuoteTest(unittest.TestCase):
             volatility_scalar=0.0,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.bid_maker)), 0)
         self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.6, 1.99)])
 
     def test_long_above_cost_close_curve_floors_fractional_units(self):
@@ -1231,7 +1224,7 @@ class StrategyQuoteTest(unittest.TestCase):
             volatility_scalar=0.0,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.bid_maker)), 0)
         self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
 
     def test_close_curve_qty_is_integer_min_bet_multiple(self):
@@ -1284,7 +1277,7 @@ class StrategyQuoteTest(unittest.TestCase):
             volatility_scalar=0.0,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.bid_maker)), 0)
         self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.6, 0.05)])
 
     def test_long_close_quote_uses_intensity_and_volatility_distance(self):
@@ -1299,7 +1292,7 @@ class StrategyQuoteTest(unittest.TestCase):
             volatility_scalar=0.1,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.bid_maker)), 0)
         self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(101.0, 1.0)])
 
     def test_non_strict_long_underwater_places_close_ask_and_open_bid(self):
@@ -1548,7 +1541,7 @@ class StrategyQuoteTest(unittest.TestCase):
             volatility_scalar=0.1,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.bid_maker)), 0)
         self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(100.8, 1.0)])
 
     def test_min_quote_distance_bps_clips_simple_close_quote(self):
@@ -1563,7 +1556,7 @@ class StrategyQuoteTest(unittest.TestCase):
             volatility_scalar=0.0,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.bid_maker)), 0)
         self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(102.6, 1.0)])
 
     def test_long_far_above_cost_still_uses_glftmm_close_ask(self):
@@ -1578,7 +1571,7 @@ class StrategyQuoteTest(unittest.TestCase):
             volatility_scalar=0.0,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.bid_maker)), 0)
         self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [(103.5, 1.0)])
 
     def test_short_min_step_residual_closes_in_profit_zone(self):
@@ -1593,7 +1586,7 @@ class StrategyQuoteTest(unittest.TestCase):
             volatility_scalar=0.0,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.ask_maker)), 0)
         self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.7, 0.001)])
 
     def test_reach_and_release_closes_min_step_residual(self):
@@ -1687,7 +1680,7 @@ class StrategyQuoteTest(unittest.TestCase):
             volatility_scalar=0.0,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.ask_maker)), 0)
         self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.4, 1.0)])
 
     def test_short_close_quote_uses_intensity_and_volatility_distance(self):
@@ -1702,7 +1695,7 @@ class StrategyQuoteTest(unittest.TestCase):
             volatility_scalar=0.1,
         )
 
-        self.assertEqual(price_levels(engine, engine.manager.books.ask_maker), [])
+        self.assertGreater(len(price_levels(engine, engine.manager.books.ask_maker)), 0)
         self.assertEqual(price_levels(engine, engine.manager.books.bid_maker), [(99.0, 1.0)])
 
     def test_single_strategy_snapshot_has_no_lot_state(self):

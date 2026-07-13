@@ -59,7 +59,6 @@ PARAM_KEY_ALIAS = {
     "lookback_instructor": "ilb",
     "lookback_intensity": "lbi",
     "max_position_usdt": "mp",
-    "max_open_inventory_utilization": "moiu",
     "phase_change_position": "pcp",
     "boost_phase_change": "bpc",
     "phase_mode": "phm",
@@ -93,7 +92,6 @@ SIM_OPTIONAL_KEYS = (
     "lookback_instructor",
     "lookback_volatility",
     "max_holding_time",
-    "max_open_inventory_utilization",
     "phase_change_position",
     "boost_phase_change",
     "phase_mode",
@@ -367,10 +365,30 @@ def _sim_params_dedupe_key(sim_params: dict[str, Any]) -> str:
     return json.dumps(sim_params, sort_keys=True, separators=(",", ":"))
 
 
+SIM_GROUPS = ("basic", "price_management", "position_management")
+
+
+def _flatten_sim_groups(sim_raw: dict[str, Any]) -> dict[str, Any]:
+    flat: dict[str, Any] = {}
+    for group_key in SIM_GROUPS:
+        group = sim_raw.get(group_key)
+        if group is not None and isinstance(group, dict):
+            flat.update(group)
+    for k, v in sim_raw.items():
+        if k not in SIM_GROUPS:
+            flat[k] = v
+    return flat
+
+
 def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
     sim_raw = cfg.get("simulation")
     if sim_raw is None or not isinstance(sim_raw, dict):
         raise ValueError("config requires simulation section(object)")
+    if any(k in sim_raw for k in SIM_GROUPS):
+        sim_raw = _flatten_sim_groups(sim_raw)
+    paths = cfg.get("paths")
+    if isinstance(paths, dict) and "simple_mode" in paths and "simple_mode" not in sim_raw:
+        sim_raw["simple_mode"] = paths["simple_mode"]
     if "strategy" in cfg:
         raise ValueError("strategy section is not supported, use simulation only")
     if "cooldown_time" in sim_raw:
@@ -429,12 +447,6 @@ def _normalize_sim_param_map(cfg: dict[str, Any]) -> dict[str, list[Any]]:
         sim_map["max_position_usdt"] = [
             _normalize_non_negative_scalar(row, "max_position_usdt")
             for row in sim_map["max_position_usdt"]
-        ]
-
-    if "max_open_inventory_utilization" in sim_map:
-        sim_map["max_open_inventory_utilization"] = [
-            _normalize_ratio(row, "max_open_inventory_utilization")
-            for row in sim_map["max_open_inventory_utilization"]
         ]
 
     if "phase_change_position" in sim_map:
@@ -633,10 +645,6 @@ def _build_simulation_config(raw: dict[str, Any]) -> SimulationConfig:
         max_position_usdt=_normalize_non_negative_scalar(
             raw["max_position_usdt"],
             "max_position_usdt",
-        ),
-        max_open_inventory_utilization=_normalize_ratio(
-            raw.get("max_open_inventory_utilization", 1.0),
-            "max_open_inventory_utilization",
         ),
         phase_change_position=_normalize_non_negative_scalar(
             raw.get("phase_change_position", 0.0),

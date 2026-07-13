@@ -103,7 +103,6 @@ class SimulationConfig:
     name_volatility: Optional[str] = None
     lookback_volatility: Optional[int] = None
     max_position_usdt: float = 0.0
-    max_open_inventory_utilization: float = 1.0
     phase_change_position: float = 0.0
     boost_phase_change: float = 1.0
     phase_mode: str = "market"
@@ -135,10 +134,6 @@ class SimulationConfig:
         stoploss = self._normalize_scalar(self.stoploss, "stoploss")
         takeprofit = self._normalize_scalar(self.takeprofit, "takeprofit")
         hold_since = self._normalize_scalar(self.hold_since, "hold_since")
-        max_open_inventory_utilization = self._normalize_scalar(
-            self.max_open_inventory_utilization,
-            "max_open_inventory_utilization",
-        )
         phase_change_position = self._normalize_scalar(
             self.phase_change_position,
             "phase_change_position",
@@ -147,11 +142,6 @@ class SimulationConfig:
         object.__setattr__(self, "stoploss", stoploss)
         object.__setattr__(self, "takeprofit", takeprofit)
         object.__setattr__(self, "hold_since", hold_since)
-        object.__setattr__(
-            self,
-            "max_open_inventory_utilization",
-            max_open_inventory_utilization,
-        )
         object.__setattr__(self, "phase_change_position", phase_change_position)
         object.__setattr__(self, "phase_mode", str(self.phase_mode).strip().lower())
         if self.freq <= 0:
@@ -190,11 +180,6 @@ class SimulationConfig:
                 raise ValueError("lookback_volatility must be > 0 when name_volatility is provided")
         if self.max_position_usdt < 0:
             raise ValueError("max_position_usdt must be >= 0")
-        if (
-            self.max_open_inventory_utilization < 0
-            or self.max_open_inventory_utilization > 1
-        ):
-            raise ValueError("max_open_inventory_utilization must be between 0 and 1")
         if self.phase_change_position < 0.0:
             raise ValueError("phase_change_position must be >= 0")
         try:
@@ -404,6 +389,8 @@ class SimpleMakerStrategy:
                 "realized_pnl": realized_pnl,
                 "unrealized_pnl": unrealized_pnl,
                 "mid": float(pos.mid),
+                "market_qty_since": None if math.isnan(float(pos.market_qty_since)) else float(pos.market_qty_since),
+                "market_amt_since": None if math.isnan(float(pos.market_amt_since)) else float(pos.market_amt_since),
             },
             "realized_pnl": realized_pnl,
             "unrealized_pnl": unrealized_pnl,
@@ -490,6 +477,11 @@ class SimpleMakerStrategy:
                 pos.mid = 0.0
         else:
             pos.mid = float(mid_raw)
+
+        mq_raw = pos_state.get("market_qty_since")
+        pos.market_qty_since = math.nan if mq_raw is None else float(mq_raw)
+        ma_raw = pos_state.get("market_amt_since")
+        pos.market_amt_since = math.nan if ma_raw is None else float(ma_raw)
 
         self.manager.position = pos
         if hasattr(self.manager, "_sync_position_steps"):
@@ -641,6 +633,8 @@ class SimpleMakerStrategy:
                 "unrealized_pnl",
                 "total_pnl",
                 "traded_volume",
+                "market_qty_since",
+                "market_amt_since",
             ],
         )
 
@@ -659,6 +653,8 @@ class SimpleMakerStrategy:
                     "unrealized_pnl",
                     "total_pnl",
                     "traded_volume",
+                    "market_qty_since",
+                    "market_amt_since",
                 ]
             )
         return pd.concat(frames, ignore_index=True)
@@ -718,6 +714,11 @@ class SimpleMakerStrategy:
                 reference_mid=float(trade_price),
                 position_reduced=position_reduced,
             )
+        self.manager.position.accumulate_market(
+            trade_qty=float(trade_qty),
+            trade_price=float(trade_price),
+            is_buyer_maker=bool(is_buyer_maker),
+        )
         return float(filled_qty)
 
     def _clear_open_maker_books(self) -> None:
@@ -941,6 +942,7 @@ class SimpleMakerStrategy:
                 bid_price_ticks=quote_bid_price_ticks,
                 bid_qty_steps=bid_qty_steps,
                 close_only=quote_close_only,
+                mid=mid,
             )
             (
                 quote_ask_price_ticks,
@@ -991,6 +993,7 @@ class SimpleMakerStrategy:
                 ask_levels=ask_levels,
                 bid_levels=bid_levels,
                 close_only=quote_close_only,
+                mid=mid,
             )
             ask_levels, bid_levels = self._clip_quote_levels_to_bbo_distance(
                 ask_levels=ask_levels,
@@ -1031,6 +1034,8 @@ class SimpleMakerStrategy:
                 float(self.manager.position.unrealized_pnl),
                 float(self.manager.position.realized_pnl + self.manager.position.unrealized_pnl),
                 float(self._traded_volume),
+                float(self.manager.position.market_qty_since),
+                float(self.manager.position.market_amt_since),
             )
         )
 
@@ -1142,49 +1147,25 @@ class SimpleMakerStrategy:
         bid_price_ticks: Optional[int],
         bid_qty_steps: int,
         close_only: bool,
+        mid: float,
     ) -> tuple[Optional[int], int, Optional[int], int]:
         if close_only or not self._phase_change_active():
             return ask_price_ticks, ask_qty_steps, bid_price_ticks, bid_qty_steps
 
         pos_qty = float(self.manager.position.qty)
         if pos_qty > self.EPS:
-            bid_price_ticks = self._phase_anchor_open_price_ticks(
-                price_ticks=bid_price_ticks,
-                is_ask=False,
-            )
-            bid_qty_steps = self._boost_phase_change_open_steps(bid_qty_steps)
+            if self._phase_best_mid is not None and mid <= self._phase_best_mid + self.EPS:
+                bid_qty_steps = self._boost_phase_change_open_steps(bid_qty_steps)
+            else:
+                bid_qty_steps = 0
+                bid_price_ticks = None
         elif pos_qty < -self.EPS:
-            ask_price_ticks = self._phase_anchor_open_price_ticks(
-                price_ticks=ask_price_ticks,
-                is_ask=True,
-            )
-            ask_qty_steps = self._boost_phase_change_open_steps(ask_qty_steps)
+            if self._phase_best_mid is not None and mid >= self._phase_best_mid - self.EPS:
+                ask_qty_steps = self._boost_phase_change_open_steps(ask_qty_steps)
+            else:
+                ask_qty_steps = 0
+                ask_price_ticks = None
         return ask_price_ticks, ask_qty_steps, bid_price_ticks, bid_qty_steps
-
-    def _phase_anchor_open_price_ticks(
-        self,
-        *,
-        price_ticks: Optional[int],
-        is_ask: bool,
-    ) -> Optional[int]:
-        if price_ticks is None or self._phase_best_mid is None:
-            return price_ticks
-        phase_best_mid = float(self._phase_best_mid)
-        if not math.isfinite(phase_best_mid) or phase_best_mid <= 0.0:
-            return price_ticks
-
-        phase_ticks = (
-            self._price_ceil_ticks(phase_best_mid)
-            if is_ask
-            else self._price_floor_ticks(phase_best_mid)
-        )
-        if phase_ticks <= 0:
-            return price_ticks
-        return (
-            max(int(price_ticks), phase_ticks)
-            if is_ask
-            else min(int(price_ticks), phase_ticks)
-        )
 
     def _boost_phase_change_open_steps(self, steps: int) -> int:
         steps = max(0, int(steps))
@@ -1201,51 +1182,21 @@ class SimpleMakerStrategy:
         ask_levels: list[MakerLevel],
         bid_levels: list[MakerLevel],
         close_only: bool,
+        mid: float,
     ) -> tuple[list[MakerLevel], list[MakerLevel]]:
         if close_only or not self._phase_change_active():
             return ask_levels, bid_levels
 
         pos_qty = float(self.manager.position.qty)
         if pos_qty > self.EPS:
-            bid_levels = self._phase_anchor_open_levels(
-                levels=bid_levels,
-                is_ask=False,
-            )
-            return ask_levels, self._boost_phase_change_open_levels(bid_levels)
+            if self._phase_best_mid is not None and mid <= self._phase_best_mid + self.EPS:
+                return ask_levels, self._boost_phase_change_open_levels(bid_levels)
+            return ask_levels, []
         if pos_qty < -self.EPS:
-            ask_levels = self._phase_anchor_open_levels(
-                levels=ask_levels,
-                is_ask=True,
-            )
-            return self._boost_phase_change_open_levels(ask_levels), bid_levels
+            if self._phase_best_mid is not None and mid >= self._phase_best_mid - self.EPS:
+                return self._boost_phase_change_open_levels(ask_levels), bid_levels
+            return [], bid_levels
         return ask_levels, bid_levels
-
-    def _phase_anchor_open_levels(
-        self,
-        *,
-        levels: Sequence[MakerLevel],
-        is_ask: bool,
-    ) -> list[MakerLevel]:
-        if not levels or self._phase_best_mid is None:
-            return list(levels)
-        phase_best_mid = float(self._phase_best_mid)
-        if not math.isfinite(phase_best_mid) or phase_best_mid <= 0.0:
-            return list(levels)
-
-        phase_price = (
-            self._price_ceil(phase_best_mid)
-            if is_ask
-            else self._price_floor(phase_best_mid)
-        )
-        adjusted: list[MakerLevel] = []
-        for price, qty in levels:
-            price = (
-                max(float(price), phase_price)
-                if is_ask
-                else min(float(price), phase_price)
-            )
-            adjusted.append((price, float(qty)))
-        return adjusted
 
     @staticmethod
     def _filled_qty_from_fills(fills: Sequence[MakerLevel]) -> float:
@@ -1511,47 +1462,12 @@ class SimpleMakerStrategy:
                 False,
             )
 
-        if not self.cfg.strict_mode:
-            if pos_qty > 0.0:
-                profitzone = mid > cost + self.EPS
-                ask_steps = min(
-                    self._boost_close_steps(
-                        self._simple_close_steps(
-                            price_ticks=close_ask_price_ticks,
-                            mid=mid,
-                            pos_qty=pos_qty,
-                        ),
-                        profitzone=profitzone,
-                    ),
-                    self._close_steps_from_position(pos_qty),
-                )
-                if self._should_hold_underwater_close(mid):
-                    ask_steps = 0
-                bid_steps = self._boost_open_steps(
-                    self._simple_open_steps(price_ticks=open_bid_price_ticks, mid=mid),
-                    profitzone=profitzone,
-                ) if open_allowed else 0
-                _ask_open_steps, bid_steps = self._apply_inventory_limit_steps(
-                    ask_steps=0,
-                    bid_steps=bid_steps,
-                )
-                return (
-                    close_ask_price_ticks if ask_steps > 0 else None,
-                    ask_steps,
-                    open_bid_price_ticks if bid_steps > 0 else None,
-                    bid_steps,
-                    False,
-                )
-
-            profitzone = mid < cost - self.EPS
-            ask_steps = self._boost_open_steps(
-                self._simple_open_steps(price_ticks=open_ask_price_ticks, mid=mid),
-                profitzone=profitzone,
-            ) if open_allowed else 0
-            bid_steps = min(
+        if pos_qty > 0.0:
+            profitzone = mid > cost + self.EPS
+            ask_steps = min(
                 self._boost_close_steps(
                     self._simple_close_steps(
-                        price_ticks=close_bid_price_ticks,
+                        price_ticks=close_ask_price_ticks,
                         mid=mid,
                         pos_qty=pos_qty,
                     ),
@@ -1560,18 +1476,70 @@ class SimpleMakerStrategy:
                 self._close_steps_from_position(pos_qty),
             )
             if self._should_hold_underwater_close(mid):
-                bid_steps = 0
-            ask_steps, _bid_open_steps = self._apply_inventory_limit_steps(
-                ask_steps=ask_steps,
-                bid_steps=0,
+                ask_steps = 0
+            bid_steps = self._boost_open_steps(
+                self._simple_open_steps(price_ticks=open_bid_price_ticks, mid=mid),
+                profitzone=profitzone,
+            ) if open_allowed else 0
+            _ask_open_steps, bid_steps = self._apply_inventory_limit_steps(
+                ask_steps=0,
+                bid_steps=bid_steps,
             )
+            ask_price_ticks = close_ask_price_ticks if ask_steps > 0 else None
+            bid_price_ticks = open_bid_price_ticks if bid_steps > 0 else None
+            if self.cfg.strict_mode:
+                ask_price_ticks, bid_price_ticks = self._clip_price_ticks_by_market_vwap(
+                    ask_price_ticks=ask_price_ticks,
+                    ask_steps=ask_steps,
+                    bid_price_ticks=bid_price_ticks,
+                    bid_steps=bid_steps,
+                )
             return (
-                open_ask_price_ticks if ask_steps > 0 else None,
+                ask_price_ticks,
                 ask_steps,
-                close_bid_price_ticks if bid_steps > 0 else None,
+                bid_price_ticks,
                 bid_steps,
                 False,
             )
+
+        profitzone = mid < cost - self.EPS
+        ask_steps = self._boost_open_steps(
+            self._simple_open_steps(price_ticks=open_ask_price_ticks, mid=mid),
+            profitzone=profitzone,
+        ) if open_allowed else 0
+        bid_steps = min(
+            self._boost_close_steps(
+                self._simple_close_steps(
+                    price_ticks=close_bid_price_ticks,
+                    mid=mid,
+                    pos_qty=pos_qty,
+                ),
+                profitzone=profitzone,
+            ),
+            self._close_steps_from_position(pos_qty),
+        )
+        if self._should_hold_underwater_close(mid):
+            bid_steps = 0
+        ask_steps, _bid_open_steps = self._apply_inventory_limit_steps(
+            ask_steps=ask_steps,
+            bid_steps=0,
+        )
+        ask_price_ticks = open_ask_price_ticks if ask_steps > 0 else None
+        bid_price_ticks = close_bid_price_ticks if bid_steps > 0 else None
+        if self.cfg.strict_mode:
+            ask_price_ticks, bid_price_ticks = self._clip_price_ticks_by_market_vwap(
+                ask_price_ticks=ask_price_ticks,
+                ask_steps=ask_steps,
+                bid_price_ticks=bid_price_ticks,
+                bid_steps=bid_steps,
+            )
+        return (
+            ask_price_ticks,
+            ask_steps,
+            bid_price_ticks,
+            bid_steps,
+            False,
+        )
 
         if pos_qty > 0.0:
             if mid <= cost + self.EPS:
@@ -1733,6 +1701,35 @@ class SimpleMakerStrategy:
         distance = float(reference_price) * min_bps / 1e4
         return max(0, math.floor((distance / self.sim.tick_size) + self.EPS))
 
+    def _clip_price_ticks_by_market_vwap(
+        self,
+        ask_price_ticks: int | None,
+        ask_steps: int,
+        bid_price_ticks: int | None,
+        bid_steps: int,
+    ) -> tuple[int | None, int | None]:
+        vwap = self.manager.position.market_vwap_since
+        if not math.isfinite(vwap) or vwap <= 0.0:
+            return ask_price_ticks, bid_price_ticks
+        vwap_ticks = self._price_round_ticks(vwap)
+        if ask_price_ticks is not None and ask_steps > 0:
+            ask_price_ticks = max(ask_price_ticks, vwap_ticks)
+        if bid_price_ticks is not None and bid_steps > 0:
+            bid_price_ticks = min(bid_price_ticks, vwap_ticks)
+        return ask_price_ticks, bid_price_ticks
+
+    def _clip_prices_by_market_vwap(
+        self,
+        ask_price: float,
+        bid_price: float,
+    ) -> tuple[float, float]:
+        vwap = self.manager.position.market_vwap_since
+        if not math.isfinite(vwap) or vwap <= 0.0:
+            return ask_price, bid_price
+        ask_price = max(ask_price, vwap)
+        bid_price = min(bid_price, vwap)
+        return ask_price, bid_price
+
     def _maker_levels_for_ticker(
         self,
         *,
@@ -1758,40 +1755,8 @@ class SimpleMakerStrategy:
             bid_qty = self._curve_open_qty(mid=mid, base_open_qty=bid_qty)
             return self._single_quote_levels(open_ask_price, ask_qty, open_bid_price, bid_qty, False)
 
-        if not self.cfg.strict_mode:
-            if pos_qty > 0.0:
-                profitzone = mid > cost + self.EPS
-                close_qty = min(
-                    self._boost_close_qty(
-                        self._curve_close_qty(mid=mid, pos_qty=pos_qty),
-                        profitzone=profitzone,
-                    ),
-                    self._close_qty_from_position(pos_qty),
-                )
-                if self._should_hold_underwater_close(mid):
-                    close_qty = 0.0
-                bid_qty = self._boost_open_qty(
-                    self._grid_open_qty(mid=mid, base_open_qty=bid_qty),
-                    profitzone=profitzone,
-                ) if open_allowed else 0.0
-                _ask_open_qty, bid_qty = self._apply_inventory_limit(
-                    mid=mid,
-                    ask_qty=0.0,
-                    bid_qty=bid_qty,
-                )
-                return self._single_quote_levels(
-                    close_ask_price,
-                    close_qty,
-                    open_bid_price,
-                    bid_qty,
-                    False,
-                )
-
-            profitzone = mid < cost - self.EPS
-            ask_qty = self._boost_open_qty(
-                self._grid_open_qty(mid=mid, base_open_qty=ask_qty),
-                profitzone=profitzone,
-            ) if open_allowed else 0.0
+        if pos_qty > 0.0:
+            profitzone = mid > cost + self.EPS
             close_qty = min(
                 self._boost_close_qty(
                     self._curve_close_qty(mid=mid, pos_qty=pos_qty),
@@ -1801,18 +1766,63 @@ class SimpleMakerStrategy:
             )
             if self._should_hold_underwater_close(mid):
                 close_qty = 0.0
-            ask_qty, _bid_open_qty = self._apply_inventory_limit(
+            bid_qty = self._boost_open_qty(
+                self._grid_open_qty(mid=mid, base_open_qty=bid_qty),
+                profitzone=profitzone,
+            ) if open_allowed else 0.0
+            _ask_open_qty, bid_qty = self._apply_inventory_limit(
                 mid=mid,
-                ask_qty=ask_qty,
-                bid_qty=0.0,
+                ask_qty=0.0,
+                bid_qty=bid_qty,
             )
+            ask_price = close_ask_price
+            bid_price = open_bid_price
+            if self.cfg.strict_mode:
+                ask_price, bid_price = self._clip_prices_by_market_vwap(
+                    ask_price=ask_price,
+                    bid_price=bid_price,
+                )
             return self._single_quote_levels(
-                open_ask_price,
-                ask_qty,
-                close_bid_price,
+                ask_price,
                 close_qty,
+                bid_price,
+                bid_qty,
                 False,
             )
+
+        profitzone = mid < cost - self.EPS
+        ask_qty = self._boost_open_qty(
+            self._grid_open_qty(mid=mid, base_open_qty=ask_qty),
+            profitzone=profitzone,
+        ) if open_allowed else 0.0
+        close_qty = min(
+            self._boost_close_qty(
+                self._curve_close_qty(mid=mid, pos_qty=pos_qty),
+                profitzone=profitzone,
+            ),
+            self._close_qty_from_position(pos_qty),
+        )
+        if self._should_hold_underwater_close(mid):
+            close_qty = 0.0
+        ask_qty, _bid_open_qty = self._apply_inventory_limit(
+            mid=mid,
+            ask_qty=ask_qty,
+            bid_qty=0.0,
+        )
+        ask_price = open_ask_price
+        bid_price = close_bid_price
+        if self.cfg.strict_mode:
+            ask_price, bid_price = self._clip_prices_by_market_vwap(
+                ask_price=ask_price,
+                bid_price=bid_price,
+            )
+        return self._single_quote_levels(
+            ask_price,
+            ask_qty,
+            bid_price,
+            close_qty,
+            False,
+        )
 
         if pos_qty > 0.0:
             if mid <= cost + self.EPS:
@@ -1966,7 +1976,7 @@ class SimpleMakerStrategy:
         max_position_usdt = float(self.cfg.max_position_usdt)
         if max_position_usdt <= self.EPS:
             return 0.0
-        return max_position_usdt * float(self.cfg.max_open_inventory_utilization)
+        return max_position_usdt
 
     def _inventory_skew_price_shift(self, mid: float) -> float:
         skew_cfg = self.cfg.inventory_skew
